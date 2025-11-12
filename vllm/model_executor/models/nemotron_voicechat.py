@@ -16,12 +16,14 @@ from transformers.generation.logits_process import (
 from transformers import AutoConfig
 
 from vllm.model_executor.models.gemma3 import Gemma3Model
+from vllm.model_executor.models.nemotron_h import NemotronHModel
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
 
 from .utils import AutoWeightsLoader
 from .optimized_t5gemma import OptimizedT5GemmaEncoderModel
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator, MambaStateDtypeCalculator
 
 
 class RMSNorm(nn.Module):
@@ -568,9 +570,9 @@ class MaskGITSampler(nn.Module):
 
 
 @support_torch_compile
-class EarTTSModel(nn.Module):
+class NemotronVoicechatModel(nn.Module):
     """
-    Wrapper module that combines the embedding preparation, backbone transformer and sampler.
+    Wrapper module that combines the llm, embedding preparation, tts backbone transformer and sampler.
     All components supports torch compile.
     """
     def __init__(
@@ -580,18 +582,61 @@ class EarTTSModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
-        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
-        self.sampler = MaskGITSampler(vllm_config.model_config.hf_config)
+        config = vllm_config.model_config.hf_config
+
+        self.top_k_warper = TopKLogitsWarper(top_k=50)
+        self.top_p_warper = TopPLogitsWarper(top_p=0.9)
+        
+        self.total_emb = EarTTSInputEmbedding(config)
+        
+        # Initialize Gemma3 backbone
+        gemma3_hf_config = self._create_hf_config(
+            config.gemma3_config, "gemma3"
+        )
+        vllm_config.model_config.hf_config = gemma3_hf_config
+        self.backbone = Gemma3Model(
+            vllm_config=vllm_config, 
+            prefix=f"{prefix}.backbone" if prefix else "backbone"
+        )
+        
+        # Initialize NemotronH LLM (if config provided)
+        nemotron_h_hf_config = self._create_hf_config(
+            config.nemotron_h_config, "nemotron_h"
+        )
+        vllm_config.model_config.hf_config = nemotron_h_hf_config
+        self.llm = NemotronHModel(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.llm" if prefix else "llm"
+        )
+
+        self.sampler = MaskGITSampler(config)
+    
+    def _create_hf_config(
+        self, 
+        nested_config: dict, 
+        model_type: str
+    ) -> VllmConfig:
+        from transformers import AutoConfig
+        
+        # Create the appropriate HF config from the nested dict
+        if model_type == "gemma3":
+            from transformers import Gemma3TextConfig
+            hf_config = Gemma3TextConfig(**nested_config)
+        elif model_type == "nemotron_h":
+            from vllm.transformers_utils.configs import NemotronHConfig
+            hf_config = NemotronHConfig(**nested_config)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+        return hf_config
     
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
+        input_acoustic_embeds: torch.Tensor,
         acoustic_tokens: torch.Tensor,
         context_text_tokens: torch.Tensor,
-        text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -599,6 +644,16 @@ class EarTTSModel(nn.Module):
         Forward pass through embeddings and backbone transformer.
         Returns hidden states to be used by the generation step.
         """
+        hidden_states = self.llm(None, positions, intermediate_tensors, inputs_embeds=input_acoustic_embeds)
+        logits = self.llm.lm_head(hidden_states)  # BT x vocab_size
+        
+        logits = logits / 0.9
+        logits = self.top_k_warper(None, logits)
+        logits = self.top_p_warper(None, logits)
+        probs = torch.softmax(logits, dim=-1)
+        text_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        text_tokens = text_tokens.clamp(max=10_000, min=0)  # BT,
+
         total_emb = self.total_emb(
             acoustic_tokens=acoustic_tokens,
             context_text_tokens=context_text_tokens,
@@ -606,16 +661,59 @@ class EarTTSModel(nn.Module):
             text_mask=text_mask,
             bos_mask=bos_mask,
         )
-        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
+        hidden_states = self.backbone(None, positions, intermediate_tensors, inputs_embeds=total_emb)
         codes = self.sampler(hidden_states)
-        return hidden_states, codes
+        return hidden_states, text_tokens, codes
 
 
-class EarTTSForCausalLM(nn.Module):
+class NemotronVoicechatForCausalLM(nn.Module):
+    is_hybrid = True
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.mamba2_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """Calculate shapes for Mamba's convolutional and state caches.
+
+        Args:
+            vllm_config: vLLM config
+
+        Returns:
+            Tuple containing:
+            - conv_state_shape: Shape for convolutional state cache
+            - temporal_state_shape: Shape for state space model cache
+        """
+        parallel_config = vllm_config.parallel_config
+        # Get the NemotronH config from the EarTTS config
+        nemotron_h_config = vllm_config.model_config.hf_config.nemotron_h_config
+        intermediate_size = nemotron_h_config["mamba_num_heads"] * nemotron_h_config["mamba_head_dim"]
+
+        return MambaStateShapeCalculator.mamba2_state_shape(
+            intermediate_size=intermediate_size,
+            tp_world_size=parallel_config.tensor_parallel_size,
+            n_groups=nemotron_h_config["n_groups"],
+            num_heads=nemotron_h_config["mamba_num_heads"],
+            head_dim=nemotron_h_config["mamba_head_dim"],
+            state_size=nemotron_h_config["ssm_state_size"],
+            conv_kernel=nemotron_h_config["conv_kernel"],
+        )
+    
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()        
         self.config = vllm_config.model_config.hf_config
-        self.model = EarTTSModel(
+        self.model = NemotronVoicechatModel(
             vllm_config=vllm_config,
             prefix=prefix,
         )
@@ -631,9 +729,9 @@ class EarTTSForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         # input used to prepare hidden states for backbone
+        input_acoustic_embeds: Optional[torch.Tensor] = None,
         acoustic_tokens: Optional[torch.Tensor] = None,
         context_text_tokens: Optional[torch.Tensor] = None,
-        text_tokens: Optional[torch.Tensor] = None,
         # text tokens are not used for prompt
         text_mask: Optional[torch.Tensor] = None,
         # bos is applied only to the first frame of audio embedding in prefill 
@@ -643,17 +741,17 @@ class EarTTSForCausalLM(nn.Module):
         input_ids, positions, intermediate_tensors, inputs_embeds - not used,
         they are here for compatability with the way vllm model executed.
         """
-        hidden_states, codes = self.model(
+        hidden_states, text_tokens, codes = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
+            input_acoustic_embeds=input_acoustic_embeds,
             acoustic_tokens=acoustic_tokens,
             context_text_tokens=context_text_tokens,
-            text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
         )
-        return hidden_states, codes
+        return hidden_states, text_tokens, codes
 
     def compute_logits(
         self,

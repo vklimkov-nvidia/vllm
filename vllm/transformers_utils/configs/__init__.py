@@ -12,7 +12,7 @@ from vllm.transformers_utils.configs.deepseek_v3 import DeepseekV3Config
 from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
 from vllm.transformers_utils.configs.dotsocr import DotsOCRConfig
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
-from vllm.transformers_utils.configs.eartts import EarTTSConfig
+from vllm.transformers_utils.configs.nemotron_voicechat import NemotronVoicechatConfig
 
 # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
 # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
@@ -45,7 +45,7 @@ __all__ = [
     "DeepseekV3Config",
     "DotsOCRConfig",
     "EAGLEConfig",
-    "EarTTSConfig",
+    "NemotronVoicechatConfig",
     "RWConfig",
     "JAISConfig",
     "MedusaConfig",

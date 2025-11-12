@@ -37,6 +37,7 @@ async def run_request(
     context_text_tokens = torch.randint(
         0, 10000, (input_num_tokens,), dtype=torch.int32
     )
+    input_acoustic_embeds = torch.randn(input_num_tokens, 4480, dtype=torch.bfloat16)
     context_token = context_text_tokens[-1:]  # 1
     bos_mask = torch.zeros(input_num_tokens, dtype=torch.float16)
     bos_mask[0] = 1.0
@@ -45,9 +46,9 @@ async def run_request(
     inputs = {
         "prompt_token_ids": [0] * input_num_tokens,
         "custom_inputs": {
+            "input_acoustic_embeds": input_acoustic_embeds,
             "acoustic_tokens": prompt_acoustic_tokens,
             "context_text_tokens": context_text_tokens,
-            "text_tokens": torch.zeros(input_num_tokens, dtype=torch.int32),
             "text_mask": torch.zeros(input_num_tokens, dtype=torch.float16),
             "bos_mask": bos_mask,
         },
@@ -88,9 +89,9 @@ async def run_request(
                 step_acoustic_tokens = acoustic_tokens[-1:]
                 current_text_token = torch.randint(0, 10000, (1,), dtype=torch.int32)
                 new_custom_inputs = {
+                    "input_acoustic_embeds": torch.randn(1, 4480, dtype=torch.bfloat16),
                     "acoustic_tokens": step_acoustic_tokens,
                     "context_text_tokens": context_token,
-                    "text_tokens": current_text_token,
                     "text_mask": torch.ones(1, dtype=torch.float16),
                     "bos_mask": torch.zeros(1, dtype=torch.float16),
                 }
@@ -244,7 +245,7 @@ async def main():
     # 1. Create Engine Args
     engine_args = AsyncEngineArgs(
         model="eartts_vllm_model",
-        dtype="float16",
+        dtype="bfloat16",
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_model_len * args.concurrency,
         gpu_memory_utilization=args.gpu_mem,

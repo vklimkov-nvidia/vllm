@@ -4559,6 +4559,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
             )
 
+    def _ensure_uniform_page_size(self, kv_cache_specs: dict[str, KVCacheSpec]):
+        """
+        Modifiese inplace the kv cache specs to ensure that page size is uniform.
+        For the models with mamba layers and attention layers with different number of kv heads,
+        the block size is not computed per attention layer, so has to be adjusted.
+        """
+        for name, spec in kv_cache_specs.items():
+            if isinstance(spec, MambaSpec):
+                print(f">>>{name} (mamba layer): {spec.page_size_bytes} = shape_prod * dtype_size", flush=True)
+            else:
+                print(f">>>{name}: {spec.page_size_bytes} = {spec.block_size} * {spec.num_kv_heads} * {spec.head_size} * dtype_size", flush=True)
+            
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Generates the KVCacheSpec by parsing the kv cache format from each
@@ -4574,6 +4587,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         for layer_name, attn_module in attn_layers.items():
+            if layer_name.startswith("backbone."):
+                block_size = 640
+            else:
+                block_size = 720
             if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None:
                 # The layer doesn't need its own KV cache and will use that of
                 # the target layer. We skip creating a KVCacheSpec for it, so
@@ -4650,6 +4667,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             mamba_block_size = self.vllm_config.cache_config.mamba_block_size
             page_size_padded = self.vllm_config.cache_config.mamba_page_size_padded
+            page_size_padded = 2949120
 
             for layer_name, mamba_module in mamba_layers.items():
                 kv_cache_spec[layer_name] = MambaSpec(

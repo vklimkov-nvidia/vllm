@@ -370,6 +370,12 @@ class NemotronHModel(nn.Module):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # THIS IS BRINGS LM HEAD FROM THE WRAPPER
+        self.unpadded_vocab_size = config.vocab_size
+        self.lm_head = torch.nn.Linear(config.hidden_size, self.unpadded_vocab_size)
+
+
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -555,10 +561,11 @@ class NemotronHForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        acoustic_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            None, positions, intermediate_tensors, acoustic_embeds
         )
 
         return hidden_states
