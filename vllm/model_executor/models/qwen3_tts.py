@@ -948,12 +948,16 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate all codec groups given talker hidden state and first codec.
         
         This runs the full code predictor loop for all 15 additional groups.
         Treats the first dimension as batch (works with packed sequences where
         seq_len becomes the batch dimension).
+        
+        As an optimisation the embeddings computed during the autoregressive
+        loop are accumulated and summed so the caller does not need to
+        re-embed all codec tokens afterwards.
         
         Args:
             talker_hidden: [seq_len, hidden_size] - hidden states from talker (packed)
@@ -967,6 +971,9 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             
         Returns:
             all_codecs: [seq_len, num_code_groups] - all 16 codec tokens
+            codec_embed_sum: [seq_len, hidden_size] - sum of all codec
+                embeddings (groups 0..N-1), ready to have tts_pad_embed
+                added by the caller.
         """
         # Prepare initial input: [seq_len, 2, hidden]
         # - talker_hidden: context from main model (provides position 0)
@@ -975,18 +982,18 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         inputs_embeds = torch.stack([talker_hidden, first_embed], dim=1)  # [seq_len, 2, hidden]
         
         all_codecs = [first_codec]  # Start with group 0
+        # Accumulate embeddings so we can return their sum (avoids re-embedding).
+        all_embeds = [first_embed]  # group 0 embedding
         
         # Generate groups 1 through num_code_groups-1 (15 groups)
         for step in range(self.num_code_groups - 1):
             # Forward through code predictor model
-            #print(f"code predictor #{step}: inputs_embeds: {inputs_embeds.shape}: {torch.max(inputs_embeds)}", flush=True)
             hidden_states = self.forward(inputs_embeds)  # [seq_len, seq_so_far, hidden]
             
             # Get logits from the appropriate head (last position)
             # step=0 -> lm_head[0] predicts group 1
             # step=1 -> lm_head[1] predicts group 2, etc.
             logits = self.compute_logits(hidden_states[:, -1, :], step)  # [seq_len, vocab]
-            #print(f"code predictor #{step}: logits: {logits.shape}: {torch.max(logits)}", flush=True)
             
             # Sample next token
             # Prepare context for repetition penalty (all previously generated codecs in this frame)
@@ -999,20 +1006,24 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             next_token = _sample_from_logits(
                 logits, do_sample, temperature, top_k, top_p, repetition_penalty, current_context
             )
-            #print(f"code predictor #{step}: sampled code: {next_token}", flush=True)
             all_codecs.append(next_token)
             
-            # Prepare embedding for next step (if not last step)
+            # Embed the predicted token (reuse for both the next code-predictor
+            # step *and* the accumulated sum returned to the caller).
+            next_embed = self.get_input_embeddings()[step](next_token)  # [seq_len, hidden]
+            all_embeds.append(next_embed)
+            
+            # Feed embedding into next step (skip on the last iteration)
             if step < self.num_code_groups - 2:
-                # step=0 -> get_input_embeddings()[0] embeds group 1's token
-                # step=1 -> get_input_embeddings()[1] embeds group 2's token, etc.
-                next_embed = self.get_input_embeddings()[step](next_token)  # [seq_len, hidden]
                 inputs_embeds = torch.cat([
                     inputs_embeds, 
                     next_embed.unsqueeze(1)
                 ], dim=1)
         
-        return torch.stack(all_codecs, dim=1)  # [seq_len, num_code_groups]
+        # Sum across all codebook groups: [seq_len, num_code_groups, hidden] -> [seq_len, hidden]
+        codec_embed_sum = torch.stack(all_embeds, dim=1).sum(dim=1)
+        
+        return torch.stack(all_codecs, dim=1), codec_embed_sum
 
 
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
@@ -1146,60 +1157,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         """Project text embeddings to hidden size."""
         return self.text_projection(text_embeds)
 
-    def _embed_codecs(self, all_codecs: torch.Tensor) -> torch.Tensor:
-        """Embed predicted codec tokens and sum them for next autoregressive step.
-        
-        Replicates the original Qwen3TTS embedding logic: each codebook group
-        is embedded with its own embedding layer, then all embeddings are summed
-        to produce the input for the next iteration.
-        
-        The original model additionally adds tts_pad_embed (the projected text
-        embedding of the pad token) to maintain the dual-stream text+codec
-        architecture.  In non-streaming mode all text is consumed during
-        prefill, so every generation step adds the same tts_pad_embed.
-        
-        Args:
-            all_codecs: [seq_len, num_code_groups] - all codec tokens
-                        Column 0 is group 0 (main talker), columns 1.. are
-                        from the code predictor.
-                        
-        Returns:
-            next_input_embeds: [seq_len, hidden_size] - summed embeddings
-                               ready to be fed as inputs_embeds for the next
-                               autoregressive step.
-        """
-        # Embed group 0 using main codec embedding
-        cb0_embed = self.model.codec_embedding(
-            all_codecs[:, 0]
-        )  # [seq_len, hidden_size]
-        
-        # Embed groups 1..N-1 using code predictor embeddings
-        cp_embeddings = self.code_predictor.get_input_embeddings()
-        cb_embeds = [cb0_embed]
-        for i in range(len(cp_embeddings)):
-            cb_embed = cp_embeddings[i](
-                all_codecs[:, i + 1]
-            )  # [seq_len, hidden_size]
-            cb_embeds.append(cb_embed)
-        
-        # Stack and sum across codebook groups
-        # [seq_len, num_code_groups, hidden_size] -> [seq_len, hidden_size]
-        codec_hiddens = torch.stack(cb_embeds, dim=1)
-        next_input_embeds = codec_hiddens.sum(dim=1)
-        
-        # Add tts_pad_embed to maintain dual-stream text+codec architecture.
-        # In the original model this is:
-        #   if generation_step < trailing_text_hidden.shape[1]:
-        #       inputs_embeds += trailing_text_hidden[:, generation_step]
-        #   else:
-        #       inputs_embeds += tts_pad_embed
-        # For non-streaming mode (all text consumed in prefill),
-        # trailing_text_hidden == tts_pad_embed at every step.
-        # tts_pad_embed is a precomputed buffer (loaded from weights).
-        next_input_embeds = next_input_embeds + self.tts_pad_embed.unsqueeze(0)
-        
-        return next_input_embeds
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1264,9 +1221,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             previous_tokens=None, # No history access for first token
         )
         
-        # Generate remaining codec groups (1-15) using code predictor
-        # Uses same sampling params from config
-        all_codecs = self.code_predictor.generate_all_groups(
+        # Generate remaining codec groups (1-15) using code predictor.
+        # generate_all_groups also returns the summed codec embeddings so we
+        # avoid re-embedding all tokens a second time.
+        all_codecs, codec_embed_sum = self.code_predictor.generate_all_groups(
             talker_hidden=hidden_states,
             first_codec=first_codec,
             talker_codec_embedding=self.model.codec_embedding,
@@ -1277,9 +1235,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             repetition_penalty=self.repetition_penalty,
         )
         
-        # Embed all predicted codecs and sum for next autoregressive step
-        #print(f">>>>>all_codecs: {torch.min(all_codecs)} <-> {torch.max(all_codecs)}", flush=True)
-        next_input_embeds = self._embed_codecs(all_codecs)
+        # Add tts_pad_embed to maintain dual-stream text+codec architecture.
+        # (Previously done inside _embed_codecs; now the embedding sum comes
+        # directly from the code predictor loop.)
+        next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
         
         return hidden_states, all_codecs, next_input_embeds
 
