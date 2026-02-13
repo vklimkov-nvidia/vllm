@@ -1013,6 +1013,26 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         
         self.logits_processor = LogitsProcessor(config.vocab_size)
         
+        # Precomputed weights (loaded from checkpoint, computed by the
+        # conversion script).  These must be static tensors so they
+        # are CUDA-graph safe (no dynamic creation or in-place mutation
+        # during forward).  Using nn.Parameter(requires_grad=False) so
+        # vLLM natively handles dtype casting.
+        #
+        # tts_pad_embed: text_projection(text_embedding(tts_pad_token_id))
+        #   Added to codec embeddings at every autoregressive step to
+        #   maintain the dual-stream text+codec architecture.
+        self.tts_pad_embed = nn.Parameter(
+            torch.zeros(config.hidden_size),
+            requires_grad=False,
+        )
+        # suppress_mask: bool mask [vocab_size] – True for the top 1024
+        #   token IDs (except EOS) that the original model suppresses.
+        self.suppress_mask = nn.Parameter(
+            torch.zeros(config.vocab_size, dtype=torch.bool),
+            requires_grad=False,
+        )
+        
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -1039,18 +1059,22 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         is embedded with its own embedding layer, then all embeddings are summed
         to produce the input for the next iteration.
         
+        The original model additionally adds tts_pad_embed (the projected text
+        embedding of the pad token) to maintain the dual-stream text+codec
+        architecture.  In non-streaming mode all text is consumed during
+        prefill, so every generation step adds the same tts_pad_embed.
+        
         Args:
             all_codecs: [seq_len, num_code_groups] - all codec tokens
                         Column 0 is group 0 (main talker), columns 1.. are
                         from the code predictor.
                         
         Returns:
-            next_input_embeds: [seq_len, 1, hidden_size] - summed embeddings
+            next_input_embeds: [seq_len, hidden_size] - summed embeddings
                                ready to be fed as inputs_embeds for the next
                                autoregressive step.
         """
         # Embed group 0 using main codec embedding
-        #print(f">>>embedding group 0: {torch.min(all_codecs[:, 0])} <-> {torch.max(all_codecs[:, 0])}", flush=True)
         cb0_embed = self.model.codec_embedding(
             all_codecs[:, 0]
         )  # [seq_len, hidden_size]
@@ -1059,7 +1083,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         cp_embeddings = self.code_predictor.get_input_embeddings()
         cb_embeds = [cb0_embed]
         for i in range(len(cp_embeddings)):
-            #print(f">>>>embedding group {i+1}: {torch.min(all_codecs[:, i+1])} <-> {torch.max(all_codecs[:, i+1])}", flush=True)
             cb_embed = cp_embeddings[i](
                 all_codecs[:, i + 1]
             )  # [seq_len, hidden_size]
@@ -1069,6 +1092,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         # [seq_len, num_code_groups, hidden_size] -> [seq_len, hidden_size]
         codec_hiddens = torch.stack(cb_embeds, dim=1)
         next_input_embeds = codec_hiddens.sum(dim=1)
+        
+        # Add tts_pad_embed to maintain dual-stream text+codec architecture.
+        # In the original model this is:
+        #   if generation_step < trailing_text_hidden.shape[1]:
+        #       inputs_embeds += trailing_text_hidden[:, generation_step]
+        #   else:
+        #       inputs_embeds += tts_pad_embed
+        # For non-streaming mode (all text consumed in prefill),
+        # trailing_text_hidden == tts_pad_embed at every step.
+        # tts_pad_embed is a precomputed buffer (loaded from weights).
+        next_input_embeds = next_input_embeds + self.tts_pad_embed.unsqueeze(0)
         
         return next_input_embeds
 
@@ -1120,6 +1154,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         
         # Compute logits for first codec (group 0)
         logits = self.logits_processor(self.codec_head, hidden_states)
+        
+        # Suppress reserved tokens using precomputed mask (CUDA-graph safe).
+        # The mask is True for the top 1024 token IDs (except EOS).
+        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
         
         # Sample first codec token using config sampling params
         first_codec = _sample_from_logits(
