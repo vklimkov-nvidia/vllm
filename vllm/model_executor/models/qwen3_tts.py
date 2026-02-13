@@ -58,6 +58,70 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+# ── RoPE helpers for the native code predictor ──────────────────────
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input (standard RoPE helper)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply standard 1-D rotary position embeddings to Q and K.
+
+    Args:
+        q, k: [batch, num_heads, seq_len, head_dim]
+        cos, sin: [1, 1, seq_len, head_dim]  (broadcastable)
+    """
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class Qwen3TTSNativeRotaryEmbedding(nn.Module):
+    """Simple 1-D rotary position embedding for the native code predictor.
+
+    Matches the ``Qwen3TTSRotaryEmbedding`` in the original HF code, but
+    simplified: no dynamic-rope, no MRoPE – just standard RoPE with a
+    configurable ``rope_theta``.
+    """
+
+    def __init__(self, head_dim: int, rope_theta: float = 1_000_000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (
+            rope_theta
+            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        # Use nn.Parameter so vLLM natively handles device/dtype casting.
+        # requires_grad=False because this is deterministic and not trained.
+        # The weight-loader already skips "rotary_emb.inv_freq".
+        self.inv_freq = nn.Parameter(inv_freq, requires_grad=False)
+
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(cos, sin)`` tensors for positions ``[0 .. seq_len)``.
+
+        Returns:
+            cos: [1, 1, seq_len, head_dim]
+            sin: [1, 1, seq_len, head_dim]
+        """
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        # [seq_len] x [head_dim/2] → [seq_len, head_dim/2]
+        freqs = torch.outer(positions, self.inv_freq.to(device))
+        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, head_dim]
+        cos = emb.cos().unsqueeze(0).unsqueeze(0).to(dtype)
+        sin = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)
+        return cos, sin
+
+
 def _sample_from_logits(
     logits: torch.Tensor,
     do_sample: bool = True,
@@ -258,12 +322,15 @@ class Qwen3TTSNativeAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Forward pass using torch SDPA.
         
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
             attention_mask: Optional attention mask
+            position_embeddings: Optional (cos, sin) tuple from rotary
+                embedding, each [1, 1, seq_len, head_dim].
         """
         batch_size, seq_len, _ = hidden_states.shape
         
@@ -285,6 +352,11 @@ class Qwen3TTSNativeAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        
+        # Apply rotary position embeddings (standard 1-D RoPE)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            q, k = _apply_rotary_pos_emb(q, k, cos, sin)
         
         # Expand KV heads if using GQA
         if self.num_kv_groups > 1:
@@ -472,11 +544,14 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Self Attention with pre-norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states, attention_mask, position_embeddings
+        )
         hidden_states = residual + hidden_states
 
         # MLP with pre-norm
@@ -733,6 +808,15 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         
         # Final layer norm
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Standard 1-D rotary position embeddings (matches HF code predictor)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.rotary_emb = Qwen3TTSNativeRotaryEmbedding(
+            head_dim=head_dim,
+            rope_theta=getattr(config, "rope_theta", 1_000_000.0),
+        )
 
     def get_input_embeddings(self) -> nn.ModuleList:
         """Get codec embedding layers for all groups."""
@@ -754,8 +838,18 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         """
         hidden_states = inputs_embeds
         
+        # Compute position embeddings shared across all decoder layers.
+        # Positions are simply [0, 1, ..., seq_len-1] since we
+        # recompute from scratch each call (no KV cache).
+        seq_len = hidden_states.shape[1]
+        position_embeddings = self.rotary_emb(
+            seq_len, hidden_states.device, hidden_states.dtype
+        )
+        
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            hidden_states = layer(
+                hidden_states, attention_mask, position_embeddings
+            )
         
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -1212,6 +1306,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        
+        # Mark deterministically-initialized params as already loaded so the
+        # strict weight-loading check doesn't complain about them missing
+        # from the checkpoint.
+        for pname in params_dict:
+            if "rotary_emb.inv_freq" in pname:
+                loaded_params.add(pname)
         
         for name, loaded_weight in weights:
             # The HF checkpoint stores weights under
