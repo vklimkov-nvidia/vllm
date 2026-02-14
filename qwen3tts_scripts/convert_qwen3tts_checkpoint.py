@@ -3,15 +3,19 @@
 
 Takes an input directory containing config.json and model.safetensors,
 applies vLLM-specific config adjustments, precomputes additional weight
-tensors required for CUDA-graph-safe inference, and writes everything
-to an output directory.
+tensors required for CUDA-graph-safe inference, renames weights to match
+the vLLM model layout, and writes everything to an output directory.
+
+Weight renames applied (to match the refactored vLLM model):
+  - talker.model.codec_embedding.* → talker.code_predictor.codec_embedding.*
+  - talker.codec_head.*            → talker.code_predictor.codec_head.*
 
 Precomputed weights added to model.safetensors:
-  - talker.tts_pad_embed   [hidden_size]       float
+  - talker.tts_pad_embed                    [hidden_size]  float
       = text_projection(text_embedding(tts_pad_token_id))
       Added to codec embeddings at every autoregressive step to
       maintain the dual-stream text+codec architecture.
-  - talker.suppress_mask    [vocab_size]        bool
+  - talker.code_predictor.suppress_mask     [vocab_size]   bool
       True for the top 1024 token IDs (except codec_eos_token_id).
       Used to suppress reserved/invalid tokens during sampling.
 
@@ -126,6 +130,37 @@ def _compute_suppress_mask(
     return mask
 
 
+# ── Weight renaming ──────────────────────────────────────────────────
+
+# (old_prefix, new_prefix) – applied in order; first match wins.
+_WEIGHT_RENAME_PREFIXES: list[tuple[str, str]] = [
+    # codec_embedding moved from talker.model → talker.code_predictor
+    ("talker.model.codec_embedding.", "talker.code_predictor.codec_embedding."),
+    # codec_head moved from talker → talker.code_predictor
+    ("talker.codec_head.", "talker.code_predictor.codec_head."),
+]
+
+
+def _rename_weights(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rename weight keys to match the refactored vLLM model layout.
+
+    Returns a new dict (same tensors, no copies).
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    num_renamed = 0
+    for name, tensor in weights.items():
+        new_name = name
+        for old_pfx, new_pfx in _WEIGHT_RENAME_PREFIXES:
+            if name.startswith(old_pfx):
+                new_name = new_pfx + name[len(old_pfx):]
+                num_renamed += 1
+                break
+        renamed[new_name] = tensor
+    if num_renamed:
+        print(f"  Renamed {num_renamed} weight key(s) to match vLLM layout.")
+    return renamed
+
+
 # ── Main conversion ──────────────────────────────────────────────────
 
 
@@ -165,7 +200,10 @@ def convert(input_dir: str, output_dir: str) -> None:
             f"suppressed={suppress_mask.sum().item()} tokens")
 
     weights["talker.tts_pad_embed"] = tts_pad_embed
-    weights["talker.suppress_mask"] = suppress_mask
+    weights["talker.code_predictor.suppress_mask"] = suppress_mask
+
+    # ── 3. Rename weights to match refactored vLLM model ─────────
+    weights = _rename_weights(weights)
 
     out_sf = out_path / "model.safetensors"
     print(f"  Saving {out_sf} ...")

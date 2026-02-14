@@ -26,6 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -680,7 +681,12 @@ def _get_talker_config(hf_config: PretrainedConfig):
 
 
 class Qwen3TTSTalkerModel(nn.Module):
-    """Qwen3TTS Talker Model - transformer backbone with codec and text embeddings."""
+    """Qwen3TTS Talker Model - transformer backbone with text embeddings.
+
+    The codec embedding lives in the code predictor; this module only
+    keeps the text embedding (needed on the first PP rank for input
+    processing).
+    """
 
     def __init__(
         self,
@@ -698,15 +704,8 @@ class Qwen3TTSTalkerModel(nn.Module):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         
-        # Codec embedding for audio tokens
+        # Text embedding for text tokens (codec embedding is in code_predictor)
         if get_pp_group().is_first_rank:
-            self.codec_embedding = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.codec_embedding",
-            )
-            # Text embedding for text tokens
             self.text_embedding = VocabParallelEmbedding(
                 config.text_vocab_size,
                 config.text_hidden_size,
@@ -714,7 +713,6 @@ class Qwen3TTSTalkerModel(nn.Module):
                 prefix=f"{prefix}.text_embedding",
             )
         else:
-            self.codec_embedding = PPMissingLayer()
             self.text_embedding = PPMissingLayer()
         
         # Decoder layers
@@ -739,10 +737,6 @@ class Qwen3TTSTalkerModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get codec embeddings for input ids."""
-        return self.codec_embedding(input_ids)
-    
     def get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Get text embeddings for input ids."""
         return self.text_embedding(input_ids)
@@ -855,34 +849,88 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         return hidden_states
 
 
+#@support_torch_compile
 class Qwen3TTSTalkerCodePredictor(nn.Module):
-    """Native PyTorch code predictor for Qwen3TTS Talker.
+    """Code predictor for Qwen3TTS Talker.
     
-    Predicts codec groups 1 to N-1 given the hidden states from the main talker
-    and previous codec groups.
+    Predicts all codec groups: group 0 via ``codec_head`` (from the talker
+    hidden states) and groups 1..N-1 via the native code-predictor
+    transformer.
     
-    This module uses native PyTorch operations instead of vLLM abstractions
+    This module uses native PyTorch operations instead of vLLM attention
     since the code predictor:
     - Runs independently for each global time step
     - Has deterministic shapes (fixed 15 steps)
     - Doesn't benefit from KV cache
     - Can be captured in CUDA graphs
+    
+    Owns:
+    - ``codec_embedding`` – VocabParallelEmbedding for group-0 codec tokens
+      (shared with the outer model for input embedding lookups).
+    - ``codec_head`` – lm head for group-0 prediction.
+    - ``suppress_mask`` – precomputed bool mask for suppressing reserved tokens.
     """
 
-    def __init__(self, config: PretrainedConfig, talker_hidden_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
+        
+        hf_config = vllm_config.model_config.hf_config
+        talker_config = _get_talker_config(hf_config)
+        config = talker_config.code_predictor_config
+        if isinstance(config, dict):
+            config = _dict_to_namespace(config)
+        quant_config = vllm_config.quant_config
         
         self.config = config
         self.num_code_groups = config.num_code_groups
         self.hidden_size = config.hidden_size
+        self.talker_hidden_size = talker_config.hidden_size
         
-        # Model backbone
-        self.model = Qwen3TTSTalkerCodePredictorModel(config, talker_hidden_size)
+        # ── Group-0 codec embedding (moved from Qwen3TTSTalkerModel) ────
+        # Available on all ranks so the outer model can look up codec
+        # embeddings on the first PP rank and the code predictor can use
+        # them for generation on the last PP rank.
+        self.codec_embedding = VocabParallelEmbedding(
+            talker_config.vocab_size,
+            talker_config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.codec_embedding",
+        )
+        
+        # ── Group-0 prediction head (moved from outer model) ────────────
+        if get_pp_group().is_last_rank:
+            self.codec_head = ParallelLMHead(
+                talker_config.vocab_size,
+                talker_config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.codec_head",
+            )
+        else:
+            self.codec_head = PPMissingLayer()
+        
+        # Precomputed suppress mask (True for the top-1024 reserved token IDs
+        # except EOS).  Static tensor – CUDA-graph safe.
+        self.suppress_mask = nn.Parameter(
+            torch.zeros(talker_config.vocab_size, dtype=torch.bool),
+            requires_grad=False,
+        )
+        
+        self.logits_processor = LogitsProcessor(talker_config.vocab_size)
+        
+        # ── Code-predictor transformer backbone ─────────────────────────
+        self.model = Qwen3TTSTalkerCodePredictorModel(
+            config, self.talker_hidden_size
+        )
         
         # Projection from talker hidden size to code predictor hidden size
-        if config.hidden_size != talker_hidden_size:
+        if config.hidden_size != self.talker_hidden_size:
             self.small_to_mtp_projection = nn.Linear(
-                talker_hidden_size, config.hidden_size, bias=True
+                self.talker_hidden_size, config.hidden_size, bias=True
             )
         else:
             self.small_to_mtp_projection = nn.Identity()
@@ -892,9 +940,22 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             for _ in range(config.num_code_groups - 1)
         ])
+        
+        # Precomputed tts_pad_embed (text_projection(text_embedding(pad_token))).
+        # Added to the summed codec embeddings at every autoregressive step
+        # to maintain the dual-stream text+codec architecture.
+        self.tts_pad_embed = nn.Parameter(
+            torch.zeros(talker_config.hidden_size),
+            requires_grad=False,
+        )
 
-    def get_input_embeddings(self) -> nn.ModuleList:
-        """Get codec embedding layers."""
+    def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Look up group-0 codec embeddings (used by the outer model for
+        input embedding on the first PP rank)."""
+        return self.codec_embedding(input_ids)
+
+    def get_group_embeddings(self) -> nn.ModuleList:
+        """Get codec embedding layers for groups 1..N-1."""
         return self.model.get_input_embeddings()
 
     def forward(
@@ -902,7 +963,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass through the code predictor.
+        """Forward pass through the code predictor transformer.
         
         Args:
             inputs_embeds: [batch_size, seq_len, talker_hidden_size]
@@ -922,7 +983,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         hidden_states: torch.Tensor,
         generation_step: int,
     ) -> torch.Tensor:
-        """Compute logits for a specific code group.
+        """Compute logits for a specific code group (1..N-1).
         
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
@@ -941,28 +1002,25 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
     def generate_all_groups(
         self,
         talker_hidden: torch.Tensor,
-        first_codec: torch.Tensor,
-        talker_codec_embedding: nn.Module,
         do_sample: bool = True,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate all codec groups given talker hidden state and first codec.
+        """Generate **all** codec groups given the talker hidden states.
         
-        This runs the full code predictor loop for all 15 additional groups.
-        Treats the first dimension as batch (works with packed sequences where
-        seq_len becomes the batch dimension).
+        First predicts group-0 from ``talker_hidden`` using ``codec_head``
+        (with suppress-mask and sampling), then autoregressively generates
+        groups 1..N-1 via the code-predictor transformer.
         
         As an optimisation the embeddings computed during the autoregressive
         loop are accumulated and summed so the caller does not need to
-        re-embed all codec tokens afterwards.
+        re-embed all codec tokens afterwards.  ``tts_pad_embed`` is added
+        to the sum internally before returning.
         
         Args:
-            talker_hidden: [seq_len, hidden_size] - hidden states from talker (packed)
-            first_codec: [seq_len] - first codec token (group 0) from talker
-            talker_codec_embedding: Embedding layer for group 0 codec
+            talker_hidden: [seq_len, hidden_size] - hidden states from talker
             do_sample: Whether to sample or use argmax
             temperature: Sampling temperature
             top_k: Top-k sampling
@@ -971,69 +1029,86 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             
         Returns:
             all_codecs: [seq_len, num_code_groups] - all 16 codec tokens
-            codec_embed_sum: [seq_len, hidden_size] - sum of all codec
-                embeddings (groups 0..N-1), ready to have tts_pad_embed
-                added by the caller.
+            next_input_embeds: [seq_len, hidden_size] - sum of all codec
+                embeddings (groups 0..N-1) plus ``tts_pad_embed``.
         """
-        # Prepare initial input: [seq_len, 2, hidden]
-        # - talker_hidden: context from main model (provides position 0)
-        # - first codec embedding: the group 0 token (provides position 1)
-        first_embed = talker_codec_embedding(first_codec)  # [seq_len, hidden]
-        inputs_embeds = torch.stack([talker_hidden, first_embed], dim=1)  # [seq_len, 2, hidden]
+        # ── Predict group-0 codec using the talker's hidden states ──────
+        logits = self.logits_processor(self.codec_head, talker_hidden)
+        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
         
-        all_codecs = [first_codec]  # Start with group 0
-        # Accumulate embeddings so we can return their sum (avoids re-embedding).
-        all_embeds = [first_embed]  # group 0 embedding
+        first_codec = _sample_from_logits(
+            logits,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            previous_tokens=None,
+        )
         
-        # Generate groups 1 through num_code_groups-1 (15 groups)
+        # ── Prepare initial input for the code-predictor transformer ────
+        # [seq_len, 2, hidden]:
+        #   position 0 = talker context
+        #   position 1 = group-0 codec embedding
+        first_embed = self.codec_embedding(first_codec)  # [seq_len, hidden]
+        inputs_embeds = torch.stack(
+            [talker_hidden, first_embed], dim=1
+        )  # [seq_len, 2, hidden]
+        
+        all_codecs = [first_codec]
+        all_embeds = [first_embed]  # accumulate for sum
+        
+        # ── Generate groups 1 through N-1 ───────────────────────────────
         for step in range(self.num_code_groups - 1):
-            # Forward through code predictor model
-            hidden_states = self.forward(inputs_embeds)  # [seq_len, seq_so_far, hidden]
+            # Forward through code predictor (via __call__ for compilation)
+            hidden_states = self(inputs_embeds)  # [seq_len, seq_so_far, hidden]
             
-            # Get logits from the appropriate head (last position)
-            # step=0 -> lm_head[0] predicts group 1
-            # step=1 -> lm_head[1] predicts group 2, etc.
-            logits = self.compute_logits(hidden_states[:, -1, :], step)  # [seq_len, vocab]
+            # Logits from the appropriate lm_head (last position)
+            logits = self.compute_logits(
+                hidden_states[:, -1, :], step
+            )  # [seq_len, vocab]
             
-            # Sample next token
-            # Prepare context for repetition penalty (all previously generated codecs in this frame)
-            # We stack them to get [seq_len, num_generated]
+            # Repetition penalty context
             if repetition_penalty != 1.0:
-                 current_context = torch.stack(all_codecs, dim=1)
+                current_context = torch.stack(all_codecs, dim=1)
             else:
-                 current_context = None
+                current_context = None
 
             next_token = _sample_from_logits(
-                logits, do_sample, temperature, top_k, top_p, repetition_penalty, current_context
+                logits, do_sample, temperature, top_k, top_p,
+                repetition_penalty, current_context,
             )
             all_codecs.append(next_token)
             
-            # Embed the predicted token (reuse for both the next code-predictor
-            # step *and* the accumulated sum returned to the caller).
-            next_embed = self.get_input_embeddings()[step](next_token)  # [seq_len, hidden]
+            # Embed the predicted token
+            next_embed = self.get_group_embeddings()[step](
+                next_token
+            )  # [seq_len, hidden]
             all_embeds.append(next_embed)
             
-            # Feed embedding into next step (skip on the last iteration)
+            # Append embedding for next step (skip on last iteration)
             if step < self.num_code_groups - 2:
-                inputs_embeds = torch.cat([
-                    inputs_embeds, 
-                    next_embed.unsqueeze(1)
-                ], dim=1)
+                inputs_embeds = torch.cat(
+                    [inputs_embeds, next_embed.unsqueeze(1)], dim=1
+                )
         
-        # Sum across all codebook groups: [seq_len, num_code_groups, hidden] -> [seq_len, hidden]
+        # Sum across all codebook groups and add tts_pad_embed
         codec_embed_sum = torch.stack(all_embeds, dim=1).sum(dim=1)
+        next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
         
-        return torch.stack(all_codecs, dim=1), codec_embed_sum
+        return torch.stack(all_codecs, dim=1), next_input_embeds
 
 
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
     """Qwen3TTS Talker for conditional generation.
     
-    This model generates codec tokens conditioned on text input.
-    It contains:
-    - model: Qwen3TTSTalkerModel (transformer backbone)
-    - text_projection: MLP to project text embeddings to hidden size
-    - codec_head: Linear head for codec token prediction
+    Top-level model that orchestrates text-to-codec generation.  The
+    ``code_predictor`` sub-module is compiled via ``@support_torch_compile``
+    (it uses native PyTorch SDPA and benefits from compilation/CUDA-graph
+    capture).  The transformer backbone (``model``) is *not* compiled
+    because it relies on vLLM's paged ``Attention`` which is already
+    optimised and whose custom-op fake kernels can produce stride
+    mismatches under ``torch.compile`` for certain GQA configurations.
     """
     
     packed_modules_mapping = {
@@ -1073,69 +1148,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             self.top_p = getattr(tts_config, "top_p", 1.0)
             self.repetition_penalty = getattr(tts_config, "repetition_penalty", 1.0)
         else:
-            # Fall back to defaults if no TTS config
             self.do_sample = True
             self.temperature = 1.0
             self.top_k = 50
             self.top_p = 1.0
             self.repetition_penalty = 1.0
         
-        # Transformer model
+        # Transformer backbone (not compiled – uses vLLM paged Attention)
         self.model = Qwen3TTSTalkerModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
         
-        # Text projection MLP
-        if get_pp_group().is_first_rank:
-            self.text_projection = Qwen3TTSTalkerResizeMLP(
-                input_size=config.text_hidden_size,
-                intermediate_size=config.text_hidden_size,
-                output_size=config.hidden_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "text_projection"),
-            )
-        else:
-            self.text_projection = PPMissingLayer()
-        
-        # Codec head for token prediction (first code group)
-        if get_pp_group().is_last_rank:
-            self.codec_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "codec_head"),
-            )
-        else:
-            self.codec_head = PPMissingLayer()
-        
-        # Code predictor for additional code groups (native PyTorch, no vLLM attention)
+        # Compiled code predictor (native PyTorch SDPA, benefits from
+        # torch.compile + CUDA-graph capture).  Owns codec_head,
+        # suppress_mask, codec_embedding, and the code-predictor
+        # transformer.
         self.code_predictor = Qwen3TTSTalkerCodePredictor(
-            config=config.code_predictor_config,
-            talker_hidden_size=config.hidden_size,
-        )
-        
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        
-        # Precomputed weights (loaded from checkpoint, computed by the
-        # conversion script).  These must be static tensors so they
-        # are CUDA-graph safe (no dynamic creation or in-place mutation
-        # during forward).  Using nn.Parameter(requires_grad=False) so
-        # vLLM natively handles dtype casting.
-        #
-        # tts_pad_embed: text_projection(text_embedding(tts_pad_token_id))
-        #   Added to codec embeddings at every autoregressive step to
-        #   maintain the dual-stream text+codec architecture.
-        self.tts_pad_embed = nn.Parameter(
-            torch.zeros(config.hidden_size),
-            requires_grad=False,
-        )
-        # suppress_mask: bool mask [vocab_size] – True for the top 1024
-        #   token IDs (except EOS) that the original model suppresses.
-        self.suppress_mask = nn.Parameter(
-            torch.zeros(config.vocab_size, dtype=torch.bool),
-            requires_grad=False,
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "code_predictor"),
         )
         
         self.make_empty_intermediate_tensors = (
@@ -1143,19 +1174,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get codec embeddings for input ids."""
-        return self.model.get_input_embeddings(input_ids)
-    
-    def get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get text embeddings for input ids."""
-        return self.model.get_text_embeddings(input_ids)
-    
-    def project_text_embeddings(
-        self, 
-        text_embeds: torch.Tensor
-    ) -> torch.Tensor:
-        """Project text embeddings to hidden size."""
-        return self.text_projection(text_embeds)
+        """Get group-0 codec embeddings for input ids."""
+        return self.code_predictor.get_group0_embeddings(input_ids)
 
     def forward(
         self,
@@ -1167,13 +1187,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
     ) -> Union[IntermediateTensors, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Forward pass through the talker model.
         
-        Runs the main transformer model, samples the first codec (group 0),
-        then runs the code predictor to generate remaining 15 codec groups.
-        Finally embeds all predicted codecs and sums them so the result can
-        be fed directly as input embeddings for the next autoregressive step.
-        
-        Sampling parameters are taken from the config (do_sample, temperature,
-        top_k, top_p) and are shared between the talker and code predictor.
+        Runs the compiled transformer backbone, then delegates all codec
+        prediction (group 0 through group N-1) to the code predictor.
         
         Args:
             input_ids: Input token IDs
@@ -1185,60 +1200,32 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         Returns:
             For non-last PP rank: IntermediateTensors for pipeline parallelism
             For last PP rank: tuple of (hidden_states, all_codecs, next_input_embeds)
-                - hidden_states: [seq_len, hidden_size] - final hidden states
-                - all_codecs: [seq_len, num_code_groups] - all 16 codec tokens
-                - next_input_embeds: [seq_len, 1, hidden_size] - summed codec
-                  embeddings for the next autoregressive iteration
         """
-        # Forward through main transformer model
+        # Forward through the compiled transformer backbone
         hidden_states = self.model(
             input_ids, 
             positions, 
             intermediate_tensors, 
             inputs_embeds,
-            combined_embeddings
+            combined_embeddings,
         )
         
-        # Handle pipeline parallelism - intermediate ranks return tensors for next rank
+        # Intermediate PP ranks return tensors for next rank
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         
-        # Compute logits for first codec (group 0)
-        logits = self.logits_processor(self.codec_head, hidden_states)
-        
-        # Suppress reserved tokens using precomputed mask (CUDA-graph safe).
-        # The mask is True for the top 1024 token IDs (except EOS).
-        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
-        
-        # Sample first codec token using config sampling params
-        first_codec = _sample_from_logits(
-            logits,
-            do_sample=self.do_sample,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            repetition_penalty=self.repetition_penalty,
-            previous_tokens=None, # No history access for first token
-        )
-        
-        # Generate remaining codec groups (1-15) using code predictor.
-        # generate_all_groups also returns the summed codec embeddings so we
-        # avoid re-embedding all tokens a second time.
-        all_codecs, codec_embed_sum = self.code_predictor.generate_all_groups(
+        # Generate all codec groups (0..N-1) via the code predictor.
+        # Group 0 is predicted from hidden_states using codec_head;
+        # groups 1..N-1 are autoregressively generated by the
+        # code-predictor transformer.
+        all_codecs, next_input_embeds = self.code_predictor.generate_all_groups(
             talker_hidden=hidden_states,
-            first_codec=first_codec,
-            talker_codec_embedding=self.model.codec_embedding,
             do_sample=self.do_sample,
             temperature=self.temperature,
             top_k=self.top_k,
             top_p=self.top_p,
             repetition_penalty=self.repetition_penalty,
         )
-        
-        # Add tts_pad_embed to maintain dual-stream text+codec architecture.
-        # (Previously done inside _embed_codecs; now the embedding sum comes
-        # directly from the code predictor loop.)
-        next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
         
         return hidden_states, all_codecs, next_input_embeds
 
@@ -1252,6 +1239,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         This method exists for compatibility with vLLM's model runner interface.
         """
         return hidden_states
+
+    # Weight-name prefixes that moved during the refactoring.
+    # Maps old (HF / pre-conversion) prefix → new (vLLM model) prefix.
+    # Applied after stripping the "talker." wrapper prefix.
+    _weight_remap_prefixes: list[tuple[str, str]] = [
+        # codec_embedding moved from model → code_predictor
+        ("model.codec_embedding.", "code_predictor.codec_embedding."),
+        # codec_head moved from root → code_predictor
+        ("codec_head.", "code_predictor.codec_head."),
+        # suppress_mask moved from root → code_predictor
+        ("suppress_mask", "code_predictor.suppress_mask"),
+        # tts_pad_embed moved from root → code_predictor
+        ("tts_pad_embed", "code_predictor.tts_pad_embed"),
+    ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1288,6 +1289,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             
             if "rotary_emb.inv_freq" in name:
                 continue
+            
+            # Remap old (HF / pre-conversion) weight names to the new
+            # locations.  Converted checkpoints already use the new names
+            # so these replacements are no-ops for them.
+            for old_pfx, new_pfx in self._weight_remap_prefixes:
+                if name.startswith(old_pfx):
+                    name = new_pfx + name[len(old_pfx):]
+                    break
             
             # Handle stacked parameters (for vLLM parallel layers in the
             # talker backbone).  The code predictor uses native nn.Linear
