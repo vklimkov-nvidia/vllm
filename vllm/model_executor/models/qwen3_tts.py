@@ -949,6 +949,38 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             requires_grad=False,
         )
 
+        # ── Persistent scratch buffers for generate_all_groups ───────────
+        # Pre-allocated once to avoid per-call allocation overhead.
+        # Sized to max_num_tokens (the maximum seq_len the model runner
+        # will ever pass).  generate_all_groups slices into these with the
+        # actual seq_len each call.
+        #
+        # Plain attributes (not register_buffer / nn.Parameter) because
+        # vLLM does not call .to(dtype) on the model after construction --
+        # it loads weights directly.  The device context manager active
+        # during __init__ places these on the correct GPU, and we set
+        # dtype explicitly from the model config.
+        max_num_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        N = config.num_code_groups  # typically 16
+        hidden = talker_config.hidden_size
+        dtype = vllm_config.model_config.dtype
+
+        # Input-embedding buffer: [max_tokens, 1 + N, hidden]
+        # Position 0 = talker context; positions 1..N = codec group embeds.
+        self._cp_inputs_embeds = torch.empty(
+            max_num_tokens, 1 + N, hidden, dtype=dtype
+        )
+        # Codec token IDs: [max_tokens, N]
+        self._cp_all_codecs = torch.empty(
+            max_num_tokens, N, dtype=torch.long
+        )
+        # Running sum of codec embeddings: [max_tokens, hidden]
+        self._cp_codec_embed_sum = torch.empty(
+            max_num_tokens, hidden, dtype=dtype
+        )
+
     def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Look up group-0 codec embeddings (used by the outer model for
         input embedding on the first PP rank)."""
@@ -1009,16 +1041,17 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         repetition_penalty: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate **all** codec groups given the talker hidden states.
-        
+
         First predicts group-0 from ``talker_hidden`` using ``codec_head``
         (with suppress-mask and sampling), then autoregressively generates
         groups 1..N-1 via the code-predictor transformer.
-        
-        As an optimisation the embeddings computed during the autoregressive
-        loop are accumulated and summed so the caller does not need to
-        re-embed all codec tokens afterwards.  ``tts_pad_embed`` is added
-        to the sum internally before returning.
-        
+
+        Uses **persistent scratch buffers** (``_cp_inputs_embeds``,
+        ``_cp_all_codecs``, ``_cp_codec_embed_sum``) that were
+        pre-allocated in the constructor to ``max_num_tokens``.  The loop
+        slices into these buffers with the actual ``seq_len`` so there are
+        zero allocations per call.
+
         Args:
             talker_hidden: [seq_len, hidden_size] - hidden states from talker
             do_sample: Whether to sample or use argmax
@@ -1026,16 +1059,30 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             top_k: Top-k sampling
             top_p: Top-p (nucleus) sampling
             repetition_penalty: Penalty for repeated tokens
-            
+
         Returns:
-            all_codecs: [seq_len, num_code_groups] - all 16 codec tokens
+            all_codecs: [seq_len, num_code_groups] - all codec tokens
             next_input_embeds: [seq_len, hidden_size] - sum of all codec
                 embeddings (groups 0..N-1) plus ``tts_pad_embed``.
         """
+        seq_len = talker_hidden.shape[0]
+        N = self.num_code_groups  # typically 16
+
+        # ── Slice persistent buffers to the actual seq_len ──────────────
+        inputs_embeds = self._cp_inputs_embeds[:seq_len]   # [S, 1+N, H]
+        all_codecs = self._cp_all_codecs[:seq_len]         # [S, N]
+        codec_embed_sum = self._cp_codec_embed_sum[:seq_len]  # [S, H]
+
+        # Reset running sum (zero only the active slice)
+        codec_embed_sum.zero_()
+
+        # Fill position 0 with the talker context
+        inputs_embeds[:, 0, :] = talker_hidden
+
         # ── Predict group-0 codec using the talker's hidden states ──────
         logits = self.logits_processor(self.codec_head, talker_hidden)
         logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
-        
+
         first_codec = _sample_from_logits(
             logits,
             do_sample=do_sample,
@@ -1045,32 +1092,29 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             repetition_penalty=repetition_penalty,
             previous_tokens=None,
         )
-        
-        # ── Prepare initial input for the code-predictor transformer ────
-        # [seq_len, 2, hidden]:
-        #   position 0 = talker context
-        #   position 1 = group-0 codec embedding
+
+        all_codecs[:, 0] = first_codec
         first_embed = self.codec_embedding(first_codec)  # [seq_len, hidden]
-        inputs_embeds = torch.stack(
-            [talker_hidden, first_embed], dim=1
-        )  # [seq_len, 2, hidden]
-        
-        all_codecs = [first_codec]
-        all_embeds = [first_embed]  # accumulate for sum
-        
+        inputs_embeds[:, 1, :] = first_embed
+        codec_embed_sum.add_(first_embed)
+
         # ── Generate groups 1 through N-1 ───────────────────────────────
-        for step in range(self.num_code_groups - 1):
-            # Forward through code predictor (via __call__ for compilation)
-            hidden_states = self(inputs_embeds)  # [seq_len, seq_so_far, hidden]
-            
+        for step in range(N - 1):
+            # Forward through code predictor using a *view* into the
+            # persistent buffer (zero copy, zero allocation).
+            current_len = step + 2  # talker ctx + groups 0..step
+            hidden_states = self(
+                inputs_embeds[:, :current_len, :]
+            )  # [seq_len, current_len, cp_hidden]
+
             # Logits from the appropriate lm_head (last position)
             logits = self.compute_logits(
                 hidden_states[:, -1, :], step
             )  # [seq_len, vocab]
-            
-            # Repetition penalty context
+
+            # Repetition penalty context (view into persistent codecs buf)
             if repetition_penalty != 1.0:
-                current_context = torch.stack(all_codecs, dim=1)
+                current_context = all_codecs[:, : step + 1]
             else:
                 current_context = None
 
@@ -1078,25 +1122,23 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
                 logits, do_sample, temperature, top_k, top_p,
                 repetition_penalty, current_context,
             )
-            all_codecs.append(next_token)
-            
-            # Embed the predicted token
+            all_codecs[:, step + 1] = next_token
+
+            # Embed the predicted token and accumulate
             next_embed = self.get_group_embeddings()[step](
                 next_token
             )  # [seq_len, hidden]
-            all_embeds.append(next_embed)
-            
-            # Append embedding for next step (skip on last iteration)
-            if step < self.num_code_groups - 2:
-                inputs_embeds = torch.cat(
-                    [inputs_embeds, next_embed.unsqueeze(1)], dim=1
-                )
-        
-        # Sum across all codebook groups and add tts_pad_embed
-        codec_embed_sum = torch.stack(all_embeds, dim=1).sum(dim=1)
+            codec_embed_sum.add_(next_embed)
+
+            # Write embedding into buffer for the next iteration's
+            # forward pass (skip on the last iteration – no next forward).
+            if step < N - 2:
+                inputs_embeds[:, current_len, :] = next_embed
+
+        # Add tts_pad_embed to the accumulated codec embedding sum
         next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
-        
-        return torch.stack(all_codecs, dim=1), next_input_embeds
+
+        return all_codecs, next_input_embeds
 
 
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
