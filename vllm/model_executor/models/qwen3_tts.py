@@ -26,10 +26,11 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.compilation.backends import set_model_tag
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -680,6 +681,7 @@ def _get_talker_config(hf_config: PretrainedConfig):
     return hf_config
 
 
+@support_torch_compile
 class Qwen3TTSTalkerModel(nn.Module):
     """Qwen3TTS Talker Model - transformer backbone with text embeddings.
 
@@ -849,7 +851,7 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         return hidden_states
 
 
-#@support_torch_compile
+@support_torch_compile
 class Qwen3TTSTalkerCodePredictor(nn.Module):
     """Code predictor for Qwen3TTS Talker.
     
@@ -950,10 +952,12 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         )
 
         # ── Persistent scratch buffers for generate_all_groups ───────────
-        # Pre-allocated once to avoid per-call allocation overhead.
-        # Sized to max_num_tokens (the maximum seq_len the model runner
-        # will ever pass).  generate_all_groups slices into these with the
-        # actual seq_len each call.
+        # Pre-allocated once to avoid per-call allocation overhead and to
+        # ensure **constant memory addresses** for PIECEWISE / CUDA-graph
+        # capture.  Sized to max_num_tokens (the maximum seq_len the model
+        # runner will ever pass).  generate_all_groups slices these by
+        # seq_len each call; under CUDA graph, seq_len is constant so
+        # the slices are always the same view.
         #
         # Plain attributes (not register_buffer / nn.Parameter) because
         # vLLM does not call .to(dtype) on the model after construction --
@@ -965,12 +969,21 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         )
         N = config.num_code_groups  # typically 16
         hidden = talker_config.hidden_size
+        cp_hidden = config.hidden_size
         dtype = vllm_config.model_config.dtype
+        self._max_cp_len = 1 + N  # talker ctx + N codec groups
 
-        # Input-embedding buffer: [max_tokens, 1 + N, hidden]
+        # Input-embedding buffer: [max_tokens, 1+N, hidden]
         # Position 0 = talker context; positions 1..N = codec group embeds.
-        self._cp_inputs_embeds = torch.empty(
-            max_num_tokens, 1 + N, hidden, dtype=dtype
+        # Zeroed so unfilled positions don't introduce NaN; the causal mask
+        # in SDPA prevents them from affecting filled positions' outputs.
+        self._cp_inputs_embeds = torch.zeros(
+            max_num_tokens, self._max_cp_len, hidden, dtype=dtype
+        )
+        # Output buffer from code-predictor forward: [max_tokens, 1+N, cp_hidden]
+        # Pre-allocated so the compiled forward always writes to the same memory.
+        self._cp_hidden_states = torch.empty(
+            max_num_tokens, self._max_cp_len, cp_hidden, dtype=dtype
         )
         # Codec token IDs: [max_tokens, N]
         self._cp_all_codecs = torch.empty(
@@ -993,21 +1006,31 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through the code predictor transformer.
-        
+
+        The input must always be the **full** pre-allocated buffer
+        ``_cp_inputs_embeds[:seq_len]`` with shape
+        ``[seq_len, 1 + num_code_groups, talker_hidden_size]``.
+        Unfilled positions should be zero; the native SDPA uses causal
+        masking (``is_causal=True``) so they cannot contaminate filled
+        positions.
+
+        Passing a fixed-shape tensor on every call ensures a single
+        compiled graph under PIECEWISE and a single CUDA-graph capture.
+
         Args:
-            inputs_embeds: [batch_size, seq_len, talker_hidden_size]
-            attention_mask: Optional attention mask
-            
+            inputs_embeds: [batch_size, max_cp_len, talker_hidden_size]
+                Always the full code-predictor sequence length.
+
         Returns:
-            hidden_states: [batch_size, seq_len, hidden_size]
+            hidden_states: [batch_size, max_cp_len, cp_hidden_size]
         """
         # Project embeddings to code predictor hidden size
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
-        
-        hidden_states = self.model(inputs_embeds, attention_mask)
+
+        # No attention_mask → SDPA uses is_causal=True (lower-triangular)
+        hidden_states = self.model(inputs_embeds)
         return hidden_states
 
     def compute_logits(
@@ -1046,11 +1069,14 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         (with suppress-mask and sampling), then autoregressively generates
         groups 1..N-1 via the code-predictor transformer.
 
-        Uses **persistent scratch buffers** (``_cp_inputs_embeds``,
-        ``_cp_all_codecs``, ``_cp_codec_embed_sum``) that were
-        pre-allocated in the constructor to ``max_num_tokens``.  The loop
-        slices into these buffers with the actual ``seq_len`` so there are
-        zero allocations per call.
+        Uses **persistent scratch buffers** that were pre-allocated in the
+        constructor to ``max_num_tokens``.  Every call to the compiled
+        ``forward()`` receives the **full** ``_cp_inputs_embeds`` buffer
+        (fixed shape ``[S, 1+N, H]``), ensuring a single compiled graph
+        under PIECEWISE and a single CUDA-graph capture.  Unfilled
+        positions are zero; causal masking in SDPA prevents them from
+        affecting filled positions.  The correct output position is
+        extracted *after* the compiled forward returns.
 
         Args:
             talker_hidden: [seq_len, hidden_size] - hidden states from talker
@@ -1069,11 +1095,15 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         N = self.num_code_groups  # typically 16
 
         # ── Slice persistent buffers to the actual seq_len ──────────────
-        inputs_embeds = self._cp_inputs_embeds[:seq_len]   # [S, 1+N, H]
-        all_codecs = self._cp_all_codecs[:seq_len]         # [S, N]
-        codec_embed_sum = self._cp_codec_embed_sum[:seq_len]  # [S, H]
+        # Under CUDA graph, seq_len is constant so these are always the
+        # same views (same memory address, same shape).
+        inputs_embeds = self._cp_inputs_embeds[:seq_len]       # [S, 1+N, H]
+        all_codecs = self._cp_all_codecs[:seq_len]             # [S, N]
+        codec_embed_sum = self._cp_codec_embed_sum[:seq_len]   # [S, H]
 
-        # Reset running sum (zero only the active slice)
+        # Zero the input buffer so unfilled positions are clean (no NaN).
+        # The running-sum buffer also needs zeroing.
+        inputs_embeds.zero_()
         codec_embed_sum.zero_()
 
         # Fill position 0 with the talker context
@@ -1100,16 +1130,15 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
 
         # ── Generate groups 1 through N-1 ───────────────────────────────
         for step in range(N - 1):
-            # Forward through code predictor using a *view* into the
-            # persistent buffer (zero copy, zero allocation).
-            current_len = step + 2  # talker ctx + groups 0..step
-            hidden_states = self(
-                inputs_embeds[:, :current_len, :]
-            )  # [seq_len, current_len, cp_hidden]
+            # Always pass the FULL buffer (fixed shape for compiled fwd).
+            # Positions 0..current_len-1 are filled; the rest are zero.
+            # Causal masking ensures filled positions' outputs are correct.
+            hidden_states = self(inputs_embeds)  # [S, 1+N, cp_hidden]
 
-            # Logits from the appropriate lm_head (last position)
+            # Extract logits from the last FILLED position
+            current_len = step + 2  # talker ctx + groups 0..step
             logits = self.compute_logits(
-                hidden_states[:, -1, :], step
+                hidden_states[:, current_len - 1, :], step
             )  # [seq_len, vocab]
 
             # Repetition penalty context (view into persistent codecs buf)
@@ -1130,10 +1159,11 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             )  # [seq_len, hidden]
             codec_embed_sum.add_(next_embed)
 
-            # Write embedding into buffer for the next iteration's
-            # forward pass (skip on the last iteration – no next forward).
-            if step < N - 2:
-                inputs_embeds[:, current_len, :] = next_embed
+            # Write embedding into buffer for the next iteration
+            # (every position is written, including the last -- the
+            # forward still reads it via causal masking even though we
+            # don't need another forward after the last step).
+            inputs_embeds[:, current_len, :] = next_embed
 
         # Add tts_pad_embed to the accumulated codec embedding sum
         next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
@@ -1141,6 +1171,8 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         return all_codecs, next_input_embeds
 
 
+@ignore_torch_compile
+@support_torch_compile
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
     """Qwen3TTS Talker for conditional generation.
     
@@ -1197,19 +1229,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             self.repetition_penalty = 1.0
         
         # Transformer backbone (not compiled – uses vLLM paged Attention)
-        self.model = Qwen3TTSTalkerModel(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-        )
+        with set_model_tag("talker"):
+            self.model = Qwen3TTSTalkerModel(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "model"),
+            )
         
         # Compiled code predictor (native PyTorch SDPA, benefits from
         # torch.compile + CUDA-graph capture).  Owns codec_head,
         # suppress_mask, codec_embedding, and the code-predictor
         # transformer.
-        self.code_predictor = Qwen3TTSTalkerCodePredictor(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "code_predictor"),
-        )
+        with set_model_tag("code_predictor"):
+            self.code_predictor = Qwen3TTSTalkerCodePredictor(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "code_predictor"),
+            )
         
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
