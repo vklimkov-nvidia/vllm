@@ -305,6 +305,7 @@ async def main():
         enable_prefix_caching=False,
         trust_remote_code=True,
         enforce_eager=args.enforce_eager,
+        compilation_config={"cudagraph_mode": "PIECEWISE"},
     )
 
     print("Initializing engine...")

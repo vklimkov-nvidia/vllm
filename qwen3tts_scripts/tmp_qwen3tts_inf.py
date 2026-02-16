@@ -29,7 +29,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
-async def main(profile: bool):
+async def main(profile: bool, nsys: bool):
     # ── engine setup ──────────────────────────────────────────────────────
     type_str = "bfloat16"
     max_len = 256
@@ -44,6 +44,7 @@ async def main(profile: bool):
         skip_tokenizer_init=True,
         enable_prefix_caching=False,
         trust_remote_code=True,
+        compilation_config={"cudagraph_mode": "PIECEWISE"},
     )
 
     print("Initializing engine...")
@@ -76,6 +77,10 @@ async def main(profile: bool):
 
     if profile:
         await engine.start_profile()
+    if nsys:
+        torch.cuda.synchronize()
+        torch.cuda.profiler.start()
+
 
     nvtx.range_push("generation_total")
 
@@ -116,6 +121,9 @@ async def main(profile: bool):
 
     if profile:
         await engine.stop_profile()
+    if nsys:
+        torch.cuda.synchronize()
+        torch.cuda.profiler.stop()
 
     print(f"Done – {step_count} decode steps generated.")
 
@@ -123,6 +131,7 @@ async def main(profile: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", action="store_true", help="Enable engine profiling")
+    parser.add_argument("--nsys", action="store_true", help="Enable nsys profiling")
     args = parser.parse_args()
-    asyncio.run(main(args.profile))
+    asyncio.run(main(args.profile, args.nsys))
 
