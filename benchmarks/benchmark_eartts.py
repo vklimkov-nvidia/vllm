@@ -225,15 +225,15 @@ async def main():
     print(f"Benchmark: concurrency={args.concurrency}, requests={args.num_requests}, in={args.input_len}, out={args.output_len}")
 
     # 1. Create Engine Args
-    max_num_batched_tokens = args.max_model_len * args.concurrency * 2
+    #max_num_batched_tokens = args.max_model_len * args.concurrency * 2
     #if args.guidance_scale is not None:
     #    max_num_batched_tokens = max_num_batched_tokens
     engine_args = AsyncEngineArgs(
         model="eartts_vllm_model",
         dtype=args.dtype,
-        max_model_len=786,
+        max_model_len=args.max_model_len,
         #max_num_seqs=args.concurrency * 2,
-        max_num_batched_tokens=786 * 4 * 2,
+        #max_num_batched_tokens=args.max_model_len * args.concurrency * 2,
         gpu_memory_utilization=args.gpu_mem,
         skip_tokenizer_init=True,  # Skip tokenizer since we're using embeddings directly
         load_format="dummy",  # <-- Use dummy weights as requested
