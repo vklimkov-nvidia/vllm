@@ -249,6 +249,13 @@ async def main():
         help="Enforce eager mode (disable CUDA graphs)",
     )
     parser.add_argument(
+        "--input-coalesce-timeout-ms",
+        type=float,
+        default=0,
+        help="Wait up to this many ms for all requests to receive custom "
+             "inputs before running a forward pass (0 to disable)",
+    )
+    parser.add_argument(
         "--no-warmup",
         action="store_true",
         help="Skip warmup run",
@@ -279,6 +286,7 @@ async def main():
         "enable_prefix_caching": False,
         "enforce_eager": args.enforce_eager,
         "disable_log_stats": True,
+        "input_coalesce_timeout_ms": args.input_coalesce_timeout_ms,
     }
     if args.load_format == "dummy":
         engine_args_kwargs["load_format"] = "dummy"
