@@ -308,13 +308,6 @@ class EngineCore:
         output_specs = decode_step_tensor_specs(
             mc.custom_output_specs or [], mc.dtype,
         )
-        #logger.info(">>>>>[CORE] register_shm_channel: request_id=%s "
-        #             "channel_name=%s input_specs=%s output_specs=%s "
-        #             "custom_input_specs=%s custom_output_specs=%s",
-        #             request_id, channel_name,
-        #             [(s.name, s.shape, s.dtype) for s in input_specs],
-        #             [(s.name, s.shape, s.dtype) for s in output_specs],
-        #             mc.custom_input_specs, mc.custom_output_specs)
         ch = SharedMemoryTensorChannel(
             name=channel_name,
             request_id=request_id,
@@ -323,10 +316,6 @@ class EngineCore:
             create=False,
         )
         self._shm_channels[request_id] = ch
-        #logger.info(">>>>>[CORE] register_shm_channel: DONE. "
-        #             "Total channels now: %d (%s)",
-        #             len(self._shm_channels),
-        #             list(self._shm_channels.keys()))
 
     def unregister_shm_channel(self, request_id: str) -> None:
         """Close and remove the shm channel for *request_id*."""
@@ -340,12 +329,7 @@ class EngineCore:
         """Check all registered shm channels for ready inputs."""
         for request_id, ch in self._shm_channels.items():
             if ch.check_input_ready():
-                #logger.info(">>>>>[CORE] _poll_shm_channels: input ready for %s",
-                #             request_id)
                 inputs = ch.consume_input()
-                #logger.info(">>>>>[CORE] _poll_shm_channels: calling "
-                #             "set_custom_inputs for %s with keys=%s",
-                #             request_id, list(inputs.keys()))
                 self.set_custom_inputs(request_id, inputs)
 
     _SHM_POLL_TIMEOUT_S = 2.0
@@ -940,16 +924,10 @@ class EngineCoreProc(EngineCore):
         # client doesn't block the forward pass indefinitely).
         # Two exclusive modes: shm spin-poll vs zmq queue block.
         needing = self.scheduler.num_requests_needing_inputs()
-        #logger.info(">>>>>[CORE] _process_input_queue: coalesce_timeout=%.4f, "
-        #             "needing_inputs=%d, shm_channels=%s",
-        #             self._input_coalesce_timeout_s, needing,
-        #             list(self._shm_channels.keys()))
         if needing > 0:
             if self._shm_channels:
-                #logger.info(">>>>>[CORE] _process_input_queue: using SHM path")
                 self._wait_for_shm_inputs()
             elif self._input_coalesce_timeout_s > 0:
-                #logger.info(">>>>>[CORE] _process_input_queue: using ZMQ queue path")
                 self._wait_for_queue_inputs()
             still_waiting = self.scheduler.num_requests_needing_inputs()
             if still_waiting > 0:
@@ -966,17 +944,6 @@ class EngineCoreProc(EngineCore):
         # For shm-registered requests, route custom outputs to shared
         # memory and remove them from the list; everything else is
         # queued exactly as before.
-        num_outputs_total = sum(
-            len(eo.outputs)
-            for eo in (outputs.values() if outputs else ())
-        )
-        #logger.info(">>>>>[CORE] _process_engine_step: model_executed=%s, "
-        #             "num_client_groups=%d, total_outputs=%d, "
-        #             "shm_channels=%s",
-        #             model_executed,
-        #             len(outputs) if outputs else 0,
-        #             num_outputs_total,
-        #             list(self._shm_channels.keys()))
         for client_idx, engine_outputs in (
             outputs.items() if outputs else ()
         ):
@@ -984,25 +951,10 @@ class EngineCoreProc(EngineCore):
                 remaining = []
                 for out in engine_outputs.outputs:
                     ch = self._shm_channels.get(out.request_id)
-                    has_custom = bool(out.new_custom_outputs)
-                    can_write = (
-                        ch.can_write_outputs(out.new_custom_outputs)
-                        if (ch is not None and has_custom) else False
-                    )
-                    #logger.info(
-                    #    ">>>>>[CORE] _process_engine_step: request_id=%s, "
-                    #    "has_shm_channel=%s, has_custom_outputs=%s, "
-                    #    "custom_output_keys=%s, can_write=%s, "
-                    #    "finish_reason=%s",
-                    #    out.request_id,
-                    #    ch is not None,
-                    #    has_custom,
-                    #    (list(out.new_custom_outputs.keys())
-                    #     if has_custom else None),
-                    #    can_write,
-                    #    getattr(out, 'finish_reason', None),
-                    #)
-                    if (ch is not None and has_custom and can_write):
+                    if (ch is not None
+                            and out.new_custom_outputs
+                            and ch.can_write_outputs(
+                                out.new_custom_outputs)):
                         ch.write_outputs(out.new_custom_outputs)
                         ch.signal_output_ready()
                     else:

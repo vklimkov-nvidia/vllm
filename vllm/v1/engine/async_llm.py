@@ -341,18 +341,10 @@ class AsyncLLM(EngineClient):
             return
 
         ch = self._shm_channels.get(request_id)
-        #logger.info(">>>>>[CLIENT] append_request: request_id=%s, "
-        #             "has_shm_channel=%s, input_keys=%s",
-        #             request_id, ch is not None,
-        #             list(custom_inputs.keys()) if custom_inputs else None)
         if ch is not None:
-            #logger.info(">>>>>[CLIENT] append_request: writing to SHM "
-            #             "(channel=%s)", ch.name)
             ch.write_inputs(custom_inputs)
             ch.signal_input_ready()
-            #logger.info(">>>>>[CLIENT] append_request: SHM input signalled")
         else:
-            #logger.info(">>>>>[CLIENT] append_request: using ZMQ path")
             request = EngineCoreAppendRequest(
                 request_id=request_id, custom_inputs=custom_inputs,
             )
@@ -383,11 +375,6 @@ class AsyncLLM(EngineClient):
             mc.custom_output_specs or [], mc.dtype,
         )
         channel_name = f"vllm_shm_{request_id}"
-        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: request_id=%s "
-        #             "channel_name=%s input_specs=%s output_specs=%s",
-        #             request_id, channel_name,
-        #             [(s.name, s.shape, s.dtype) for s in input_specs],
-        #             [(s.name, s.shape, s.dtype) for s in output_specs])
         ch = SharedMemoryTensorChannel(
             name=channel_name,
             request_id=request_id,
@@ -397,12 +384,9 @@ class AsyncLLM(EngineClient):
         )
         self._shm_channels[request_id] = ch
 
-        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: calling "
-        #             "register_shm_channel on core...")
         await self.engine_core.call_utility_async(
             "register_shm_channel", request_id, channel_name,
         )
-        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: core registered OK")
         return ch
 
     async def close_shm_decode_channel(self, request_id: str) -> None:
