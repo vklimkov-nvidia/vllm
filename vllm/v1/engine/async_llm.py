@@ -416,35 +416,23 @@ class AsyncLLM(EngineClient):
 
     async def wait_for_output(
         self, request_id: str,
+        timeout: float = 5.0,
     ) -> dict[str, torch.Tensor]:
         """Await the next decode-step output from the shared-memory channel.
 
-        Polls the output-ready flag with short async sleeps so the
-        event loop stays responsive without burning CPU.
+        Uses futex via ``run_in_executor`` so the event loop stays free
+        while the thread sleeps in the kernel (~1-5 µs wake latency,
+        zero CPU usage while waiting).
         """
         ch = self._shm_channels.get(request_id)
         if ch is None:
             raise ValueError(
                 f"No shared-memory channel for request {request_id}"
             )
-        #logger.info(">>>>>[CLIENT] wait_for_output: start polling for %s "
-        #             "(channel=%s, buf_id=%d)",
-        #             request_id, ch.name, id(ch._buf))
-        polls = 0
-        t0 = time.monotonic()
-        while not ch.check_output_ready():
-            polls += 1
-            if polls % 10000 == 0:
-                elapsed = time.monotonic() - t0
-                #logger.warning(
-                #    ">>>>>[CLIENT] wait_for_output: still waiting for %s "
-                #    "after %d polls (%.2fs). output_ready_byte=%d",
-                #    request_id, polls, elapsed,
-                #    int(ch._buf[1]))
-            await asyncio.sleep(0.0001)  # 100 µs
-        elapsed = time.monotonic() - t0
-        #logger.info(">>>>>[CLIENT] wait_for_output: output ready for %s "
-        #             "after %d polls (%.4fs)", request_id, polls, elapsed)
+        if not ch.check_output_ready():
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, ch.wait_output_ready, timeout)
         return ch.consume_output()
 
     async def _add_request(

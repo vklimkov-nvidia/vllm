@@ -351,23 +351,26 @@ class EngineCore:
     _SHM_POLL_TIMEOUT_S = 2.0
 
     def _wait_for_shm_inputs(self) -> None:
-        """Spin-poll shm channels until all requests have inputs or timeout."""
+        """Wait for shm inputs using futex (kernel-assisted sleep)."""
         timeout = max(self._input_coalesce_timeout_s, self._SHM_POLL_TIMEOUT_S)
-        needing = self.scheduler.num_requests_needing_inputs()
-        #logger.info(">>>>>[CORE] _wait_for_shm_inputs: entering, "
-        #             "needing_inputs=%d, timeout=%.4fs, channels=%s",
-        #             needing, timeout,
-        #             list(self._shm_channels.keys()))
         deadline = time.monotonic() + timeout
-        polls = 0
         while self.scheduler.num_requests_needing_inputs() > 0:
             self._poll_shm_channels()
-            polls += 1
-            if time.monotonic() >= deadline:
+            if self.scheduler.num_requests_needing_inputs() == 0:
                 break
-        still_needing = self.scheduler.num_requests_needing_inputs()
-        #logger.info(">>>>>[CORE] _wait_for_shm_inputs: exiting after %d polls, "
-        #             "still_needing=%d", polls, still_needing)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Futex-wait on any non-ready channel.  For the typical
+            # single-channel case this sleeps until the client signals,
+            # waking in ~1-5 µs.  For multiple channels use a short
+            # timeout so we cycle between them.
+            wait_t = (remaining if len(self._shm_channels) == 1
+                      else min(remaining, 0.001))
+            for ch in self._shm_channels.values():
+                if not ch.check_input_ready():
+                    ch.wait_input_ready(timeout_s=wait_t)
+                    break
 
     def _wait_for_queue_inputs(self) -> None:
         """Original ZMQ path: block on queue for custom inputs."""

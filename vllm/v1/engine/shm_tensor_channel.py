@@ -7,13 +7,17 @@ using POSIX shared memory with flag-based signaling.  Designed for the
 decode loop where the client writes custom inputs (e.g. shape [1, dim])
 and the core writes back outputs each step.
 
+Uses Linux futex(2) for efficient cross-process waiting: the waiting
+side sleeps in the kernel until the signaling side writes the flag and
+calls FUTEX_WAKE, yielding ~1-5 µs wake latency with zero CPU usage.
+
 Shared-memory layout::
 
-    HEADER (264 bytes, aligned to 64):
-      [0]       input_ready    (uint8, client -> core)
-      [1]       output_ready   (uint8, core -> client)
-      [4:8]     request_id_len (uint32 LE)
-      [8:264]   request_id     (UTF-8, max 256 bytes)
+    HEADER (272 bytes, aligned to 64):
+      [0:4]     input_ready    (uint32 LE, client -> core, futex word)
+      [4:8]     output_ready   (uint32 LE, core -> client, futex word)
+      [8:12]    request_id_len (uint32 LE)
+      [12:268]  request_id     (UTF-8, max 256 bytes)
 
     INPUT DATA REGION:  contiguous buffer for input tensors
     OUTPUT DATA REGION: contiguous buffer for output tensors
@@ -24,6 +28,8 @@ passed at construction time, so both sides agree on the layout.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import math
 import multiprocessing.shared_memory as shm
 import struct
@@ -35,13 +41,50 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_INPUT_READY_OFF = 0
-_OUTPUT_READY_OFF = 1
-_REQ_ID_LEN_OFF = 4
-_REQ_ID_OFF = 8
+_INPUT_READY_OFF = 0   # uint32, 4-byte aligned for futex
+_OUTPUT_READY_OFF = 4  # uint32, 4-byte aligned for futex
+_REQ_ID_LEN_OFF = 8
+_REQ_ID_OFF = 12
 _REQ_ID_MAX = 256
-_HEADER_SIZE = _REQ_ID_OFF + _REQ_ID_MAX  # 264
+_HEADER_SIZE = _REQ_ID_OFF + _REQ_ID_MAX  # 268
 _ALIGN = 64
+
+# ── Linux futex helpers ───────────────────────────────────────────
+_SYS_FUTEX = 202  # x86_64
+_FUTEX_WAIT = 0
+_FUTEX_WAKE = 1
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+def _futex_wait(addr: int, expected: int,
+                timeout_s: float | None) -> int:
+    """Sleep until the uint32 at *addr* differs from *expected*."""
+    if timeout_s is not None:
+        sec = int(timeout_s)
+        nsec = int((timeout_s - sec) * 1_000_000_000)
+        ts = _Timespec(sec, nsec)
+        return _libc.syscall(
+            ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
+            ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected),
+            ctypes.byref(ts),
+        )
+    return _libc.syscall(
+        ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
+        ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected), None,
+    )
+
+
+def _futex_wake(addr: int, count: int = 1) -> int:
+    """Wake up to *count* threads sleeping on the futex at *addr*."""
+    return _libc.syscall(
+        ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
+        ctypes.c_int(_FUTEX_WAKE), ctypes.c_int(count),
+    )
 
 
 def _align_up(n: int, alignment: int) -> int:
@@ -134,33 +177,19 @@ class SharedMemoryTensorChannel:
             rid = request_id.encode("utf-8")[:_REQ_ID_MAX]
             struct.pack_into("<I", self._buf, _REQ_ID_LEN_OFF, len(rid))
             self._buf[_REQ_ID_OFF : _REQ_ID_OFF + len(rid)] = rid
-           #logger.info(
-           #     ">>>>>[SHM] CREATED channel name=%s request_id=%s "
-           #     "total_size=%d input_region_off=%d output_region_off=%d "
-           #     "input_slots=%s output_slots=%s buf_id=%d",
-           #     name, request_id, total_size,
-           #     self._input_region_off, self._output_region_off,
-           #     {k: (off, s.shape, s.dtype)
-           #      for k, (off, s) in self._input_slots.items()},
-           #     {k: (off, s.shape, s.dtype)
-           #      for k, (off, s) in self._output_slots.items()},
-           #     id(self._buf),
-           # )
         else:
             self._shm = shm.SharedMemory(name=name, create=False)
             self._buf = self._shm.buf
-            #logger.info(
-            #    ">>>>>[SHM] OPENED channel name=%s request_id=%s "
-            #    "shm_size=%d input_region_off=%d output_region_off=%d "
-            #    "input_slots=%s output_slots=%s buf_id=%d",
-            #    name, request_id, self._shm.size,
-            #    self._input_region_off, self._output_region_off,
-            #    {k: (off, s.shape, s.dtype)
-            #     for k, (off, s) in self._input_slots.items()},
-            #    {k: (off, s.shape, s.dtype)
-            #     for k, (off, s) in self._output_slots.items()},
-            #    id(self._buf),
-            #)
+
+        # Cache raw addresses for futex syscalls.  ctypes.from_buffer
+        # pins to the underlying mmap page so both processes use the
+        # same physical address, which is what futex requires.
+        self._input_futex_word = ctypes.c_uint32.from_buffer(
+            self._shm.buf, _INPUT_READY_OFF)
+        self._output_futex_word = ctypes.c_uint32.from_buffer(
+            self._shm.buf, _OUTPUT_READY_OFF)
+        self._input_futex_addr = ctypes.addressof(self._input_futex_word)
+        self._output_futex_addr = ctypes.addressof(self._output_futex_word)
 
     # ── internal helpers ───────────────────────────────────────────
 
@@ -206,33 +235,31 @@ class SharedMemoryTensorChannel:
             self.write_input(name, tensor)
 
     def signal_input_ready(self) -> None:
-        #logger.info(">>>>>[SHM %s] signal_input_ready: setting flag at offset %d "
-        #             "(shm_name=%s, buf_id=%d)",
-        #             self.request_id, _INPUT_READY_OFF, self.name, id(self._buf))
-        self._buf[_INPUT_READY_OFF] = 1
-        #logger.info(">>>>>[SHM %s] signal_input_ready: flag value after set = %d",
-        #             self.request_id, int(self._buf[_INPUT_READY_OFF]))
+        """Client: set input_ready flag and wake the core via futex."""
+        self._input_futex_word.value = 1
+        _futex_wake(self._input_futex_addr)
 
     def check_input_ready(self) -> bool:
-        val = bool(self._buf[_INPUT_READY_OFF])
-        #if val:
-        #    logger.info(">>>>>[SHM %s] check_input_ready: flag=1 (shm_name=%s, "
-        #                 "buf_id=%d)", self.request_id, self.name, id(self._buf))
-        return val
+        return self._input_futex_word.value != 0
+
+    def wait_input_ready(self, timeout_s: float | None = None) -> bool:
+        """Core: block until input_ready is set, or timeout.
+
+        Returns True if input is ready, False on timeout.
+        """
+        while self._input_futex_word.value == 0:
+            _futex_wait(self._input_futex_addr, 0, timeout_s)
+            if timeout_s is not None and self._input_futex_word.value == 0:
+                return False
+        return True
 
     def consume_input(self) -> dict[str, torch.Tensor]:
         """Read all input tensors and clear the input_ready flag."""
-        #logger.info(">>>>>[SHM %s] consume_input: clearing input_ready flag",
-        #             self.request_id)
-        self._buf[_INPUT_READY_OFF] = 0
-        result = {
+        self._input_futex_word.value = 0
+        return {
             name: self._read_tensor(self._input_region_off, off, spec)
             for name, (off, spec) in self._input_slots.items()
         }
-        #logger.info(">>>>>[SHM %s] consume_input: read %d tensors: %s",
-        #             self.request_id, len(result),
-        #             {k: (v.shape, v.dtype) for k, v in result.items()})
-        return result
 
     # ── Core -> Client ─────────────────────────────────────────────
 
@@ -241,15 +268,9 @@ class SharedMemoryTensorChannel:
         for name, tensor in outputs.items():
             entry = self._output_slots.get(name)
             if entry is None:
-                #logger.info(">>>>>[SHM %s] can_write_outputs: no slot for '%s'",
-                #             self.request_id, name)
                 return False
             _, spec = entry
             if tensor.shape != spec.shape or tensor.dtype != spec.dtype:
-                #logger.info(">>>>>[SHM %s] can_write_outputs: mismatch for '%s': "
-                #             "expected shape=%s dtype=%s, got shape=%s dtype=%s",
-                #             spec.shape, spec.dtype,
-                #             tensor.shape, tensor.dtype)
                 return False
         return True
 
@@ -258,41 +279,42 @@ class SharedMemoryTensorChannel:
         self._write_tensor(self._output_region_off, local_off, spec, tensor)
 
     def write_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
-        #logger.info(">>>>>[SHM %s] write_outputs: writing %d tensors: %s",
-        #             self.request_id, len(outputs),
-        #             {k: (v.shape, v.dtype) for k, v in outputs.items()})
         for name, tensor in outputs.items():
             self.write_output(name, tensor)
 
     def signal_output_ready(self) -> None:
-        #logger.info(">>>>>[SHM %s] signal_output_ready: setting flag at offset %d "
-        #             "(shm_name=%s, buf_id=%d)",
-        #             self.request_id, _OUTPUT_READY_OFF, self.name, id(self._buf))
-        self._buf[_OUTPUT_READY_OFF] = 1
-        #logger.info(">>>>>[SHM %s] signal_output_ready: flag value after set = %d",
-        #             self.request_id, int(self._buf[_OUTPUT_READY_OFF]))
+        """Core: set output_ready flag and wake the client via futex."""
+        self._output_futex_word.value = 1
+        _futex_wake(self._output_futex_addr)
 
     def check_output_ready(self) -> bool:
-        val = bool(self._buf[_OUTPUT_READY_OFF])
-        return val
+        return self._output_futex_word.value != 0
+
+    def wait_output_ready(self, timeout_s: float | None = None) -> bool:
+        """Client: block until output_ready is set, or timeout.
+
+        Returns True if output is ready, False on timeout.
+        """
+        while self._output_futex_word.value == 0:
+            _futex_wait(self._output_futex_addr, 0, timeout_s)
+            if timeout_s is not None and self._output_futex_word.value == 0:
+                return False
+        return True
 
     def consume_output(self) -> dict[str, torch.Tensor]:
         """Read all output tensors and clear the output_ready flag."""
-        #logger.info(">>>>>[SHM %s] consume_output: clearing output_ready flag",
-        #             self.request_id)
-        self._buf[_OUTPUT_READY_OFF] = 0
-        result = {
+        self._output_futex_word.value = 0
+        return {
             name: self._read_tensor(self._output_region_off, off, spec)
             for name, (off, spec) in self._output_slots.items()
         }
-        #logger.info(">>>>>[SHM %s] consume_output: read %d tensors: %s",
-        #             self.request_id, len(result),
-        #             {k: (v.shape, v.dtype) for k, v in result.items()})
-        return result
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
     def close(self) -> None:
+        # Release ctypes buffer exports before closing the mmap.
+        self._input_futex_word = None
+        self._output_futex_word = None
         if hasattr(self, "_shm"):
             self._shm.close()
             if self._is_creator:
