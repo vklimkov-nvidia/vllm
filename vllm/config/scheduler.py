@@ -151,6 +151,12 @@ class SchedulerConfig:
     structured outputs, speculative decoding, and pipeline parallelism.
     """
 
+    input_coalesce_timeout_ms: float = 0
+    """When using models with custom inputs (e.g. TTS), wait up to this many
+    milliseconds for all active requests to receive their inputs before
+    running the next forward pass. Prevents partial-batch scheduling where
+    only some requests are ready. Set to 0 to disable."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
