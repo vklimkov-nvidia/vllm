@@ -1511,6 +1511,16 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
+    def num_requests_needing_inputs(self) -> int:
+        """Count requests that need custom inputs before they can run."""
+        if not self.await_inputs:
+            return 0
+        count = len(self.waiting_input)
+        for req in self.running:
+            if not req.has_custom_inputs():
+                count += 1
+        return count
+
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
 

@@ -151,6 +151,8 @@ class EngineCore:
             include_finished_set=vllm_config.parallel_config.data_parallel_size > 1,
             log_stats=self.log_stats,
         )
+        self._input_coalesce_timeout_s = (
+            vllm_config.scheduler_config.input_coalesce_timeout_ms / 1000.0)
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(
@@ -825,6 +827,29 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+        # Wait briefly for custom inputs so requests can be batched together
+        # instead of running partial batches.
+        if (self._input_coalesce_timeout_s > 0
+                and self.scheduler.num_requests_needing_inputs() > 0):
+            deadline = time.monotonic() + self._input_coalesce_timeout_s
+            while self.scheduler.num_requests_needing_inputs() > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    req = self.input_queue.get(timeout=remaining)
+                    self._handle_client_request(*req)
+                    while not self.input_queue.empty():
+                        req = self.input_queue.get_nowait()
+                        self._handle_client_request(*req)
+                except queue.Empty:
+                    break
+            still_waiting = self.scheduler.num_requests_needing_inputs()
+            if still_waiting > 0:
+                logger.warning(
+                    "Proceeding with forward pass while %d request(s) "
+                    "still waiting for custom inputs", still_waiting)
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

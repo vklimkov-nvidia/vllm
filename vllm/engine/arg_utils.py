@@ -514,6 +514,8 @@ class EngineArgs:
 
     async_scheduling: bool = SchedulerConfig.async_scheduling
 
+    input_coalesce_timeout_ms: float = SchedulerConfig.input_coalesce_timeout_ms
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
 
     def __post_init__(self):
@@ -993,6 +995,10 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
+        )
+        scheduler_group.add_argument(
+            "--input-coalesce-timeout-ms",
+            **scheduler_kwargs["input_coalesce_timeout_ms"],
         )
 
         # vLLM arguments
@@ -1485,6 +1491,7 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            input_coalesce_timeout_ms=self.input_coalesce_timeout_ms,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
