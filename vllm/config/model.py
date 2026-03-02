@@ -341,6 +341,14 @@ class ModelConfig:
     for a custom input that will be provided via append_request. If specified, the model
     will wait for custom inputs before scheduling.
     """
+    custom_output_specs: Optional[list[CustomInputSpec]] = None
+    """List of custom output specifications (same schema as input specs).
+    Each spec defines name, dtype, and dim for an output tensor produced
+    by the model on each decode step.  Used to size shared-memory decode
+    channels."""
+    shm_decode: bool = False
+    """Use shared-memory channels for decode-step custom I/O instead of
+    ZMQ.  Requires ``custom_input_specs`` and ``custom_output_specs``."""
 
     # Pooler config
     pooler_config: Optional[PoolerConfig] = None
@@ -751,7 +759,30 @@ class ModelConfig:
                 raise RuntimeError(
                     f"Error parsing custom input specifications from hf_config: {e}"
                 ) from e
-        self.custom_outputs = getattr(self.hf_config, "custom_outputs", None)
+        self.custom_output_specs = None
+        custom_out_specs_dict = getattr(
+            self.hf_config, "custom_output_specs", None
+        )
+        if custom_out_specs_dict:
+            self.custom_output_specs = []
+            try:
+                for spec_dict in custom_out_specs_dict:
+                    spec = CustomInputSpec(**spec_dict)
+                    self.custom_output_specs.append(spec)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error parsing custom output specifications "
+                    f"from hf_config: {e}"
+                ) from e
+
+        # Derive custom_outputs (name list) from output specs when
+        # available; fall back to the legacy flat list for older configs.
+        if self.custom_output_specs:
+            self.custom_outputs = [s.name for s in self.custom_output_specs]
+        else:
+            self.custom_outputs = getattr(
+                self.hf_config, "custom_outputs", None
+            )
 
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len

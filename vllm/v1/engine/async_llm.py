@@ -33,6 +33,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Device, as_list, cancel_task_threadsafe, cdiv, deprecate_kwargs
 from vllm.v1.engine import EngineCoreRequest, EngineCoreAppendRequest
 from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.shm_tensor_channel import (
+    SharedMemoryTensorChannel,
+    decode_step_tensor_specs,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -138,6 +142,8 @@ class AsyncLLM(EngineClient):
                 client_count=client_count,
             )
             self.logger_manager.log_engine_initialized()
+
+        self._shm_channels: dict[str, SharedMemoryTensorChannel] = {}
 
         self.output_handler: Optional[asyncio.Task] = None
         try:
@@ -323,19 +329,123 @@ class AsyncLLM(EngineClient):
         request_id: str, 
         custom_inputs: Optional[dict[str, torch.Tensor]] = None,
     ):
-        """
-        Adds new custom inputs into existing request.
-        Once inputs are added, the request will be scheduled for execution.
-        
-        Args:
-            request_id: The request ID
-            custom_inputs: Optional dictionary mapping input names to tensors
+        """Adds new custom inputs into existing request.
+
+        When a shared-memory channel is registered for *request_id*
+        (see ``shm_decode`` config), the inputs are written directly
+        to shared memory.  Otherwise the ZMQ path is used.
         """
         if self.errored:
             raise EngineDeadError()
-        if custom_inputs is not None:
-            request = EngineCoreAppendRequest(request_id=request_id, custom_inputs=custom_inputs)
+        if custom_inputs is None:
+            return
+
+        ch = self._shm_channels.get(request_id)
+        #logger.info(">>>>>[CLIENT] append_request: request_id=%s, "
+        #             "has_shm_channel=%s, input_keys=%s",
+        #             request_id, ch is not None,
+        #             list(custom_inputs.keys()) if custom_inputs else None)
+        if ch is not None:
+            #logger.info(">>>>>[CLIENT] append_request: writing to SHM "
+            #             "(channel=%s)", ch.name)
+            ch.write_inputs(custom_inputs)
+            ch.signal_input_ready()
+            #logger.info(">>>>>[CLIENT] append_request: SHM input signalled")
+        else:
+            #logger.info(">>>>>[CLIENT] append_request: using ZMQ path")
+            request = EngineCoreAppendRequest(
+                request_id=request_id, custom_inputs=custom_inputs,
+            )
             await self.engine_core.set_custom_inputs_async(request)
+
+    # ── Shared-memory decode channels ──────────────────────────────
+
+    async def create_shm_decode_channel(
+        self,
+        request_id: str,
+    ) -> SharedMemoryTensorChannel:
+        """Create a shared-memory channel for decode-step I/O.
+
+        Tensor specs are derived from the model config's
+        ``custom_input_specs`` and ``custom_output_specs``.  The core
+        is notified via a utility call so the channel is registered
+        before the first decode step.
+
+        When ``model_config.shm_decode`` is ``True`` this is called
+        automatically from ``_add_request``; callers may also invoke
+        it explicitly.
+        """
+        mc = self.model_config
+        input_specs = decode_step_tensor_specs(
+            mc.custom_input_specs or [], mc.dtype,
+        )
+        output_specs = decode_step_tensor_specs(
+            mc.custom_output_specs or [], mc.dtype,
+        )
+        channel_name = f"vllm_shm_{request_id}"
+        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: request_id=%s "
+        #             "channel_name=%s input_specs=%s output_specs=%s",
+        #             request_id, channel_name,
+        #             [(s.name, s.shape, s.dtype) for s in input_specs],
+        #             [(s.name, s.shape, s.dtype) for s in output_specs])
+        ch = SharedMemoryTensorChannel(
+            name=channel_name,
+            request_id=request_id,
+            input_specs=input_specs,
+            output_specs=output_specs,
+            create=True,
+        )
+        self._shm_channels[request_id] = ch
+
+        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: calling "
+        #             "register_shm_channel on core...")
+        await self.engine_core.call_utility_async(
+            "register_shm_channel", request_id, channel_name,
+        )
+        #logger.info(">>>>>[CLIENT] create_shm_decode_channel: core registered OK")
+        return ch
+
+    async def close_shm_decode_channel(self, request_id: str) -> None:
+        """Close the shared-memory channel and unregister it on the core."""
+        ch = self._shm_channels.pop(request_id, None)
+        if ch is not None:
+            ch.close()
+            await self.engine_core.call_utility_async(
+                "unregister_shm_channel", request_id,
+            )
+
+    async def wait_for_output(
+        self, request_id: str,
+    ) -> dict[str, torch.Tensor]:
+        """Await the next decode-step output from the shared-memory channel.
+
+        Polls the output-ready flag with short async sleeps so the
+        event loop stays responsive without burning CPU.
+        """
+        ch = self._shm_channels.get(request_id)
+        if ch is None:
+            raise ValueError(
+                f"No shared-memory channel for request {request_id}"
+            )
+        #logger.info(">>>>>[CLIENT] wait_for_output: start polling for %s "
+        #             "(channel=%s, buf_id=%d)",
+        #             request_id, ch.name, id(ch._buf))
+        polls = 0
+        t0 = time.monotonic()
+        while not ch.check_output_ready():
+            polls += 1
+            if polls % 10000 == 0:
+                elapsed = time.monotonic() - t0
+                #logger.warning(
+                #    ">>>>>[CLIENT] wait_for_output: still waiting for %s "
+                #    "after %d polls (%.2fs). output_ready_byte=%d",
+                #    request_id, polls, elapsed,
+                #    int(ch._buf[1]))
+            await asyncio.sleep(0.0001)  # 100 µs
+        elapsed = time.monotonic() - t0
+        #logger.info(">>>>>[CLIENT] wait_for_output: output ready for %s "
+        #             "after %d polls (%.4fs)", request_id, polls, elapsed)
+        return ch.consume_output()
 
     async def _add_request(
         self,
@@ -347,6 +457,12 @@ class AsyncLLM(EngineClient):
     ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+
+        # When shm_decode is enabled, create and register the SHM
+        # channel *before* sending the ADD so the core sees it first.
+        if (self.model_config.shm_decode
+                and request.request_id not in self._shm_channels):
+            await self.create_shm_decode_channel(request.request_id)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -539,6 +655,13 @@ class AsyncLLM(EngineClient):
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
+
+        # Clean up any client-side SHM channels.
+        for rid in request_ids:
+            ch = self._shm_channels.pop(rid, None)
+            if ch is not None:
+                ch.close()
+
         all_request_ids = self.output_processor.abort_requests(request_ids)
         await self.engine_core.abort_requests_async(all_request_ids)
 
