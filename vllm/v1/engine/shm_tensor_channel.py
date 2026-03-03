@@ -33,6 +33,8 @@ import ctypes.util
 import errno
 import math
 import multiprocessing.shared_memory as shm
+from multiprocessing import resource_tracker
+from multiprocessing.shared_memory import _posixshmem  # type: ignore[attr-defined]
 import struct
 import time
 from dataclasses import dataclass
@@ -92,6 +94,22 @@ def _futex_wake(addr: int, count: int = 1) -> int:
 
 def _align_up(n: int, alignment: int) -> int:
     return (n + alignment - 1) & ~(alignment - 1)
+
+
+def _create_shm_untracked(
+    name: str, create: bool, size: int = 0,
+) -> shm.SharedMemory:
+    """Create a SharedMemory without registering it with the resource tracker.
+
+    We manage close()/unlink() ourselves, so tracker bookkeeping is
+    unnecessary and causes spurious warnings at shutdown.
+    """
+    orig = resource_tracker.register
+    resource_tracker.register = lambda *args, **kwargs: None
+    try:
+        return shm.SharedMemory(name=name, create=create, size=size)
+    finally:
+        resource_tracker.register = orig
 
 
 @dataclass(frozen=True)
@@ -167,14 +185,13 @@ class SharedMemoryTensorChannel:
         total_size = max(self._output_region_off + output_data_size, 1)
 
         if create:
+            shm_name = "/" + name if not name.startswith("/") else name
             try:
-                old = shm.SharedMemory(name=name, create=False)
-                old.close()
-                old.unlink()
+                _posixshmem.shm_unlink(shm_name)
             except FileNotFoundError:
                 pass
-            self._shm = shm.SharedMemory(
-                name=name, create=True, size=total_size
+            self._shm = _create_shm_untracked(
+                name, create=True, size=total_size,
             )
             self._buf = self._shm.buf
             self._buf[:_HEADER_SIZE] = b"\x00" * _HEADER_SIZE
@@ -182,7 +199,7 @@ class SharedMemoryTensorChannel:
             struct.pack_into("<I", self._buf, _REQ_ID_LEN_OFF, len(rid))
             self._buf[_REQ_ID_OFF : _REQ_ID_OFF + len(rid)] = rid
         else:
-            self._shm = shm.SharedMemory(name=name, create=False)
+            self._shm = _create_shm_untracked(name, create=False)
             self._buf = self._shm.buf
 
         # Cache raw addresses for futex syscalls.  One-time ctypes use to get
@@ -340,10 +357,11 @@ class SharedMemoryTensorChannel:
         self._input_shm_views.clear()
         self._output_shm_views.clear()
         if hasattr(self, "_shm"):
+            name = self._shm._name
             self._shm.close()
             if self._is_creator:
                 try:
-                    self._shm.unlink()
+                    _posixshmem.shm_unlink(name)
                 except FileNotFoundError:
                     pass
 
