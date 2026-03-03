@@ -33,6 +33,7 @@ import ctypes.util
 import math
 import multiprocessing.shared_memory as shm
 import struct
+import time
 from dataclasses import dataclass
 
 import torch
@@ -141,6 +142,7 @@ class SharedMemoryTensorChannel:
         self.name = name
         self.request_id = request_id
         self._is_creator = create
+        self._wait_input_stats: list[float] = []
 
         # Build offset tables: name -> (local_byte_offset, TensorSpec)
         self._input_slots: dict[str, tuple[int, TensorSpec]] = {}
@@ -247,10 +249,13 @@ class SharedMemoryTensorChannel:
 
         Returns True if input is ready, False on timeout.
         """
+        t0 = time.perf_counter()
         while self._input_futex_word.value == 0:
             _futex_wait(self._input_futex_addr, 0, timeout_s)
             if timeout_s is not None and self._input_futex_word.value == 0:
+                self._wait_input_stats.append(time.perf_counter() - t0)
                 return False
+        self._wait_input_stats.append(time.perf_counter() - t0)
         return True
 
     def consume_input(self) -> dict[str, torch.Tensor]:
@@ -312,6 +317,16 @@ class SharedMemoryTensorChannel:
     # ── Lifecycle ──────────────────────────────────────────────────
 
     def close(self) -> None:
+        if hasattr(self, "_wait_input_stats") and self._wait_input_stats:
+            count = len(self._wait_input_stats)
+            total_ms = sum(self._wait_input_stats) * 1000
+            avg_ms = total_ms / count
+            min_ms = min(self._wait_input_stats) * 1000
+            max_ms = max(self._wait_input_stats) * 1000
+            print(f">>>[SharedMemoryTensorChannel] wait_input_ready stats: "
+                  f"count={count}, avg={avg_ms:.3f}ms, "
+                  f"min={min_ms:.3f}ms, max={max_ms:.3f}ms", flush=True)
+
         # Release ctypes buffer exports before closing the mmap.
         self._input_futex_word = None
         self._output_futex_word = None
