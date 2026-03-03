@@ -255,12 +255,13 @@ class SharedMemoryTensorChannel:
         return False  # timeout or error
 
     def consume_input(self) -> dict[str, torch.Tensor]:
-        """Read all input tensors and clear the input_ready flag."""
+        """Read all input tensors and clear the input_ready flag.
+
+        Returns views (no clone) since the consumer only reads via copy_();
+        the client will not overwrite until after the next output round-trip.
+        """
         struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 0)
-        return {
-            name: view.clone()
-            for name, view in self._input_shm_views.items()
-        }
+        return dict(self._input_shm_views)
 
     # ── Core -> Client ─────────────────────────────────────────────
 
@@ -314,12 +315,13 @@ class SharedMemoryTensorChannel:
         return False  # timeout or error
 
     def consume_output(self) -> dict[str, torch.Tensor]:
-        """Read all output tensors and clear the output_ready flag."""
+        """Read all output tensors and clear the output_ready flag.
+
+        Returns views (no clone) since the consumer only reads; the core
+        will not overwrite until after the next forward pass.
+        """
         struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
-        return {
-            name: view.clone()
-            for name, view in self._output_shm_views.items()
-        }
+        return dict(self._output_shm_views)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
