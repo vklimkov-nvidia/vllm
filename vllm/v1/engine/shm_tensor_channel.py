@@ -235,7 +235,7 @@ class SharedMemoryTensorChannel:
 
     def write_input(self, name: str, tensor: torch.Tensor) -> None:
         view = self._input_shm_views[name]
-        t = tensor.detach().cpu()
+        t = tensor.detach()
         assert t.shape == view.shape, (
             f"Shape mismatch for '{name}': "
             f"expected {view.shape}, got {t.shape}"
@@ -276,12 +276,13 @@ class SharedMemoryTensorChannel:
     def consume_input(self) -> dict[str, torch.Tensor]:
         """Read all input tensors and clear the input_ready flag.
 
-        Returns cloned tensors so callers never hold pointers into
-        the shm mmap — safe even if the channel is closed while
-        the caller (or torch profiler) still references the tensors.
+        Returns direct views into the shm buffer (zero-copy).  The
+        protocol guarantees the client will not overwrite the buffer
+        until after it receives the next output_ready signal, so the
+        views remain valid through model-runner consumption.
         """
         struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 0)
-        return {k: v.clone() for k, v in self._input_shm_views.items()}
+        return dict(self._input_shm_views)
 
     # ── Core -> Client ─────────────────────────────────────────────
 
@@ -298,7 +299,7 @@ class SharedMemoryTensorChannel:
 
     def write_output(self, name: str, tensor: torch.Tensor) -> None:
         view = self._output_shm_views[name]
-        t = tensor.detach().cpu()
+        t = tensor.detach()
         assert t.shape == view.shape, (
             f"Shape mismatch for '{name}': "
             f"expected {view.shape}, got {t.shape}"
@@ -337,12 +338,13 @@ class SharedMemoryTensorChannel:
     def consume_output(self) -> dict[str, torch.Tensor]:
         """Read all output tensors and clear the output_ready flag.
 
-        Returns cloned tensors so callers never hold pointers into
-        the shm mmap — safe even if the channel is closed while
-        the caller (or torch profiler) still references the tensors.
+        Returns direct views into the shm buffer (zero-copy).  The
+        protocol guarantees the core will not overwrite the buffer
+        until the client writes new inputs and signals input_ready,
+        so the views remain valid for immediate use.
         """
         struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
-        return {k: v.clone() for k, v in self._output_shm_views.items()}
+        return dict(self._output_shm_views)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
