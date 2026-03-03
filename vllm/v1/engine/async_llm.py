@@ -329,26 +329,16 @@ class AsyncLLM(EngineClient):
         request_id: str, 
         custom_inputs: Optional[dict[str, torch.Tensor]] = None,
     ):
-        """Adds new custom inputs into existing request.
-
-        When a shared-memory channel is registered for *request_id*
-        (see ``shm_decode`` config), the inputs are written directly
-        to shared memory.  Otherwise the ZMQ path is used.
-        """
+        """Adds new custom inputs into existing request via ZMQ."""
         if self.errored:
             raise EngineDeadError()
         if custom_inputs is None:
             return
 
-        ch = self._shm_channels.get(request_id)
-        if ch is not None:
-            ch.write_inputs(custom_inputs)
-            ch.signal_input_ready()
-        else:
-            request = EngineCoreAppendRequest(
-                request_id=request_id, custom_inputs=custom_inputs,
-            )
-            await self.engine_core.set_custom_inputs_async(request)
+        request = EngineCoreAppendRequest(
+            request_id=request_id, custom_inputs=custom_inputs,
+        )
+        await self.engine_core.set_custom_inputs_async(request)
 
     # ── Shared-memory decode channels ──────────────────────────────
 
@@ -398,25 +388,55 @@ class AsyncLLM(EngineClient):
                 "unregister_shm_channel", request_id,
             )
 
-    async def wait_for_output(
-        self, request_id: str,
-        timeout: float = 5.0,
+    async def decode_step_shm(
+        self,
+        request_id: str,
+        custom_inputs: dict[str, torch.Tensor],
+        timeout: float = 10.0,
     ) -> dict[str, torch.Tensor]:
-        """Await the next decode-step output from the shared-memory channel.
+        """Execute a single SHM decode step: write inputs, wait for outputs.
 
-        Uses futex via ``run_in_executor`` so the event loop stays free
-        while the thread sleeps in the kernel (~1-5 µs wake latency,
-        zero CPU usage while waiting).
+        Writes *custom_inputs* to the shared-memory channel, signals the
+        core, then blocks (via futex / ``run_in_executor``) until the core
+        writes outputs back.  The event loop stays free while waiting.
+
+        If outputs do not arrive within *timeout* seconds the engine
+        health is checked: a dead engine raises ``EngineDeadError``,
+        otherwise ``TimeoutError`` is raised so the caller can decide
+        whether to retry or abort.
+
+        Args:
+            request_id: the request whose SHM channel to use.
+            custom_inputs: tensors to send to the core for this step.
+            timeout: max seconds to wait for the core's output.
+
+        Returns:
+            Dict of output tensors produced by the core.
         """
+        if self.errored:
+            raise EngineDeadError()
+
         ch = self._shm_channels.get(request_id)
         if ch is None:
             raise ValueError(
                 f"No shared-memory channel for request {request_id}"
             )
+
+        ch.write_inputs(custom_inputs)
+        ch.signal_input_ready()
+
         if not ch.check_output_ready():
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
+            ready = await loop.run_in_executor(
                 None, ch.wait_output_ready, timeout)
+            if not ready:
+                if self.errored:
+                    raise EngineDeadError()
+                raise TimeoutError(
+                    f"Decode step timed out after {timeout}s "
+                    f"for request {request_id}"
+                )
+
         return ch.consume_output()
 
     async def _add_request(
