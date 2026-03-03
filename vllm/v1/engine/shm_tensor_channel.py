@@ -193,44 +193,38 @@ class SharedMemoryTensorChannel:
         self._input_futex_addr = ctypes.addressof(self._input_futex_word)
         self._output_futex_addr = ctypes.addressof(self._output_futex_word)
 
-    # ── internal helpers ───────────────────────────────────────────
+        # Pre-create zero-copy tensor views backed by the shm buffer.
+        # Reads/writes then only need a single copy_() or clone().
+        self._input_shm_views: dict[str, torch.Tensor] = {}
+        for name, (local_off, spec) in self._input_slots.items():
+            off = self._input_region_off + local_off
+            self._input_shm_views[name] = torch.frombuffer(
+                self._buf, dtype=spec.dtype,
+                count=math.prod(spec.shape), offset=off,
+            ).reshape(spec.shape)
 
-    def _write_tensor(
-        self,
-        region_off: int,
-        local_off: int,
-        spec: TensorSpec,
-        tensor: torch.Tensor,
-    ) -> None:
-        assert tensor.shape == spec.shape, (
-            f"Shape mismatch for '{spec.name}': "
-            f"expected {spec.shape}, got {tensor.shape}"
-        )
-        assert tensor.dtype == spec.dtype, (
-            f"Dtype mismatch for '{spec.name}': "
-            f"expected {spec.dtype}, got {tensor.dtype}"
-        )
-        t = tensor.detach().cpu().clone().contiguous()
-        raw = bytes(t.untyped_storage())
-        off = region_off + local_off
-        self._buf[off : off + spec.nbytes] = raw[: spec.nbytes]
-
-    def _read_tensor(
-        self, region_off: int, local_off: int, spec: TensorSpec
-    ) -> torch.Tensor:
-        off = region_off + local_off
-        raw = bytearray(self._buf[off : off + spec.nbytes])
-        return (
-            torch.frombuffer(raw, dtype=spec.dtype)
-            .reshape(spec.shape)
-            .clone()
-        )
+        self._output_shm_views: dict[str, torch.Tensor] = {}
+        for name, (local_off, spec) in self._output_slots.items():
+            off = self._output_region_off + local_off
+            self._output_shm_views[name] = torch.frombuffer(
+                self._buf, dtype=spec.dtype,
+                count=math.prod(spec.shape), offset=off,
+            ).reshape(spec.shape)
 
     # ── Client -> Core ─────────────────────────────────────────────
 
     def write_input(self, name: str, tensor: torch.Tensor) -> None:
-        local_off, spec = self._input_slots[name]
-        self._write_tensor(self._input_region_off, local_off, spec, tensor)
+        view = self._input_shm_views[name]
+        t = tensor.detach().cpu()
+        assert t.shape == view.shape, (
+            f"Shape mismatch for '{name}': "
+            f"expected {view.shape}, got {t.shape}"
+        )
+        assert t.dtype == view.dtype, (
+            f"Dtype mismatch for '{name}': "
+            f"expected {view.dtype}, got {t.dtype}"
+        )
+        view.copy_(t)
 
     def write_inputs(self, inputs: dict[str, torch.Tensor]) -> None:
         for name, tensor in inputs.items():
@@ -262,8 +256,8 @@ class SharedMemoryTensorChannel:
         """Read all input tensors and clear the input_ready flag."""
         self._input_futex_word.value = 0
         return {
-            name: self._read_tensor(self._input_region_off, off, spec)
-            for name, (off, spec) in self._input_slots.items()
+            name: view.clone()
+            for name, view in self._input_shm_views.items()
         }
 
     # ── Core -> Client ─────────────────────────────────────────────
@@ -280,8 +274,17 @@ class SharedMemoryTensorChannel:
         return True
 
     def write_output(self, name: str, tensor: torch.Tensor) -> None:
-        local_off, spec = self._output_slots[name]
-        self._write_tensor(self._output_region_off, local_off, spec, tensor)
+        view = self._output_shm_views[name]
+        t = tensor.detach().cpu()
+        assert t.shape == view.shape, (
+            f"Shape mismatch for '{name}': "
+            f"expected {view.shape}, got {t.shape}"
+        )
+        assert t.dtype == view.dtype, (
+            f"Dtype mismatch for '{name}': "
+            f"expected {view.dtype}, got {t.dtype}"
+        )
+        view.copy_(t)
 
     def write_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
         for name, tensor in outputs.items():
@@ -310,8 +313,8 @@ class SharedMemoryTensorChannel:
         """Read all output tensors and clear the output_ready flag."""
         self._output_futex_word.value = 0
         return {
-            name: self._read_tensor(self._output_region_off, off, spec)
-            for name, (off, spec) in self._output_slots.items()
+            name: view.clone()
+            for name, view in self._output_shm_views.items()
         }
 
     # ── Lifecycle ──────────────────────────────────────────────────
@@ -327,7 +330,10 @@ class SharedMemoryTensorChannel:
                   f"count={count}, avg={avg_ms:.3f}ms, "
                   f"min={min_ms:.3f}ms, max={max_ms:.3f}ms", flush=True)
 
-        # Release ctypes buffer exports before closing the mmap.
+        # Release tensor views and ctypes buffer exports before closing
+        # the mmap.
+        self._input_shm_views.clear()
+        self._output_shm_views.clear()
         self._input_futex_word = None
         self._output_futex_word = None
         if hasattr(self, "_shm"):
