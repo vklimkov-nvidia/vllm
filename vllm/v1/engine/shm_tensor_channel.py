@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import math
 import multiprocessing.shared_memory as shm
 import struct
@@ -55,29 +56,30 @@ _SYS_FUTEX = 202  # x86_64
 _FUTEX_WAIT = 0
 _FUTEX_WAKE = 1
 
+# ctypes used only for syscall and address lookup; struct used for flag I/O
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-
-class _Timespec(ctypes.Structure):
-    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
 
 
 def _futex_wait(addr: int, expected: int,
                 timeout_s: float | None) -> int:
-    """Sleep until the uint32 at *addr* differs from *expected*."""
+    """Sleep until the uint32 at *addr* differs from *expected*.
+    Returns 0 on wake, -1 on error (check errno: EAGAIN=ready, ETIMEDOUT=timeout).
+    """
     if timeout_s is not None:
         sec = int(timeout_s)
         nsec = int((timeout_s - sec) * 1_000_000_000)
-        ts = _Timespec(sec, nsec)
-        return _libc.syscall(
+        ts = (ctypes.c_long * 2)(sec, nsec)
+        ret = _libc.syscall(
             ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
             ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected),
             ctypes.byref(ts),
         )
-    return _libc.syscall(
-        ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
-        ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected), None,
-    )
+    else:
+        ret = _libc.syscall(
+            ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
+            ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected), None,
+        )
+    return ret
 
 
 def _futex_wake(addr: int, count: int = 1) -> int:
@@ -183,15 +185,14 @@ class SharedMemoryTensorChannel:
             self._shm = shm.SharedMemory(name=name, create=False)
             self._buf = self._shm.buf
 
-        # Cache raw addresses for futex syscalls.  ctypes.from_buffer
-        # pins to the underlying mmap page so both processes use the
-        # same physical address, which is what futex requires.
-        self._input_futex_word = ctypes.c_uint32.from_buffer(
-            self._shm.buf, _INPUT_READY_OFF)
-        self._output_futex_word = ctypes.c_uint32.from_buffer(
-            self._shm.buf, _OUTPUT_READY_OFF)
-        self._input_futex_addr = ctypes.addressof(self._input_futex_word)
-        self._output_futex_addr = ctypes.addressof(self._output_futex_word)
+        # Cache raw addresses for futex syscalls.  One-time ctypes use to get
+        # the address; flag I/O uses struct for lower overhead in the hot path.
+        _input_view = (ctypes.c_char * 4).from_buffer(self._shm.buf,
+                                                      _INPUT_READY_OFF)
+        _output_view = (ctypes.c_char * 4).from_buffer(self._shm.buf,
+                                                        _OUTPUT_READY_OFF)
+        self._input_futex_addr = ctypes.addressof(_input_view)
+        self._output_futex_addr = ctypes.addressof(_output_view)
 
         # Pre-create zero-copy tensor views backed by the shm buffer.
         # Reads/writes then only need a single copy_() or clone().
@@ -232,29 +233,30 @@ class SharedMemoryTensorChannel:
 
     def signal_input_ready(self) -> None:
         """Client: set input_ready flag and wake the core via futex."""
-        self._input_futex_word.value = 1
+        struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 1)
         _futex_wake(self._input_futex_addr)
 
     def check_input_ready(self) -> bool:
-        return self._input_futex_word.value != 0
+        return struct.unpack_from("<I", self._buf, _INPUT_READY_OFF)[0] != 0
 
     def wait_input_ready(self, timeout_s: float | None = None) -> bool:
         """Core: block until input_ready is set, or timeout.
 
         Returns True if input is ready, False on timeout.
+        Uses a single futex_wait; kernel returns EAGAIN if value already set.
         """
         t0 = time.perf_counter()
-        while self._input_futex_word.value == 0:
-            _futex_wait(self._input_futex_addr, 0, timeout_s)
-            if timeout_s is not None and self._input_futex_word.value == 0:
-                self._wait_input_stats.append(time.perf_counter() - t0)
-                return False
+        ret = _futex_wait(self._input_futex_addr, 0, timeout_s)
         self._wait_input_stats.append(time.perf_counter() - t0)
-        return True
+        if ret == 0:
+            return True  # woken by client
+        if ret == -1 and ctypes.get_errno() == errno.EAGAIN:
+            return True  # value already set (race), no sleep needed
+        return False  # timeout or error
 
     def consume_input(self) -> dict[str, torch.Tensor]:
         """Read all input tensors and clear the input_ready flag."""
-        self._input_futex_word.value = 0
+        struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 0)
         return {
             name: view.clone()
             for name, view in self._input_shm_views.items()
@@ -292,26 +294,28 @@ class SharedMemoryTensorChannel:
 
     def signal_output_ready(self) -> None:
         """Core: set output_ready flag and wake the client via futex."""
-        self._output_futex_word.value = 1
+        struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 1)
         _futex_wake(self._output_futex_addr)
 
     def check_output_ready(self) -> bool:
-        return self._output_futex_word.value != 0
+        return struct.unpack_from("<I", self._buf, _OUTPUT_READY_OFF)[0] != 0
 
     def wait_output_ready(self, timeout_s: float | None = None) -> bool:
         """Client: block until output_ready is set, or timeout.
 
         Returns True if output is ready, False on timeout.
+        Uses a single futex_wait; kernel returns EAGAIN if value already set.
         """
-        while self._output_futex_word.value == 0:
-            _futex_wait(self._output_futex_addr, 0, timeout_s)
-            if timeout_s is not None and self._output_futex_word.value == 0:
-                return False
-        return True
+        ret = _futex_wait(self._output_futex_addr, 0, timeout_s)
+        if ret == 0:
+            return True  # woken by core
+        if ret == -1 and ctypes.get_errno() == errno.EAGAIN:
+            return True  # value already set (race), no sleep needed
+        return False  # timeout or error
 
     def consume_output(self) -> dict[str, torch.Tensor]:
         """Read all output tensors and clear the output_ready flag."""
-        self._output_futex_word.value = 0
+        struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
         return {
             name: view.clone()
             for name, view in self._output_shm_views.items()
@@ -330,12 +334,9 @@ class SharedMemoryTensorChannel:
                   f"count={count}, avg={avg_ms:.3f}ms, "
                   f"min={min_ms:.3f}ms, max={max_ms:.3f}ms", flush=True)
 
-        # Release tensor views and ctypes buffer exports before closing
-        # the mmap.
+        # Release tensor views before closing the mmap.
         self._input_shm_views.clear()
         self._output_shm_views.clear()
-        self._input_futex_word = None
-        self._output_futex_word = None
         if hasattr(self, "_shm"):
             self._shm.close()
             if self._is_creator:
