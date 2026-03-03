@@ -163,6 +163,7 @@ class SharedMemoryTensorChannel:
         self.request_id = request_id
         self._is_creator = create
         self._wait_input_stats: list[float] = []
+        self._output_ready_ts: float = 0.0
 
         # Build offset tables: name -> (local_byte_offset, TensorSpec)
         self._input_slots: dict[str, tuple[int, TensorSpec]] = {}
@@ -329,6 +330,7 @@ class SharedMemoryTensorChannel:
         Uses a single futex_wait; kernel returns EAGAIN if value already set.
         """
         ret = _futex_wait(self._output_futex_addr, 0, timeout_s)
+        self._output_ready_ts = time.perf_counter()
         if ret == 0:
             return True  # woken by core
         if ret == -1 and ctypes.get_errno() == errno.EAGAIN:
@@ -345,6 +347,36 @@ class SharedMemoryTensorChannel:
         """
         struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
         return dict(self._output_shm_views)
+
+    # ── Synchronous decode step ───────────────────────────────────
+
+    def decode_step(
+        self,
+        custom_inputs: dict[str, torch.Tensor],
+        timeout: float = 10.0,
+    ) -> dict[str, torch.Tensor]:
+        """Write inputs, signal core, block until output, return results.
+
+        Runs entirely in the calling thread with no asyncio involvement.
+        The calling thread sleeps in a futex until the core signals,
+        giving ~1-5 µs wake latency with zero CPU usage.
+
+        Returns:
+            Dict of output tensor views (zero-copy, backed by shm).
+
+        Raises:
+            TimeoutError: if the core doesn't respond within *timeout*.
+        """
+        self.write_inputs(custom_inputs)
+        self.signal_input_ready()
+
+        if not self.check_output_ready():
+            if not self.wait_output_ready(timeout_s=timeout):
+                raise TimeoutError(
+                    f"Decode step timed out after {timeout}s"
+                )
+
+        return self.consume_output()
 
     # ── Lifecycle ──────────────────────────────────────────────────
 

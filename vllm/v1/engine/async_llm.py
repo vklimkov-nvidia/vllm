@@ -388,22 +388,21 @@ class AsyncLLM(EngineClient):
                 "unregister_shm_channel", request_id,
             )
 
-    async def decode_step_shm(
+    def decode_step_shm(
         self,
         request_id: str,
         custom_inputs: dict[str, torch.Tensor],
         timeout: float = 10.0,
     ) -> dict[str, torch.Tensor]:
-        """Execute a single SHM decode step: write inputs, wait for outputs.
+        """Execute a single SHM decode step (synchronous, blocks caller).
 
         Writes *custom_inputs* to the shared-memory channel, signals the
-        core, then blocks (via futex / ``run_in_executor``) until the core
-        writes outputs back.  The event loop stays free while waiting.
+        core, then blocks in a futex until the core writes outputs back.
+        No asyncio involvement — the calling thread sleeps directly in
+        the kernel, giving ~1-5 µs wake latency.
 
-        If outputs do not arrive within *timeout* seconds the engine
-        health is checked: a dead engine raises ``EngineDeadError``,
-        otherwise ``TimeoutError`` is raised so the caller can decide
-        whether to retry or abort.
+        Call from a dedicated thread if you need the event loop to stay
+        free.
 
         Args:
             request_id: the request whose SHM channel to use.
@@ -422,22 +421,7 @@ class AsyncLLM(EngineClient):
                 f"No shared-memory channel for request {request_id}"
             )
 
-        ch.write_inputs(custom_inputs)
-        ch.signal_input_ready()
-
-        if not ch.check_output_ready():
-            loop = asyncio.get_running_loop()
-            ready = await loop.run_in_executor(
-                None, ch.wait_output_ready, timeout)
-            if not ready:
-                if self.errored:
-                    raise EngineDeadError()
-                raise TimeoutError(
-                    f"Decode step timed out after {timeout}s "
-                    f"for request {request_id}"
-                )
-
-        return ch.consume_output()
+        return ch.decode_step(custom_inputs, timeout=timeout)
 
     async def _add_request(
         self,
