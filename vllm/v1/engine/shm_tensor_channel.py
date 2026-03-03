@@ -202,14 +202,16 @@ class SharedMemoryTensorChannel:
             self._shm = _create_shm_untracked(name, create=False)
             self._buf = self._shm.buf
 
-        # Cache raw addresses for futex syscalls.  One-time ctypes use to get
-        # the address; flag I/O uses struct for lower overhead in the hot path.
-        _input_view = (ctypes.c_char * 4).from_buffer(self._shm.buf,
-                                                      _INPUT_READY_OFF)
-        _output_view = (ctypes.c_char * 4).from_buffer(self._shm.buf,
-                                                        _OUTPUT_READY_OFF)
-        self._input_futex_addr = ctypes.addressof(_input_view)
-        self._output_futex_addr = ctypes.addressof(_output_view)
+        self._closed = False
+
+        # Cache raw addresses for futex syscalls.  Keep the ctypes views
+        # alive so the buffer export stays valid for the channel's lifetime.
+        self._input_futex_view = (ctypes.c_char * 4).from_buffer(
+            self._shm.buf, _INPUT_READY_OFF)
+        self._output_futex_view = (ctypes.c_char * 4).from_buffer(
+            self._shm.buf, _OUTPUT_READY_OFF)
+        self._input_futex_addr = ctypes.addressof(self._input_futex_view)
+        self._output_futex_addr = ctypes.addressof(self._output_futex_view)
 
         # Pre-create zero-copy tensor views backed by the shm buffer.
         # Reads/writes then only need a single copy_() or clone().
@@ -274,11 +276,12 @@ class SharedMemoryTensorChannel:
     def consume_input(self) -> dict[str, torch.Tensor]:
         """Read all input tensors and clear the input_ready flag.
 
-        Returns views (no clone) since the consumer only reads via copy_();
-        the client will not overwrite until after the next output round-trip.
+        Returns cloned tensors so callers never hold pointers into
+        the shm mmap — safe even if the channel is closed while
+        the caller (or torch profiler) still references the tensors.
         """
         struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 0)
-        return dict(self._input_shm_views)
+        return {k: v.clone() for k, v in self._input_shm_views.items()}
 
     # ── Core -> Client ─────────────────────────────────────────────
 
@@ -334,31 +337,48 @@ class SharedMemoryTensorChannel:
     def consume_output(self) -> dict[str, torch.Tensor]:
         """Read all output tensors and clear the output_ready flag.
 
-        Returns views (no clone) since the consumer only reads; the core
-        will not overwrite until after the next forward pass.
+        Returns cloned tensors so callers never hold pointers into
+        the shm mmap — safe even if the channel is closed while
+        the caller (or torch profiler) still references the tensors.
         """
         struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
-        return dict(self._output_shm_views)
+        return {k: v.clone() for k, v in self._output_shm_views.items()}
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
     def close(self) -> None:
-        if hasattr(self, "_wait_input_stats") and self._wait_input_stats:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+
+        if self._wait_input_stats:
             count = len(self._wait_input_stats)
             total_ms = sum(self._wait_input_stats) * 1000
             avg_ms = total_ms / count
             min_ms = min(self._wait_input_stats) * 1000
             max_ms = max(self._wait_input_stats) * 1000
-            print(f">>>[SharedMemoryTensorChannel] wait_input_ready stats: "
-                  f"count={count}, avg={avg_ms:.3f}ms, "
-                  f"min={min_ms:.3f}ms, max={max_ms:.3f}ms", flush=True)
+            logger.info(
+                "SharedMemoryTensorChannel wait_input_ready stats: "
+                "count=%d, avg=%.3fms, min=%.3fms, max=%.3fms",
+                count, avg_ms, min_ms, max_ms,
+            )
 
-        # Release tensor views before closing the mmap.
         self._input_shm_views.clear()
         self._output_shm_views.clear()
+        self._input_futex_view = None
+        self._output_futex_view = None
+        self._buf = None
+
         if hasattr(self, "_shm"):
             name = self._shm._name
-            self._shm.close()
+            try:
+                self._shm.close()
+            except BufferError:
+                logger.warning(
+                    "SharedMemoryTensorChannel %s: could not close shm — "
+                    "outstanding buffer references exist (torch profiler?)",
+                    name,
+                )
             if self._is_creator:
                 try:
                     _posixshmem.shm_unlink(name)
