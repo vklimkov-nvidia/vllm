@@ -426,6 +426,7 @@ class EngineArgs:
     )
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
     io_processor_plugin: Optional[str] = None
+    shm_decode: bool = ModelConfig.shm_decode
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float = MultiModalConfig.video_pruning_rate
     # LoRA fields
@@ -635,6 +636,9 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--io-processor-plugin", **model_kwargs["io_processor_plugin"]
+        )
+        model_group.add_argument(
+            "--shm-decode", **model_kwargs["shm_decode"]
         )
 
         # Model loading arguments
@@ -1139,6 +1143,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
+            shm_decode=self.shm_decode,
         )
 
     def validate_tensorizer_args(self):

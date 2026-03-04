@@ -33,6 +33,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Device, as_list, cancel_task_threadsafe, cdiv, deprecate_kwargs
 from vllm.v1.engine import EngineCoreRequest, EngineCoreAppendRequest
 from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.shm_tensor_channel import (
+    SharedMemoryTensorChannel,
+    decode_step_tensor_specs,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -138,6 +142,8 @@ class AsyncLLM(EngineClient):
                 client_count=client_count,
             )
             self.logger_manager.log_engine_initialized()
+
+        self._shm_channels: dict[str, SharedMemoryTensorChannel] = {}
 
         self.output_handler: Optional[asyncio.Task] = None
         try:
@@ -323,19 +329,99 @@ class AsyncLLM(EngineClient):
         request_id: str, 
         custom_inputs: Optional[dict[str, torch.Tensor]] = None,
     ):
+        """Adds new custom inputs into existing request via ZMQ."""
+        if self.errored:
+            raise EngineDeadError()
+        if custom_inputs is None:
+            return
+
+        request = EngineCoreAppendRequest(
+            request_id=request_id, custom_inputs=custom_inputs,
+        )
+        await self.engine_core.set_custom_inputs_async(request)
+
+    # ── Shared-memory decode channels ──────────────────────────────
+
+    async def create_shm_decode_channel(
+        self,
+        request_id: str,
+    ) -> SharedMemoryTensorChannel:
+        """Create a shared-memory channel for decode-step I/O.
+
+        Tensor specs are derived from the model config's
+        ``custom_input_specs`` and ``custom_output_specs``.  The core
+        is notified via a utility call so the channel is registered
+        before the first decode step.
+
+        When ``model_config.shm_decode`` is ``True`` this is called
+        automatically from ``_add_request``; callers may also invoke
+        it explicitly.
         """
-        Adds new custom inputs into existing request.
-        Once inputs are added, the request will be scheduled for execution.
-        
+        mc = self.model_config
+        input_specs = decode_step_tensor_specs(
+            mc.custom_input_specs or [], mc.dtype,
+        )
+        output_specs = decode_step_tensor_specs(
+            mc.custom_output_specs or [], mc.dtype,
+        )
+        channel_name = f"vllm_shm_{request_id}"
+        ch = SharedMemoryTensorChannel(
+            name=channel_name,
+            request_id=request_id,
+            input_specs=input_specs,
+            output_specs=output_specs,
+            create=True,
+        )
+        self._shm_channels[request_id] = ch
+
+        await self.engine_core.call_utility_async(
+            "register_shm_channel", request_id, channel_name,
+        )
+        return ch
+
+    async def close_shm_decode_channel(self, request_id: str) -> None:
+        """Close the shared-memory channel and unregister it on the core."""
+        ch = self._shm_channels.pop(request_id, None)
+        if ch is not None:
+            ch.close()
+            await self.engine_core.call_utility_async(
+                "unregister_shm_channel", request_id,
+            )
+
+    def decode_step_shm(
+        self,
+        request_id: str,
+        custom_inputs: dict[str, torch.Tensor],
+        timeout: float = 10.0,
+    ) -> dict[str, torch.Tensor]:
+        """Execute a single SHM decode step (synchronous, blocks caller).
+
+        Writes *custom_inputs* to the shared-memory channel, signals the
+        core, then blocks in a futex until the core writes outputs back.
+        No asyncio involvement — the calling thread sleeps directly in
+        the kernel, giving ~1-5 µs wake latency.
+
+        Call from a dedicated thread if you need the event loop to stay
+        free.
+
         Args:
-            request_id: The request ID
-            custom_inputs: Optional dictionary mapping input names to tensors
+            request_id: the request whose SHM channel to use.
+            custom_inputs: tensors to send to the core for this step.
+            timeout: max seconds to wait for the core's output.
+
+        Returns:
+            Dict of output tensors produced by the core.
         """
         if self.errored:
             raise EngineDeadError()
-        if custom_inputs is not None:
-            request = EngineCoreAppendRequest(request_id=request_id, custom_inputs=custom_inputs)
-            await self.engine_core.set_custom_inputs_async(request)
+
+        ch = self._shm_channels.get(request_id)
+        if ch is None:
+            raise ValueError(
+                f"No shared-memory channel for request {request_id}"
+            )
+
+        return ch.decode_step(custom_inputs, timeout=timeout)
 
     async def _add_request(
         self,
@@ -347,6 +433,12 @@ class AsyncLLM(EngineClient):
     ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+
+        # When shm_decode is enabled, create and register the SHM
+        # channel *before* sending the ADD so the core sees it first.
+        if (self.model_config.shm_decode
+                and request.request_id not in self._shm_channels):
+            await self.create_shm_decode_channel(request.request_id)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -539,6 +631,13 @@ class AsyncLLM(EngineClient):
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
+
+        # Clean up any client-side SHM channels.
+        for rid in request_ids:
+            ch = self._shm_channels.pop(rid, None)
+            if ch is not None:
+                ch.close()
+
         all_request_ids = self.output_processor.abort_requests(request_ids)
         await self.engine_core.abort_requests_async(all_request_ids)
 

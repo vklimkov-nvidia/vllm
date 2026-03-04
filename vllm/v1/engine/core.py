@@ -55,6 +55,11 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.shm_tensor_channel import (
+    SharedMemoryTensorChannel,
+    TensorSpec,
+    decode_step_tensor_specs,
+)
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -93,6 +98,7 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self._shm_channels: dict[str, SharedMemoryTensorChannel] = {}
         logger.info(
             "Initializing a V1 LLM engine (v%s) with config: %s",
             VLLM_VERSION,
@@ -282,12 +288,98 @@ class EngineCore:
         """Set custom inputs for a request."""
         self.scheduler.set_custom_inputs(request_id, custom_inputs)
 
+    # ── Shared-memory decode channels ──────────────────────────────
+
+    def register_shm_channel(
+        self,
+        request_id: str,
+        channel_name: str,
+    ) -> None:
+        """Open an existing shared-memory channel for *request_id*.
+
+        Tensor specs are derived from the model config's
+        ``custom_input_specs`` / ``custom_output_specs``.
+        The client must have already created the channel (create=True).
+        """
+        mc = self.vllm_config.model_config
+        input_specs = decode_step_tensor_specs(
+            mc.custom_input_specs or [], mc.dtype,
+        )
+        output_specs = decode_step_tensor_specs(
+            mc.custom_output_specs or [], mc.dtype,
+        )
+        ch = SharedMemoryTensorChannel(
+            name=channel_name,
+            request_id=request_id,
+            input_specs=input_specs,
+            output_specs=output_specs,
+            create=False,
+        )
+        self._shm_channels[request_id] = ch
+
+    def unregister_shm_channel(self, request_id: str) -> None:
+        """Close and remove the shm channel for *request_id*."""
+        ch = self._shm_channels.pop(request_id, None)
+        if ch is not None:
+            ch.close()
+            logger.debug("Unregistered shm channel for request %s",
+                          request_id)
+
+    def _poll_shm_channels(self) -> None:
+        """Check all registered shm channels for ready inputs."""
+        for request_id, ch in self._shm_channels.items():
+            if ch.check_input_ready():
+                inputs = ch.consume_input()
+                self.set_custom_inputs(request_id, inputs)
+
+    _SHM_POLL_TIMEOUT_S = 2.0
+
+    def _wait_for_shm_inputs(self) -> None:
+        """Wait for shm inputs using futex (kernel-assisted sleep)."""
+        timeout = max(self._input_coalesce_timeout_s, self._SHM_POLL_TIMEOUT_S)
+        deadline = time.monotonic() + timeout
+        while self.scheduler.num_requests_needing_inputs() > 0:
+            self._poll_shm_channels()
+            if self.scheduler.num_requests_needing_inputs() == 0:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Futex-wait on any non-ready channel.  For the typical
+            # single-channel case this sleeps until the client signals,
+            # waking in ~1-5 µs.  For multiple channels use a short
+            # timeout so we cycle between them.
+            wait_t = (remaining if len(self._shm_channels) == 1
+                      else min(remaining, 0.001))
+            for ch in self._shm_channels.values():
+                if not ch.check_input_ready():
+                    ch.wait_input_ready(timeout_s=wait_t)
+                    break
+
+    def _wait_for_queue_inputs(self) -> None:
+        """Original ZMQ path: block on queue for custom inputs."""
+        deadline = time.monotonic() + self._input_coalesce_timeout_s
+        while self.scheduler.num_requests_needing_inputs() > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                req = self.input_queue.get(timeout=remaining)
+                self._handle_client_request(*req)
+                while not self.input_queue.empty():
+                    req = self.input_queue.get_nowait()
+                    self._handle_client_request(*req)
+            except queue.Empty:
+                break
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
+        for rid in request_ids:
+            self.unregister_shm_channel(rid)
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
     def execute_model_with_error_logging(
@@ -828,23 +920,15 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-        # Wait briefly for custom inputs so requests can be batched together
-        # instead of running partial batches.
-        if (self._input_coalesce_timeout_s > 0
-                and self.scheduler.num_requests_needing_inputs() > 0):
-            deadline = time.monotonic() + self._input_coalesce_timeout_s
-            while self.scheduler.num_requests_needing_inputs() > 0:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    req = self.input_queue.get(timeout=remaining)
-                    self._handle_client_request(*req)
-                    while not self.input_queue.empty():
-                        req = self.input_queue.get_nowait()
-                        self._handle_client_request(*req)
-                except queue.Empty:
-                    break
+        # Wait for decode-step custom inputs (with timeout so a lagging
+        # client doesn't block the forward pass indefinitely).
+        # Two exclusive modes: shm spin-poll vs zmq queue block.
+        needing = self.scheduler.num_requests_needing_inputs()
+        if needing > 0:
+            if self._shm_channels:
+                self._wait_for_shm_inputs()
+            elif self._input_coalesce_timeout_s > 0:
+                self._wait_for_queue_inputs()
             still_waiting = self.scheduler.num_requests_needing_inputs()
             if still_waiting > 0:
                 logger.warning(
@@ -857,8 +941,28 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
+        if outputs:
+            if self._shm_channels:
+                for client_idx, engine_outputs in outputs.items():
+                    remaining = []
+                    for out in engine_outputs.outputs:
+                        ch = self._shm_channels.get(out.request_id)
+                        if (ch is not None
+                                and out.new_custom_outputs
+                                and ch.can_write_outputs(
+                                    out.new_custom_outputs)):
+                            ch.write_outputs(out.new_custom_outputs)
+                            ch.signal_output_ready()
+                        else:
+                            remaining.append(out)
+                    engine_outputs.outputs = remaining
+                    if not remaining:
+                        continue
+                    self.output_queue.put_nowait(
+                        (client_idx, engine_outputs))
+            else:
+                for output in outputs.items():
+                    self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
 

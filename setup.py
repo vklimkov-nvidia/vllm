@@ -643,6 +643,11 @@ if _is_cuda():
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
+import platform
+if platform.system() == "Linux":
+    ext_modules.append(CMakeExtension(name="vllm._shm_channel_cpp",
+                                      optional=True))
+
 package_data = {
     "vllm": [
         "py.typed",

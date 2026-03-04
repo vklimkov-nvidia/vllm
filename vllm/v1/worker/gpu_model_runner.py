@@ -2961,17 +2961,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         custom_outputs_list = None
         if custom_outputs_flat:
-            custom_outputs_list = []  # put here dicts per request
+            total = scheduler_output.total_num_scheduled_tokens
+            custom_outputs_cpu = {
+                name: arr[:total].cpu()
+                for name, arr in custom_outputs_flat.items()
+            }
+            custom_outputs_list = []
             num_reqs = self.input_batch.num_reqs
             query_start_loc_np = self.query_start_loc.np[:num_reqs]
             for i in range(num_reqs):
                 start = int(query_start_loc_np[i])
                 length = int(num_scheduled_tokens_np[i])
-
-                request_custom_outputs = {}  # contains all custom outputs for this request
-                for name, arr in custom_outputs_flat.items():
-                    request_custom_outputs[name] = arr[start:start+length].cpu()
-                custom_outputs_list.append(request_custom_outputs)
+                custom_outputs_list.append({
+                    name: arr_cpu[start:start + length]
+                    for name, arr_cpu in custom_outputs_cpu.items()
+                })
 
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
