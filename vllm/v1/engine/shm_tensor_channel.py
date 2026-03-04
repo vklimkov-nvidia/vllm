@@ -3,20 +3,24 @@
 """Shared-memory tensor channel for decode-step communication.
 
 Provides bidirectional tensor transfer between client and core processes
-using POSIX shared memory with flag-based signaling.  Designed for the
-decode loop where the client writes custom inputs (e.g. shape [1, dim])
-and the core writes back outputs each step.
+using POSIX shared memory with C++-accelerated signaling.  Designed for
+the decode loop where the client writes custom inputs (e.g. shape
+[1, dim]) and the core writes back outputs each step.
 
-Uses Linux futex(2) for efficient cross-process waiting: the waiting
-side sleeps in the kernel until the signaling side writes the flag and
-calls FUTEX_WAKE, yielding ~1-5 µs wake latency with zero CPU usage.
+All flag operations use C++ atomics with acquire/release ordering,
+futex syscalls are issued directly from C++ (no ctypes overhead),
+the GIL is released during all waits and memory copies, and tensor
+writes are batched into a single GIL-free memcpy+signal sequence.
+
+Requires the ``_shm_channel_cpp`` C++ extension (built from
+``csrc/shm_channel.cpp``).
 
 Shared-memory layout::
 
-    HEADER (272 bytes, aligned to 64):
-      [0:4]     input_ready    (uint32 LE, client -> core, futex word)
-      [4:8]     output_ready   (uint32 LE, core -> client, futex word)
-      [8:12]    request_id_len (uint32 LE)
+    HEADER (268 bytes, aligned to 64):
+      [0:4]     input_ready    (uint32, client -> core, futex word)
+      [4:8]     output_ready   (uint32, core -> client, futex word)
+      [8:12]    request_id_len (uint32)
       [12:268]  request_id     (UTF-8, max 256 bytes)
 
     INPUT DATA REGION:  contiguous buffer for input tensors
@@ -29,8 +33,6 @@ passed at construction time, so both sides agree on the layout.
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
-import errno
 import math
 import multiprocessing.shared_memory as shm
 from multiprocessing import resource_tracker
@@ -45,51 +47,22 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_INPUT_READY_OFF = 0   # uint32, 4-byte aligned for futex
-_OUTPUT_READY_OFF = 4  # uint32, 4-byte aligned for futex
+# ── C++ extension (required) ─────────────────────────────────────
+try:
+    import vllm._shm_channel_cpp as _cpp
+except ImportError as exc:
+    raise ImportError(
+        "vllm._shm_channel_cpp is required for SharedMemoryTensorChannel. "
+        "Build it with: pip install -e .  (or rebuild vllm)"
+    ) from exc
+
+_INPUT_READY_OFF = 0
+_OUTPUT_READY_OFF = 4
 _REQ_ID_LEN_OFF = 8
 _REQ_ID_OFF = 12
 _REQ_ID_MAX = 256
 _HEADER_SIZE = _REQ_ID_OFF + _REQ_ID_MAX  # 268
 _ALIGN = 64
-
-# ── Linux futex helpers ───────────────────────────────────────────
-_SYS_FUTEX = 202  # x86_64
-_FUTEX_WAIT = 0
-_FUTEX_WAKE = 1
-
-# ctypes used only for syscall and address lookup; struct used for flag I/O
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-
-def _futex_wait(addr: int, expected: int,
-                timeout_s: float | None) -> int:
-    """Sleep until the uint32 at *addr* differs from *expected*.
-    Returns 0 on wake, -1 on error (check errno: EAGAIN=ready, ETIMEDOUT=timeout).
-    """
-    if timeout_s is not None:
-        sec = int(timeout_s)
-        nsec = int((timeout_s - sec) * 1_000_000_000)
-        ts = (ctypes.c_long * 2)(sec, nsec)
-        ret = _libc.syscall(
-            ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
-            ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected),
-            ctypes.byref(ts),
-        )
-    else:
-        ret = _libc.syscall(
-            ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
-            ctypes.c_int(_FUTEX_WAIT), ctypes.c_int(expected), None,
-        )
-    return ret
-
-
-def _futex_wake(addr: int, count: int = 1) -> int:
-    """Wake up to *count* threads sleeping on the futex at *addr*."""
-    return _libc.syscall(
-        ctypes.c_long(_SYS_FUTEX), ctypes.c_void_p(addr),
-        ctypes.c_int(_FUTEX_WAKE), ctypes.c_int(count),
-    )
 
 
 def _align_up(n: int, alignment: int) -> int:
@@ -110,6 +83,34 @@ def _create_shm_untracked(
         return shm.SharedMemory(name=name, create=create, size=size)
     finally:
         resource_tracker.register = orig
+
+
+def _prepare_copy_descs(
+    shm_views: dict[str, torch.Tensor],
+    tensors: dict[str, torch.Tensor],
+) -> tuple[list[tuple[int, int, int]], list[torch.Tensor]]:
+    """Build (dst_ptr, src_ptr, nbytes) descriptors for C++ batch_copy.
+
+    Returns ``(copies, alive)`` where *alive* keeps references to any
+    contiguous copies so their storage survives the GIL-released memcpy.
+    """
+    copies: list[tuple[int, int, int]] = []
+    alive: list[torch.Tensor] = []
+    for name, tensor in tensors.items():
+        view = shm_views[name]
+        t = tensor.detach()
+        assert t.shape == view.shape, (
+            f"Shape mismatch for '{name}': "
+            f"expected {view.shape}, got {t.shape}"
+        )
+        assert t.dtype == view.dtype, (
+            f"Dtype mismatch for '{name}': "
+            f"expected {view.dtype}, got {t.dtype}"
+        )
+        t = t.contiguous()
+        alive.append(t)
+        copies.append((view.data_ptr(), t.data_ptr(), view.nbytes))
+    return copies, alive
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,7 @@ def decode_step_tensor_specs(
 
 
 class SharedMemoryTensorChannel:
-    """Bidirectional tensor channel via POSIX shared memory.
+    """Bidirectional tensor channel via POSIX shared memory + C++ IPC.
 
     The creator (client) passes ``create=True`` and the opener (core)
     passes ``create=False``.  Both sides must supply identical specs.
@@ -165,7 +166,6 @@ class SharedMemoryTensorChannel:
         self._wait_input_stats: list[float] = []
         self._output_ready_ts: float = 0.0
 
-        # Build offset tables: name -> (local_byte_offset, TensorSpec)
         self._input_slots: dict[str, tuple[int, TensorSpec]] = {}
         self._output_slots: dict[str, tuple[int, TensorSpec]] = {}
 
@@ -205,8 +205,8 @@ class SharedMemoryTensorChannel:
 
         self._closed = False
 
-        # Cache raw addresses for futex syscalls.  Keep the ctypes views
-        # alive so the buffer export stays valid for the channel's lifetime.
+        # Raw addresses for C++ atomic/futex ops.
+        # ctypes views kept alive so the buffer export stays valid.
         self._input_futex_view = (ctypes.c_char * 4).from_buffer(
             self._shm.buf, _INPUT_READY_OFF)
         self._output_futex_view = (ctypes.c_char * 4).from_buffer(
@@ -214,8 +214,17 @@ class SharedMemoryTensorChannel:
         self._input_futex_addr = ctypes.addressof(self._input_futex_view)
         self._output_futex_addr = ctypes.addressof(self._output_futex_view)
 
+        # Prefault + mlock via C++ to prevent page eviction stalls.
+        base = ctypes.addressof(
+            (ctypes.c_char * 1).from_buffer(self._shm.buf, 0))
+        if not _cpp.prefault_mlock(base, self._shm.size):
+            logger.warning(
+                "mlock(%s, %d) failed; shm pages may be evicted "
+                "causing sporadic copy stalls. Run: ulimit -l unlimited",
+                self._shm.name, self._shm.size,
+            )
+
         # Pre-create zero-copy tensor views backed by the shm buffer.
-        # Reads/writes then only need a single copy_() or clone().
         self._input_shm_views: dict[str, torch.Tensor] = {}
         for name, (local_off, spec) in self._input_slots.items():
             off = self._input_region_off + local_off
@@ -237,58 +246,43 @@ class SharedMemoryTensorChannel:
     def write_input(self, name: str, tensor: torch.Tensor) -> None:
         view = self._input_shm_views[name]
         t = tensor.detach()
-        assert t.shape == view.shape, (
-            f"Shape mismatch for '{name}': "
-            f"expected {view.shape}, got {t.shape}"
-        )
-        assert t.dtype == view.dtype, (
-            f"Dtype mismatch for '{name}': "
-            f"expected {view.dtype}, got {t.dtype}"
-        )
-        view.copy_(t)
+        assert t.shape == view.shape and t.dtype == view.dtype
+        t = t.contiguous()
+        _cpp.batch_copy([(view.data_ptr(), t.data_ptr(), view.nbytes)])
 
     def write_inputs(self, inputs: dict[str, torch.Tensor]) -> None:
-        for name, tensor in inputs.items():
-            self.write_input(name, tensor)
+        copies, _alive = _prepare_copy_descs(
+            self._input_shm_views, inputs)
+        _cpp.batch_copy(copies)
 
     def signal_input_ready(self) -> None:
-        """Client: set input_ready flag and wake the core via futex."""
-        struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 1)
-        _futex_wake(self._input_futex_addr)
+        """Client: atomic set input_ready + FUTEX_WAKE."""
+        _cpp.set_flag_and_wake(self._input_futex_addr)
 
     def check_input_ready(self) -> bool:
-        return struct.unpack_from("<I", self._buf, _INPUT_READY_OFF)[0] != 0
+        return _cpp.check_flag(self._input_futex_addr)
 
     def wait_input_ready(self, timeout_s: float | None = None) -> bool:
-        """Core: block until input_ready is set, or timeout.
+        """Core: spin + futex wait with GIL released.
 
         Returns True if input is ready, False on timeout.
-        Uses a single futex_wait; kernel returns EAGAIN if value already set.
         """
         t0 = time.perf_counter()
-        ret = _futex_wait(self._input_futex_addr, 0, timeout_s)
+        ready = _cpp.wait_flag(
+            self._input_futex_addr,
+            -1.0 if timeout_s is None else timeout_s)
         self._wait_input_stats.append(time.perf_counter() - t0)
-        if ret == 0:
-            return True  # woken by client
-        if ret == -1 and ctypes.get_errno() == errno.EAGAIN:
-            return True  # value already set (race), no sleep needed
-        return False  # timeout or error
+        return ready
 
     def consume_input(self) -> dict[str, torch.Tensor]:
-        """Read all input tensors and clear the input_ready flag.
-
-        Returns direct views into the shm buffer (zero-copy).  The
-        protocol guarantees the client will not overwrite the buffer
-        until after it receives the next output_ready signal, so the
-        views remain valid through model-runner consumption.
-        """
-        struct.pack_into("<I", self._buf, _INPUT_READY_OFF, 0)
+        """Clear input_ready and return zero-copy shm tensor views."""
+        _cpp.clear_flag(self._input_futex_addr)
         return dict(self._input_shm_views)
 
     # ── Core -> Client ─────────────────────────────────────────────
 
     def can_write_outputs(self, outputs: dict[str, torch.Tensor]) -> bool:
-        """Return True if every tensor matches its output spec shape/dtype."""
+        """Return True if every tensor matches its output spec."""
         for name, tensor in outputs.items():
             entry = self._output_slots.get(name)
             if entry is None:
@@ -301,51 +295,44 @@ class SharedMemoryTensorChannel:
     def write_output(self, name: str, tensor: torch.Tensor) -> None:
         view = self._output_shm_views[name]
         t = tensor.detach()
-        assert t.shape == view.shape, (
-            f"Shape mismatch for '{name}': "
-            f"expected {view.shape}, got {t.shape}"
-        )
-        assert t.dtype == view.dtype, (
-            f"Dtype mismatch for '{name}': "
-            f"expected {view.dtype}, got {t.dtype}"
-        )
-        view.copy_(t)
+        assert t.shape == view.shape and t.dtype == view.dtype
+        t = t.contiguous()
+        _cpp.batch_copy([(view.data_ptr(), t.data_ptr(), view.nbytes)])
 
     def write_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
-        for name, tensor in outputs.items():
-            self.write_output(name, tensor)
+        copies, _alive = _prepare_copy_descs(
+            self._output_shm_views, outputs)
+        _cpp.batch_copy(copies)
+
+    def write_outputs_and_signal(
+        self, outputs: dict[str, torch.Tensor],
+    ) -> None:
+        """Core: write all outputs + signal in one GIL-free batch."""
+        copies, _alive = _prepare_copy_descs(
+            self._output_shm_views, outputs)
+        _cpp.batch_copy_and_signal(copies, self._output_futex_addr)
 
     def signal_output_ready(self) -> None:
-        """Core: set output_ready flag and wake the client via futex."""
-        struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 1)
-        _futex_wake(self._output_futex_addr)
+        """Core: atomic set output_ready + FUTEX_WAKE."""
+        _cpp.set_flag_and_wake(self._output_futex_addr)
 
     def check_output_ready(self) -> bool:
-        return struct.unpack_from("<I", self._buf, _OUTPUT_READY_OFF)[0] != 0
+        return _cpp.check_flag(self._output_futex_addr)
 
     def wait_output_ready(self, timeout_s: float | None = None) -> bool:
-        """Client: block until output_ready is set, or timeout.
+        """Client: spin + futex wait with GIL released.
 
         Returns True if output is ready, False on timeout.
-        Uses a single futex_wait; kernel returns EAGAIN if value already set.
         """
-        ret = _futex_wait(self._output_futex_addr, 0, timeout_s)
+        ready = _cpp.wait_flag(
+            self._output_futex_addr,
+            -1.0 if timeout_s is None else timeout_s)
         self._output_ready_ts = time.perf_counter()
-        if ret == 0:
-            return True  # woken by core
-        if ret == -1 and ctypes.get_errno() == errno.EAGAIN:
-            return True  # value already set (race), no sleep needed
-        return False  # timeout or error
+        return ready
 
     def consume_output(self) -> dict[str, torch.Tensor]:
-        """Read all output tensors and clear the output_ready flag.
-
-        Returns direct views into the shm buffer (zero-copy).  The
-        protocol guarantees the core will not overwrite the buffer
-        until the client writes new inputs and signals input_ready,
-        so the views remain valid for immediate use.
-        """
-        struct.pack_into("<I", self._buf, _OUTPUT_READY_OFF, 0)
+        """Clear output_ready and return zero-copy shm tensor views."""
+        _cpp.clear_flag(self._output_futex_addr)
         return dict(self._output_shm_views)
 
     # ── Synchronous decode step ───────────────────────────────────
@@ -358,8 +345,9 @@ class SharedMemoryTensorChannel:
         """Write inputs, signal core, block until output, return results.
 
         Runs entirely in the calling thread with no asyncio involvement.
-        The calling thread sleeps in a futex until the core signals,
-        giving ~1-5 µs wake latency with zero CPU usage.
+        The entire write+signal is a single GIL-free batch (memcpy all
+        inputs -> atomic flag set -> futex wake), then a GIL-free
+        wait+clear for the output flag.  Total: 2 GIL transitions.
 
         Returns:
             Dict of output tensor views (zero-copy, backed by shm).
@@ -367,16 +355,14 @@ class SharedMemoryTensorChannel:
         Raises:
             TimeoutError: if the core doesn't respond within *timeout*.
         """
-        self.write_inputs(custom_inputs)
-        self.signal_input_ready()
+        copies, _alive = _prepare_copy_descs(
+            self._input_shm_views, custom_inputs)
+        _cpp.batch_copy_and_signal(copies, self._input_futex_addr)
 
-        if not self.check_output_ready():
-            if not self.wait_output_ready(timeout_s=timeout):
-                raise TimeoutError(
-                    f"Decode step timed out after {timeout}s"
-                )
-
-        return self.consume_output()
+        if not _cpp.wait_and_clear_flag(self._output_futex_addr, timeout):
+            raise TimeoutError(
+                f"Decode step timed out after {timeout}s")
+        return dict(self._output_shm_views)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
