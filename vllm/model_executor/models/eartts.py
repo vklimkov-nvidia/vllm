@@ -860,7 +860,7 @@ class EarTTSForCausalLM(nn.Module):
             text_mask=text_mask,
             bos_mask=bos_mask,
         )
-        return hidden_states, codes
+        return hidden_states, codes.to(torch.int32)
 
     def compute_logits(
         self,
