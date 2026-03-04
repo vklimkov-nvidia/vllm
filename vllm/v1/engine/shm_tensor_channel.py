@@ -133,13 +133,13 @@ def decode_step_tensor_specs(
     custom_specs: list,
     model_dtype: torch.dtype,
 ) -> list["TensorSpec"]:
-    """Convert ``CustomInputSpec`` list to ``TensorSpec`` list for a
+    """Convert ``CustomIOSpec`` list to ``TensorSpec`` list for a
     single decode step (batch size 1)."""
-    from vllm.config.model import CustomInputSpec
+    from vllm.config.model import CustomIOSpec
 
     result: list[TensorSpec] = []
     for spec in custom_specs:
-        assert isinstance(spec, CustomInputSpec)
+        assert isinstance(spec, CustomIOSpec)
         dtype = spec.get_torch_dtype() or model_dtype
         shape = (1,) if spec.dim is None else (1, spec.dim)
         result.append(TensorSpec(name=spec.name, shape=shape, dtype=dtype))
