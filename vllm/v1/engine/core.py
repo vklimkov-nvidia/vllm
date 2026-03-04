@@ -284,39 +284,29 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
+        if self.vllm_config.model_config.shm_decode:
+            mc = self.vllm_config.model_config
+            n_out = getattr(mc.hf_config, "num_output_tokens_per_step", 1)
+            input_specs = decode_step_tensor_specs(
+                mc.custom_input_specs or [], mc.dtype, n_out
+            )
+            output_specs = decode_step_tensor_specs(
+                mc.custom_output_specs or [], mc.dtype, n_out
+            )
+            ch = SharedMemoryTensorChannel(
+                name=f"vllm_shm_{request.request_id}",
+                request_id=request.request_id,
+                input_specs=input_specs,
+                output_specs=output_specs,
+                create=False,
+            )
+            self._shm_channels[request.request_id] = ch
+
     def set_custom_inputs(self, request_id: str, custom_inputs: dict[str, torch.Tensor]):
         """Set custom inputs for a request."""
         self.scheduler.set_custom_inputs(request_id, custom_inputs)
 
     # ── Shared-memory decode channels ──────────────────────────────
-
-    def register_shm_channel(
-        self,
-        request_id: str,
-        channel_name: str,
-    ) -> None:
-        """Open an existing shared-memory channel for *request_id*.
-
-        Tensor specs are derived from the model config's
-        ``custom_input_specs`` / ``custom_output_specs``.
-        The client must have already created the channel (create=True).
-        """
-        mc = self.vllm_config.model_config
-        n_out = getattr(mc.hf_config, "num_output_tokens_per_step", 1)
-        input_specs = decode_step_tensor_specs(
-            mc.custom_input_specs or [], mc.dtype, n_out,
-        )
-        output_specs = decode_step_tensor_specs(
-            mc.custom_output_specs or [], mc.dtype, n_out,
-        )
-        ch = SharedMemoryTensorChannel(
-            name=channel_name,
-            request_id=request_id,
-            input_specs=input_specs,
-            output_specs=output_specs,
-            create=False,
-        )
-        self._shm_channels[request_id] = ch
 
     def unregister_shm_channel(self, request_id: str) -> None:
         """Close and remove the shm channel for *request_id*."""
@@ -332,6 +322,7 @@ class EngineCore:
             if ch.check_input_ready():
                 inputs = ch.consume_input()
                 self.set_custom_inputs(request_id, inputs)
+                ch.decode_started = True
 
     _SHM_POLL_TIMEOUT_S = 2.0
 
@@ -932,9 +923,16 @@ class EngineCoreProc(EngineCore):
                 self._wait_for_queue_inputs()
             still_waiting = self.scheduler.num_requests_needing_inputs()
             if still_waiting > 0:
+                waiting_ids = list(self.scheduler.waiting_input)
+                running_no_input = [
+                    r.request_id for r in self.scheduler.running
+                    if not r.has_custom_inputs()
+                ]
                 logger.warning(
                     "Proceeding with forward pass while %d request(s) "
-                    "still waiting for custom inputs", still_waiting)
+                    "still waiting for custom inputs "
+                    "(waiting_input=%s, running_no_input=%s)",
+                    still_waiting, waiting_ids, running_no_input)
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -949,6 +947,7 @@ class EngineCoreProc(EngineCore):
                     for out in engine_outputs.outputs:
                         ch = self._shm_channels.get(out.request_id)
                         if (ch is not None
+                                and ch.decode_started
                                 and out.new_custom_outputs
                                 and ch.can_write_outputs(
                                     out.new_custom_outputs)):

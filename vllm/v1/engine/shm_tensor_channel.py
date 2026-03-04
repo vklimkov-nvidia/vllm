@@ -179,6 +179,7 @@ class SharedMemoryTensorChannel:
         self.name = name
         self.request_id = request_id
         self._is_creator = create
+        self.decode_started = False
 
         self._input_slots: dict[str, tuple[int, TensorSpec]] = {}
         self._output_slots: dict[str, tuple[int, TensorSpec]] = {}
