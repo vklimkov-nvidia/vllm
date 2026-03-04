@@ -342,7 +342,7 @@ class AsyncLLM(EngineClient):
 
     # ── Shared-memory decode channels ──────────────────────────────
 
-    async def create_shm_decode_channel(
+    def create_shm_decode_channel(
         self,
         request_id: str,
     ) -> SharedMemoryTensorChannel:
@@ -350,8 +350,9 @@ class AsyncLLM(EngineClient):
 
         Tensor specs are derived from the model config's
         ``custom_input_specs`` and ``custom_output_specs``.  The core
-        is notified via a utility call so the channel is registered
-        before the first decode step.
+        opens its side of the channel using the same deterministic
+        name (``vllm_shm_{request_id}``) when it processes the
+        ``add_request``.
 
         When ``model_config.shm_decode`` is ``True`` this is called
         automatically from ``_add_request``; callers may also invoke
@@ -373,20 +374,7 @@ class AsyncLLM(EngineClient):
             create=True,
         )
         self._shm_channels[request_id] = ch
-
-        await self.engine_core.call_utility_async(
-            "register_shm_channel", request_id, channel_name,
-        )
         return ch
-
-    async def close_shm_decode_channel(self, request_id: str) -> None:
-        """Close the shared-memory channel and unregister it on the core."""
-        ch = self._shm_channels.pop(request_id, None)
-        if ch is not None:
-            ch.close()
-            await self.engine_core.call_utility_async(
-                "unregister_shm_channel", request_id,
-            )
 
     def decode_step_shm(
         self,
@@ -434,11 +422,12 @@ class AsyncLLM(EngineClient):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
-        # When shm_decode is enabled, create and register the SHM
-        # channel *before* sending the ADD so the core sees it first.
+        # When shm_decode is enabled, create the local SHM channel.
+        # The core registers its side using the same deterministic name
+        # when it processes the add_request.
         if (self.model_config.shm_decode
                 and request.request_id not in self._shm_channels):
-            await self.create_shm_decode_channel(request.request_id)
+            self.create_shm_decode_channel(request.request_id)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -763,16 +752,18 @@ class AsyncLLM(EngineClient):
             raise self.dead_error
 
     async def start_profile(self) -> None:
-        coros = [self.engine_core.profile_async(True)]
+        # profiler.start/stop use a thread-local stack internally
+        # (_enable_profiler / _disable_profiler), so they MUST run on the
+        # same thread.  Calling them directly on the event-loop thread
+        # guarantees this; they are fast (trace-hook setup/teardown only).
         if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.start))
-        await asyncio.gather(*coros)
+            self.profiler.start()
+        await self.engine_core.profile_async(True)
 
     async def stop_profile(self) -> None:
-        coros = [self.engine_core.profile_async(False)]
+        await self.engine_core.profile_async(False)
         if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.stop))
-        await asyncio.gather(*coros)
+            self.profiler.stop()
 
     async def reset_mm_cache(self) -> None:
         self.processor.clear_cache()
