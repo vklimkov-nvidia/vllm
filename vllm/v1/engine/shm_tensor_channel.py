@@ -38,6 +38,7 @@ import multiprocessing.shared_memory as shm
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import _posixshmem  # type: ignore[attr-defined]
 import struct
+import threading
 import time
 from dataclasses import dataclass
 
@@ -47,14 +48,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# ── C++ extension (required) ─────────────────────────────────────
+# ── C++ extension (optional at import time) ──────────────────────
 try:
     import vllm._shm_channel_cpp as _cpp
-except ImportError as exc:
-    raise ImportError(
-        "vllm._shm_channel_cpp is required for SharedMemoryTensorChannel. "
-        "Build it with: pip install -e .  (or rebuild vllm)"
-    ) from exc
+except ImportError:
+    _cpp = None  # type: ignore[assignment]
 
 _INPUT_READY_OFF = 0
 _OUTPUT_READY_OFF = 4
@@ -69,6 +67,9 @@ def _align_up(n: int, alignment: int) -> int:
     return (n + alignment - 1) & ~(alignment - 1)
 
 
+_shm_create_lock = threading.Lock()
+
+
 def _create_shm_untracked(
     name: str, create: bool, size: int = 0,
 ) -> shm.SharedMemory:
@@ -77,12 +78,13 @@ def _create_shm_untracked(
     We manage close()/unlink() ourselves, so tracker bookkeeping is
     unnecessary and causes spurious warnings at shutdown.
     """
-    orig = resource_tracker.register
-    resource_tracker.register = lambda *args, **kwargs: None
-    try:
-        return shm.SharedMemory(name=name, create=create, size=size)
-    finally:
-        resource_tracker.register = orig
+    with _shm_create_lock:
+        orig = resource_tracker.register
+        resource_tracker.register = lambda *args, **kwargs: None
+        try:
+            return shm.SharedMemory(name=name, create=create, size=size)
+        finally:
+            resource_tracker.register = orig
 
 
 def _prepare_copy_descs(
@@ -160,6 +162,13 @@ class SharedMemoryTensorChannel:
         output_specs: list[TensorSpec],
         create: bool = True,
     ):
+        if _cpp is None:
+            raise ImportError(
+                "vllm._shm_channel_cpp is required for "
+                "SharedMemoryTensorChannel. "
+                "Build it with: pip install -e .  (or rebuild vllm)"
+            )
+
         self.name = name
         self.request_id = request_id
         self._is_creator = create

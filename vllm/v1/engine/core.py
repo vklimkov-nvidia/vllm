@@ -941,28 +941,28 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        # For shm-registered requests, route custom outputs to shared
-        # memory and remove them from the list; everything else is
-        # queued exactly as before.
-        for client_idx, engine_outputs in (
-            outputs.items() if outputs else ()
-        ):
+        if outputs:
             if self._shm_channels:
-                remaining = []
-                for out in engine_outputs.outputs:
-                    ch = self._shm_channels.get(out.request_id)
-                    if (ch is not None
-                            and out.new_custom_outputs
-                            and ch.can_write_outputs(
-                                out.new_custom_outputs)):
-                        ch.write_outputs(out.new_custom_outputs)
-                        ch.signal_output_ready()
-                    else:
-                        remaining.append(out)
-                engine_outputs.outputs = remaining
-                if not remaining:
-                    continue
-            self.output_queue.put_nowait((client_idx, engine_outputs))
+                for client_idx, engine_outputs in outputs.items():
+                    remaining = []
+                    for out in engine_outputs.outputs:
+                        ch = self._shm_channels.get(out.request_id)
+                        if (ch is not None
+                                and out.new_custom_outputs
+                                and ch.can_write_outputs(
+                                    out.new_custom_outputs)):
+                            ch.write_outputs(out.new_custom_outputs)
+                            ch.signal_output_ready()
+                        else:
+                            remaining.append(out)
+                    engine_outputs.outputs = remaining
+                    if not remaining:
+                        continue
+                    self.output_queue.put_nowait(
+                        (client_idx, engine_outputs))
+            else:
+                for output in outputs.items():
+                    self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
 
