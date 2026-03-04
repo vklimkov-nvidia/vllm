@@ -28,8 +28,8 @@ async def run_request(
     request_id: str,
 ):
     """
-    Sends a single request to the vLLM engine and records metrics.
-    Prefills with random combined embeddings, then decodes step-by-step.
+    ZMQ mode: prefills with random combined embeddings, then decodes
+    step-by-step via generate() + append_request().
     """
     combined_embeds = torch.randn(
         input_num_tokens, hidden_size, dtype=torch.bfloat16
@@ -77,6 +77,77 @@ async def run_request(
         request_latency = request_end_time - request_start_time
 
         metrics["request_latencies"].append(request_latency)
+        metrics["completed_sequences"] += 1
+        metrics["total_tokens"] += token_idx
+
+    except Exception as e:
+        print(f"Request {request_id} failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        metrics["failed_sequences"] += 1
+
+
+async def run_request_shm(
+    engine: AsyncLLM,
+    sampling_params: SamplingParams,
+    input_num_tokens: int,
+    hidden_size: int,
+    metrics: Dict[str, Any],
+    request_id: str,
+):
+    """
+    SHM mode: prefill via ZMQ (add_request), then decode via
+    shared-memory channel (decode_step_shm).
+    """
+    combined_embeds = torch.randn(
+        input_num_tokens, hidden_size, dtype=torch.bfloat16
+    )
+    inputs = {
+        "prompt_token_ids": [0] * input_num_tokens,
+        "custom_inputs": {"combined_embeds": combined_embeds},
+    }
+
+    request_start_time = time.perf_counter()
+    token_idx = 0
+
+    try:
+        queue = await engine.add_request(request_id, inputs, sampling_params)
+
+        prefill_output = await queue.get()
+        now = time.perf_counter()
+        metrics["first_tokens"][0].append(now - request_start_time)
+        last_token_time = now
+        token_idx = 1
+
+        for step in range(sampling_params.max_tokens - 1):
+            step_embeds = torch.randn(1, hidden_size, dtype=torch.bfloat16)
+            custom_inputs = {"combined_embeds": step_embeds}
+            outputs = await asyncio.to_thread(
+                engine.decode_step_shm,
+                request_id,
+                custom_inputs=custom_inputs,
+            )
+            now = time.perf_counter()
+
+            if token_idx < 6:
+                metrics["first_tokens"][token_idx].append(
+                    now - last_token_time
+                )
+            else:
+                metrics["inter_token_latencies"].append(
+                    now - last_token_time
+                )
+
+            last_token_time = now
+            token_idx += 1
+
+        await engine.abort(request_id)
+
+        request_end_time = time.perf_counter()
+        metrics["request_latencies"].append(
+            request_end_time - request_start_time
+        )
         metrics["completed_sequences"] += 1
         metrics["total_tokens"] += token_idx
 
@@ -154,6 +225,7 @@ async def worker(
     input_num_tokens: int,
     hidden_size: int,
     metrics: Dict[str, Any],
+    use_shm: bool = False,
 ):
     while True:
         async with metrics["lock"]:
@@ -162,9 +234,16 @@ async def worker(
             metrics["requests_to_run"] -= 1
 
         request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
-        await run_request(
-            engine, sampling_params, input_num_tokens, hidden_size, metrics, request_id
-        )
+        if use_shm:
+            await run_request_shm(
+                engine, sampling_params, input_num_tokens, hidden_size,
+                metrics, request_id,
+            )
+        else:
+            await run_request(
+                engine, sampling_params, input_num_tokens, hidden_size,
+                metrics, request_id
+            )
 
 
 def init_metrics(num_requests: int):
@@ -265,9 +344,16 @@ async def main():
         action="store_true",
         help="Run with torch profiler",
     )
+    parser.add_argument(
+        "--use-shm",
+        action="store_true",
+        help="Use shared-memory decode channel (prefill via ZMQ, "
+             "decode via SHM)",
+    )
     args = parser.parse_args()
 
-    print("Starting Nemotron LLM benchmark...")
+    mode = "SHM" if args.use_shm else "ZMQ"
+    print(f"Starting Nemotron LLM benchmark ({mode} mode)...")
     print(
         f"Concurrency: {args.concurrency}, Requests: {args.num_requests}, "
         f"Input: {args.input_len}, Output: {args.output_len}, "
@@ -290,6 +376,8 @@ async def main():
     }
     if args.load_format == "dummy":
         engine_args_kwargs["load_format"] = "dummy"
+    if args.use_shm:
+        engine_args_kwargs["shm_decode"] = True
 
     engine_args = AsyncEngineArgs(**engine_args_kwargs)
     engine = AsyncLLM.from_engine_args(engine_args)
@@ -324,6 +412,7 @@ async def main():
                         input_num_tokens=args.input_len,
                         hidden_size=args.hidden_size,
                         metrics=metrics,
+                        use_shm=args.use_shm,
                     )
                 )
             )

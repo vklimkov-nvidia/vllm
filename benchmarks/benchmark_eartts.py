@@ -105,6 +105,97 @@ async def run_request(
 
     except Exception as e:
         print(f"Request {request_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        metrics["failed_sequences"] += 1
+
+
+async def run_request_shm(
+    engine: AsyncLLMEngine,
+    sampling_params: SamplingParams,
+    input_num_tokens: int,
+    metrics: Dict[str, Any],
+    request_id: str,
+):
+    """
+    SHM mode: prefill via ZMQ (add_request), then decode via
+    shared-memory channel (decode_step_shm).
+    """
+    model_dtype = engine.vllm_config.model_config.dtype
+    prompt_acoustic_tokens = torch.randint(
+        0, 1024, (input_num_tokens, 31), dtype=torch.int32
+    )
+    bos_mask = torch.zeros(input_num_tokens, dtype=model_dtype)
+    bos_mask[0] = 1.0
+
+    inputs = {
+        "prompt_token_ids": [0] * input_num_tokens,
+        "custom_inputs": {
+            "acoustic_tokens": prompt_acoustic_tokens,
+            "text_tokens": torch.zeros(input_num_tokens, dtype=torch.int32),
+            "text_mask": torch.zeros(input_num_tokens, dtype=model_dtype),
+            "bos_mask": bos_mask,
+        },
+    }
+
+    request_start_time = time.perf_counter()
+    token_idx = 0
+
+    try:
+        queue = await engine.add_request(request_id, inputs, sampling_params)
+
+        prefill_output = await queue.get()
+        now = time.perf_counter()
+        metrics["first_tokens"][0].append(now - request_start_time)
+        last_token_time = now
+        token_idx = 1
+
+        acoustic_tokens = prefill_output.outputs[0].custom_outputs.get(
+            "acoustic_tokens"
+        )
+
+        for _ in range(sampling_params.max_tokens - 1):
+            step_acoustic_tokens = acoustic_tokens[-1:]
+            current_text_token = torch.randint(
+                0, 10000, (1,), dtype=torch.int32
+            )
+            custom_outputs = engine.decode_step_shm(
+                request_id,
+                custom_inputs={
+                    "acoustic_tokens": step_acoustic_tokens,
+                    "text_tokens": current_text_token,
+                    "text_mask": torch.ones(1, dtype=model_dtype),
+                    "bos_mask": torch.zeros(1, dtype=model_dtype),
+                },
+            )
+            acoustic_tokens = custom_outputs.get("acoustic_tokens")
+            now = time.perf_counter()
+
+            if token_idx < 6:
+                metrics["first_tokens"][token_idx].append(
+                    now - last_token_time
+                )
+            else:
+                metrics["inter_token_latencies"].append(
+                    now - last_token_time
+                )
+
+            last_token_time = now
+            token_idx += 1
+
+        await engine.abort(request_id)
+
+        request_end_time = time.perf_counter()
+        metrics["request_latencies"].append(
+            request_end_time - request_start_time
+        )
+        metrics["completed_sequences"] += 1
+        metrics["total_tokens"] += token_idx
+
+    except Exception as e:
+        print(f"Request {request_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
         metrics["failed_sequences"] += 1
 
 
@@ -148,25 +239,24 @@ async def worker(
     sampling_params: SamplingParams,
     input_num_tokens: int,
     metrics: Dict[str, Any],
+    use_shm: bool = False,
 ):
-    """
-    A persistent worker that continuously sends requests until
-    the global request counter reaches zero.
-    """
     while True:
-
-        # Atomically check and decrement the request counter
         async with metrics["lock"]:
             if metrics["requests_to_run"] <= 0:
-                # All requests have been assigned, worker can exit
                 break
             metrics["requests_to_run"] -= 1
 
         request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
-        # Run the request *outside* the lock
-        await run_request(
-            engine, sampling_params, input_num_tokens, metrics, request_id
-        )
+        if use_shm:
+            await run_request_shm(
+                engine, sampling_params, input_num_tokens,
+                metrics, request_id
+            )
+        else:
+            await run_request(
+                engine, sampling_params, input_num_tokens, metrics, request_id
+            )
 
 
 def init_metrics(num_requests: int):
@@ -220,50 +310,70 @@ async def main():
     parser.add_argument(
         "--gpu-mem", type=float, default=0.7, help="GPU memory utilization (0.0 to 1.0)"
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="eartts_vllm_model",
+        help="Path to the EarTTS model directory",
+    )
+    parser.add_argument(
+        "--input-coalesce-timeout-ms",
+        type=float,
+        default=0,
+        help="Wait up to this many ms for all requests to receive custom "
+             "inputs before running a forward pass (0 to disable)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Run with torch profiler",
+    )
+    parser.add_argument(
+        "--use-shm",
+        action="store_true",
+        help="Use shared-memory decode channel (prefill via ZMQ, "
+             "decode via SHM)",
+    )
     args = parser.parse_args()
 
     print(f"Benchmark: concurrency={args.concurrency}, requests={args.num_requests}, in={args.input_len}, out={args.output_len}")
 
-    # 1. Create Engine Args
-    #max_num_batched_tokens = args.max_model_len * args.concurrency * 2
-    #if args.guidance_scale is not None:
-    #    max_num_batched_tokens = max_num_batched_tokens
-    engine_args = AsyncEngineArgs(
-        model="eartts_vllm_model",
-        dtype=args.dtype,
-        max_model_len=args.max_model_len,
-        #max_num_seqs=args.concurrency * 2,
-        #max_num_batched_tokens=args.max_model_len * args.concurrency * 2,
-        gpu_memory_utilization=args.gpu_mem,
-        skip_tokenizer_init=True,  # Skip tokenizer since we're using embeddings directly
-        load_format="dummy",  # <-- Use dummy weights as requested
-        disable_log_stats=True,
-        enable_prefix_caching=False,
-    )
+    engine_args_kwargs = {
+        "model": args.model,
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_mem,
+        "skip_tokenizer_init": True,
+        "load_format": "dummy",
+        "disable_log_stats": True,
+        "enable_prefix_caching": False,
+        "input_coalesce_timeout_ms": args.input_coalesce_timeout_ms,
+    }
+    if args.use_shm:
+        engine_args_kwargs["shm_decode"] = True
 
-    # 2. Create Engine
+    engine_args = AsyncEngineArgs(**engine_args_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    # 3. Create Sampling Params
+    if args.profile:
+        await engine.start_profile()
+
     sampling_args = {
         "max_tokens": args.output_len,
-        "stop_token_ids": [],  # Ensure no default stop tokens interfere
+        "stop_token_ids": [],
         "skip_sampling": True,
     }
     if args.guidance_scale is not None:
         sampling_args["guidance_scale"] = args.guidance_scale
     sampling_params = SamplingParams(**sampling_args)
 
-    # Shared metrics dictionary
     for run, num_requests in enumerate([3 * args.concurrency, args.num_requests]):
         metrics = init_metrics(num_requests)
 
-        # --- Start Benchmark ---
         if run == 0:
             print("Warmup...")
         start_time = time.perf_counter()
 
-        # Create and start C worker tasks
         tasks = []
         for i in range(args.concurrency):
             tasks.append(
@@ -274,21 +384,19 @@ async def main():
                         sampling_params=sampling_params,
                         input_num_tokens=args.input_len,
                         metrics=metrics,
+                        use_shm=args.use_shm,
                     )
                 )
             )
 
-        # Wait for all worker tasks to finish
-        # Workers will finish once metrics["requests_to_run"] hits 0
         await asyncio.gather(*tasks)
 
         end_time = time.perf_counter()
-        # --- End Benchmark ---
-
         total_time = end_time - start_time
 
         if run > 0:
-            # Calculate and print final metrics
+            if args.profile:
+                await engine.stop_profile()
             calculate_and_print_metrics(metrics, total_time, args)
 
 
