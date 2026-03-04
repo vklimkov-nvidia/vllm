@@ -302,11 +302,12 @@ class EngineCore:
         The client must have already created the channel (create=True).
         """
         mc = self.vllm_config.model_config
+        n_out = getattr(mc.hf_config, "num_output_tokens_per_step", 1)
         input_specs = decode_step_tensor_specs(
-            mc.custom_input_specs or [], mc.dtype,
+            mc.custom_input_specs or [], mc.dtype, n_out,
         )
         output_specs = decode_step_tensor_specs(
-            mc.custom_output_specs or [], mc.dtype,
+            mc.custom_output_specs or [], mc.dtype, n_out,
         )
         ch = SharedMemoryTensorChannel(
             name=channel_name,

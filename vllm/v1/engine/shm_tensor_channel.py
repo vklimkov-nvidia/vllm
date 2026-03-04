@@ -5,7 +5,8 @@
 Provides bidirectional tensor transfer between client and core processes
 using POSIX shared memory with C++-accelerated signaling.  Designed for
 the decode loop where the client writes custom inputs (e.g. shape
-[1, dim]) and the core writes back outputs each step.
+[N, dim] where N = num_output_tokens_per_step, default 1) and the
+core writes back outputs each step.
 
 All flag operations use C++ atomics with acquire/release ordering,
 futex syscalls are issued directly from C++ (no ctypes overhead),
@@ -132,16 +133,23 @@ class TensorSpec:
 def decode_step_tensor_specs(
     custom_specs: list,
     model_dtype: torch.dtype,
+    num_output_tokens_per_step: int = 1,
 ) -> list["TensorSpec"]:
     """Convert ``CustomIOSpec`` list to ``TensorSpec`` list for a
-    single decode step (batch size 1)."""
+    single decode step.
+
+    When *num_output_tokens_per_step* > 1 (e.g. FastConformer producing
+    multiple frames per step), the leading dimension of every tensor is
+    set to that value instead of 1.
+    """
     from vllm.config.model import CustomIOSpec
 
+    n = max(num_output_tokens_per_step, 1)
     result: list[TensorSpec] = []
     for spec in custom_specs:
         assert isinstance(spec, CustomIOSpec)
         dtype = spec.get_torch_dtype() or model_dtype
-        shape = (1,) if spec.dim is None else (1, spec.dim)
+        shape = (n,) if spec.dim is None else (n, spec.dim)
         result.append(TensorSpec(name=spec.name, shape=shape, dtype=dtype))
     return result
 

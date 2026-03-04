@@ -358,11 +358,12 @@ class AsyncLLM(EngineClient):
         it explicitly.
         """
         mc = self.model_config
+        n_out = getattr(mc.hf_config, "num_output_tokens_per_step", 1)
         input_specs = decode_step_tensor_specs(
-            mc.custom_input_specs or [], mc.dtype,
+            mc.custom_input_specs or [], mc.dtype, n_out,
         )
         output_specs = decode_step_tensor_specs(
-            mc.custom_output_specs or [], mc.dtype,
+            mc.custom_output_specs or [], mc.dtype, n_out,
         )
         channel_name = f"vllm_shm_{request_id}"
         ch = SharedMemoryTensorChannel(
