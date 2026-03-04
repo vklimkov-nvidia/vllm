@@ -39,7 +39,6 @@ from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import _posixshmem  # type: ignore[attr-defined]
 import struct
 import threading
-import time
 from dataclasses import dataclass
 
 import torch
@@ -172,8 +171,6 @@ class SharedMemoryTensorChannel:
         self.name = name
         self.request_id = request_id
         self._is_creator = create
-        self._wait_input_stats: list[float] = []
-        self._output_ready_ts: float = 0.0
 
         self._input_slots: dict[str, tuple[int, TensorSpec]] = {}
         self._output_slots: dict[str, tuple[int, TensorSpec]] = {}
@@ -276,12 +273,9 @@ class SharedMemoryTensorChannel:
 
         Returns True if input is ready, False on timeout.
         """
-        t0 = time.perf_counter()
-        ready = _cpp.wait_flag(
+        return _cpp.wait_flag(
             self._input_futex_addr,
             -1.0 if timeout_s is None else timeout_s)
-        self._wait_input_stats.append(time.perf_counter() - t0)
-        return ready
 
     def consume_input(self) -> dict[str, torch.Tensor]:
         """Clear input_ready and return zero-copy shm tensor views."""
@@ -333,11 +327,9 @@ class SharedMemoryTensorChannel:
 
         Returns True if output is ready, False on timeout.
         """
-        ready = _cpp.wait_flag(
+        return _cpp.wait_flag(
             self._output_futex_addr,
             -1.0 if timeout_s is None else timeout_s)
-        self._output_ready_ts = time.perf_counter()
-        return ready
 
     def consume_output(self) -> dict[str, torch.Tensor]:
         """Clear output_ready and return zero-copy shm tensor views."""
@@ -379,18 +371,6 @@ class SharedMemoryTensorChannel:
         if getattr(self, "_closed", True):
             return
         self._closed = True
-
-        if self._wait_input_stats:
-            count = len(self._wait_input_stats)
-            total_ms = sum(self._wait_input_stats) * 1000
-            avg_ms = total_ms / count
-            min_ms = min(self._wait_input_stats) * 1000
-            max_ms = max(self._wait_input_stats) * 1000
-            logger.info(
-                "SharedMemoryTensorChannel wait_input_ready stats: "
-                "count=%d, avg=%.3fms, min=%.3fms, max=%.3fms",
-                count, avg_ms, min_ms, max_ms,
-            )
 
         self._input_shm_views.clear()
         self._output_shm_views.clear()
