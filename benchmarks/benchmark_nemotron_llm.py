@@ -88,45 +88,44 @@ async def run_request(
         metrics["failed_sequences"] += 1
 
 
-async def run_request_shm(
+def _make_step_timing():
+    return {
+        'prepare_copy_us': [],
+        'write_signal_us': [],
+        'wait_output_us': [],
+        'build_result_us': [],
+        'turnaround_us': [],
+        'client_overhead_us': [],
+    }
+
+
+def _decode_loop_sync(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
-    input_num_tokens: int,
     hidden_size: int,
     metrics: Dict[str, Any],
     request_id: str,
+    prefill_token_time: float,
+    request_start_time: float,
 ):
-    """
-    SHM mode: prefill via ZMQ (add_request), then decode via
-    shared-memory channel (decode_step_shm).
-    """
-    combined_embeds = torch.randn(
-        input_num_tokens, hidden_size, dtype=torch.bfloat16
-    )
-    inputs = {
-        "prompt_token_ids": [0] * input_num_tokens,
-        "custom_inputs": {"combined_embeds": combined_embeds},
-    }
+    """Run the entire decode loop in a plain OS thread (no asyncio).
 
-    request_start_time = time.perf_counter()
-    token_idx = 0
+    After prefill completes on the event loop, this function takes over.
+    Each step is: generate embeddings -> shm decode_step (futex
+    write+wait) -> record metrics.  No event-loop round-trips means
+    zero queuing delay between concurrent requests.
+    """
+    step_embeds = torch.randn(1, hidden_size, dtype=torch.bfloat16)
+    last_token_time = prefill_token_time
+    token_idx = 1
+    timing = _make_step_timing()
 
     try:
-        queue = await engine.add_request(request_id, inputs, sampling_params)
-
-        prefill_output = await queue.get()
-        now = time.perf_counter()
-        metrics["first_tokens"][0].append(now - request_start_time)
-        last_token_time = now
-        token_idx = 1
-
         for step in range(sampling_params.max_tokens - 1):
-            step_embeds = torch.randn(1, hidden_size, dtype=torch.bfloat16)
             custom_inputs = {"combined_embeds": step_embeds}
-            outputs = await asyncio.to_thread(
-                engine.decode_step_shm,
-                request_id,
-                custom_inputs=custom_inputs,
+            engine.decode_step_shm(
+                request_id, custom_inputs=custom_inputs,
+                timing=timing,
             )
             now = time.perf_counter()
 
@@ -142,7 +141,9 @@ async def run_request_shm(
             last_token_time = now
             token_idx += 1
 
-        await engine.abort(request_id)
+            timing['client_overhead_us'].append(
+                (time.perf_counter() - now) * 1e6
+            )
 
         request_end_time = time.perf_counter()
         metrics["request_latencies"].append(
@@ -152,9 +153,68 @@ async def run_request_shm(
         metrics["total_tokens"] += token_idx
 
     except Exception as e:
+        print(f"Request {request_id} decode loop failed: {e}")
+        import traceback
+        traceback.print_exc()
+        metrics["failed_sequences"] += 1
+
+    if metrics.get("step_timing") is not None:
+        dst = metrics["step_timing"]
+        for key in timing:
+            if key.startswith('_'):
+                continue
+            dst[key].extend(timing[key])
+
+
+async def run_request_shm(
+    engine: AsyncLLM,
+    sampling_params: SamplingParams,
+    input_num_tokens: int,
+    hidden_size: int,
+    metrics: Dict[str, Any],
+    request_id: str,
+):
+    """
+    SHM mode: prefill via ZMQ (add_request on event loop), then the
+    entire decode loop runs in a dedicated OS thread — no event-loop
+    round-trips between steps.
+    """
+    combined_embeds = torch.randn(
+        input_num_tokens, hidden_size, dtype=torch.bfloat16
+    )
+    inputs = {
+        "prompt_token_ids": [0] * input_num_tokens,
+        "custom_inputs": {"combined_embeds": combined_embeds},
+    }
+
+    request_start_time = time.perf_counter()
+
+    try:
+        queue = await engine.add_request(request_id, inputs, sampling_params)
+        prefill_output = await queue.get()
+        prefill_token_time = time.perf_counter()
+        metrics["first_tokens"][0].append(
+            prefill_token_time - request_start_time
+        )
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _decode_loop_sync,
+            engine,
+            sampling_params,
+            hidden_size,
+            metrics,
+            request_id,
+            prefill_token_time,
+            request_start_time,
+        )
+
+        await engine.abort(request_id)
+
+    except Exception as e:
         print(f"Request {request_id} failed: {e}")
         import traceback
-
         traceback.print_exc()
         metrics["failed_sequences"] += 1
 
@@ -215,6 +275,28 @@ def calculate_and_print_metrics(
     avg_rtf = avg_request_time / audio_duration_per_seq
     print(f"\n--- S2S Real-Time Factor (80ms/frame) ---")
     print(f"  RTF: {avg_rtf:.4f}x (< 1.0 means faster than real-time)")
+
+    st = metrics.get("step_timing")
+    if st:
+        print(f"\n--- SHM Decode Step Breakdown (µs) ---")
+        print(f"  {'phase':<20s} {'mean':>8s} {'p50':>8s} "
+              f"{'p95':>8s} {'p99':>8s} {'max':>8s}")
+        for key in ['prepare_copy_us', 'write_signal_us',
+                     'wait_output_us', 'build_result_us',
+                     'client_overhead_us', 'turnaround_us']:
+            vals = st.get(key, [])
+            if not vals:
+                continue
+            a = np.array(vals)
+            label = key.replace('_us', '')
+            print(f"  {label:<20s} {np.mean(a):>8.1f} {np.median(a):>8.1f} "
+                  f"{np.percentile(a, 95):>8.1f} "
+                  f"{np.percentile(a, 99):>8.1f} {np.max(a):>8.1f}")
+        turnaround = st.get('turnaround_us', [])
+        if turnaround:
+            print(f"\n  turnaround = time from output received to input "
+                  f"sent (what core waits for)")
+
     print("---------------------------------------")
 
 
@@ -246,8 +328,8 @@ async def worker(
             )
 
 
-def init_metrics(num_requests: int):
-    return {
+def init_metrics(num_requests: int, use_shm: bool = False):
+    m = {
         "request_latencies": [],
         "inter_token_latencies": [],
         "first_tokens": [[] for _ in range(6)],
@@ -257,6 +339,9 @@ def init_metrics(num_requests: int):
         "requests_to_run": num_requests,
         "lock": asyncio.Lock(),
     }
+    if use_shm:
+        m["step_timing"] = _make_step_timing()
+    return m
 
 
 async def main():
@@ -395,7 +480,7 @@ async def main():
     for run, num_requests in enumerate([warmup_num, args.num_requests]):
         if num_requests == 0:
             continue
-        metrics = init_metrics(num_requests)
+        metrics = init_metrics(num_requests, use_shm=args.use_shm)
 
         run_name = "Warmup" if run == 0 else "Benchmark"
         print(f"\n--- Starting {run_name} ({num_requests} requests) ---")
