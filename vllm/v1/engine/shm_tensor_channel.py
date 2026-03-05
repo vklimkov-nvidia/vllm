@@ -35,11 +35,11 @@ from __future__ import annotations
 import ctypes
 import math
 import multiprocessing.shared_memory as shm
-from multiprocessing import resource_tracker
-from multiprocessing.shared_memory import _posixshmem  # type: ignore[attr-defined]
 import struct
 import threading
 from dataclasses import dataclass
+from multiprocessing import resource_tracker
+from multiprocessing.shared_memory import _posixshmem  # type: ignore[attr-defined]
 
 import torch
 
@@ -89,29 +89,16 @@ def _create_shm_untracked(
 def _prepare_copy_descs(
     shm_views: dict[str, torch.Tensor],
     tensors: dict[str, torch.Tensor],
-) -> tuple[list[tuple[int, int, int]], list[torch.Tensor]]:
+) -> list[tuple[int, int, int]]:
     """Build (dst_ptr, src_ptr, nbytes) descriptors for C++ batch_copy.
 
-    Returns ``(copies, alive)`` where *alive* keeps references to any
-    contiguous copies so their storage survives the GIL-released memcpy.
+    Caller must provide contiguous tensors with matching shape/dtype.
     """
-    copies: list[tuple[int, int, int]] = []
-    alive: list[torch.Tensor] = []
-    for name, tensor in tensors.items():
-        view = shm_views[name]
-        t = tensor.detach()
-        assert t.shape == view.shape, (
-            f"Shape mismatch for '{name}': "
-            f"expected {view.shape}, got {t.shape}"
-        )
-        assert t.dtype == view.dtype, (
-            f"Dtype mismatch for '{name}': "
-            f"expected {view.dtype}, got {t.dtype}"
-        )
-        t = t.contiguous()
-        alive.append(t)
-        copies.append((view.data_ptr(), t.data_ptr(), view.nbytes))
-    return copies, alive
+    return [
+        (shm_views[name].data_ptr(), tensor.data_ptr(),
+         shm_views[name].nbytes)
+        for name, tensor in tensors.items()
+    ]
 
 
 @dataclass(frozen=True)
@@ -248,6 +235,14 @@ class SharedMemoryTensorChannel:
                 count=math.prod(spec.shape), offset=off,
             ).reshape(spec.shape)
 
+        # Cached (name, dst_ptr, nbytes) per input slot — these never
+        # change, letting decode_step avoid per-step dict lookups and
+        # .data_ptr()/.nbytes calls on the shm views.
+        self._input_copy_cache: list[tuple[str, int, int]] = [
+            (name, view.data_ptr(), view.nbytes)
+            for name, view in self._input_shm_views.items()
+        ]
+
     # ── Client -> Core ─────────────────────────────────────────────
 
     def write_input(self, name: str, tensor: torch.Tensor) -> None:
@@ -258,9 +253,8 @@ class SharedMemoryTensorChannel:
         _cpp.batch_copy([(view.data_ptr(), t.data_ptr(), view.nbytes)])
 
     def write_inputs(self, inputs: dict[str, torch.Tensor]) -> None:
-        copies, _alive = _prepare_copy_descs(
-            self._input_shm_views, inputs)
-        _cpp.batch_copy(copies)
+        _cpp.batch_copy(_prepare_copy_descs(
+            self._input_shm_views, inputs))
 
     def signal_input_ready(self) -> None:
         """Client: atomic set input_ready + FUTEX_WAKE."""
@@ -304,17 +298,8 @@ class SharedMemoryTensorChannel:
         _cpp.batch_copy([(view.data_ptr(), t.data_ptr(), view.nbytes)])
 
     def write_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
-        copies, _alive = _prepare_copy_descs(
-            self._output_shm_views, outputs)
-        _cpp.batch_copy(copies)
-
-    def write_outputs_and_signal(
-        self, outputs: dict[str, torch.Tensor],
-    ) -> None:
-        """Core: write all outputs + signal in one GIL-free batch."""
-        copies, _alive = _prepare_copy_descs(
-            self._output_shm_views, outputs)
-        _cpp.batch_copy_and_signal(copies, self._output_futex_addr)
+        _cpp.batch_copy(_prepare_copy_descs(
+            self._output_shm_views, outputs))
 
     def signal_output_ready(self) -> None:
         """Core: atomic set output_ready + FUTEX_WAKE."""
@@ -347,23 +332,19 @@ class SharedMemoryTensorChannel:
         """Write inputs, signal core, block until output, return results.
 
         Runs entirely in the calling thread with no asyncio involvement.
-        The entire write+signal is a single GIL-free batch (memcpy all
-        inputs -> atomic flag set -> futex wake), then a GIL-free
-        wait+clear for the output flag.  Total: 2 GIL transitions.
-
-        Returns:
-            Dict of output tensor views (zero-copy, backed by shm).
-
-        Raises:
-            TimeoutError: if the core doesn't respond within *timeout*.
+        The caller **must** provide contiguous tensors with matching
+        shape and dtype.
         """
-        copies, _alive = _prepare_copy_descs(
-            self._input_shm_views, custom_inputs)
+        copies = [
+            (dst_ptr, custom_inputs[name].data_ptr(), nbytes)
+            for name, dst_ptr, nbytes in self._input_copy_cache
+        ]
         _cpp.batch_copy_and_signal(copies, self._input_futex_addr)
 
         if not _cpp.wait_and_clear_flag(self._output_futex_addr, timeout):
             raise TimeoutError(
                 f"Decode step timed out after {timeout}s")
+
         return dict(self._output_shm_views)
 
     # ── Lifecycle ──────────────────────────────────────────────────
