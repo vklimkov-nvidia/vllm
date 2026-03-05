@@ -7,6 +7,12 @@ Usage:
         --num-requests 512 \
         --input-len 128 \
         --output-len 256
+
+    # With shared-memory decode channel:
+    python benchmarks/benchmark_qwen3_tts.py \
+        --model dummy_qwen3_tts_model \
+        --concurrency 16 \
+        --use-shm
 """
 
 import os
@@ -17,12 +23,12 @@ import asyncio
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 import numpy as np
 import torch
 
-# Suppress verbose vLLM logging
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
 try:
@@ -125,6 +131,96 @@ async def run_request(
         metrics["failed_sequences"] += 1
 
 
+async def run_request_shm(
+    engine: AsyncLLM,
+    sampling_params: SamplingParams,
+    input_num_tokens: int,
+    output_steps: int,
+    hidden_size: int,
+    metrics: Dict[str, Any],
+    request_id: str,
+    executor: ThreadPoolExecutor,
+):
+    """
+    SHM-based decode loop: prefill via the regular async path, then all
+    subsequent decode steps via shared-memory (decode_step_shm).
+
+    decode_step_shm is synchronous (blocks in a futex), so each call is
+    dispatched to *executor* to keep the event loop responsive.
+    """
+
+    prefill_emb = torch.randn(
+        input_num_tokens, hidden_size, dtype=torch.bfloat16
+    )
+
+    inputs = {
+        "prompt_token_ids": [0] * input_num_tokens,
+        "custom_inputs": {
+            "combined_embeddings": prefill_emb,
+        },
+    }
+
+    request_start_time = time.perf_counter()
+    step_idx = 0
+    loop = asyncio.get_event_loop()
+
+    try:
+        queue = await engine.add_request(request_id, inputs, sampling_params)
+        prefill_output = await queue.get()
+
+        now = time.perf_counter()
+        metrics["first_tokens"][0].append(now - request_start_time)
+        last_token_time = now
+        step_idx = 1
+
+        custom_out = prefill_output.outputs[0].custom_outputs
+        next_input = custom_out["next_input_embeddings"]
+
+        if prefill_output.finished or step_idx >= output_steps:
+            await engine.abort(request_id)
+            metrics["request_latencies"].append(now - request_start_time)
+            metrics["completed_sequences"] += 1
+            metrics["total_tokens"] += step_idx
+            return
+
+        while step_idx < output_steps:
+            custom_inputs = {"combined_embeddings": next_input[-1:, :]}
+
+            custom_outputs = await loop.run_in_executor(
+                executor,
+                engine.decode_step_shm,
+                request_id,
+                custom_inputs,
+            )
+
+            now = time.perf_counter()
+            next_input = custom_outputs["next_input_embeddings"]
+
+            if step_idx < 6:
+                metrics["first_tokens"][step_idx].append(
+                    now - last_token_time)
+            else:
+                metrics["inter_token_latencies"].append(
+                    now - last_token_time)
+
+            last_token_time = now
+            step_idx += 1
+
+        await engine.abort(request_id)
+
+        request_end_time = time.perf_counter()
+        metrics["request_latencies"].append(
+            request_end_time - request_start_time)
+        metrics["completed_sequences"] += 1
+        metrics["total_tokens"] += step_idx
+
+    except Exception as e:
+        print(f"Request {request_id} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        metrics["failed_sequences"] += 1
+
+
 def calculate_and_print_metrics(
     metrics: Dict[str, Any], total_time: float, args: argparse.Namespace
 ):
@@ -183,6 +279,8 @@ async def worker(
     output_steps: int,
     hidden_size: int,
     metrics: Dict[str, Any],
+    use_shm: bool = False,
+    executor: ThreadPoolExecutor = None,
 ):
     """
     A persistent worker that continuously sends requests until
@@ -195,15 +293,27 @@ async def worker(
             metrics["requests_to_run"] -= 1
 
         request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
-        await run_request(
-            engine,
-            sampling_params,
-            input_num_tokens,
-            output_steps,
-            hidden_size,
-            metrics,
-            request_id,
-        )
+        if use_shm:
+            await run_request_shm(
+                engine,
+                sampling_params,
+                input_num_tokens,
+                output_steps,
+                hidden_size,
+                metrics,
+                request_id,
+                executor,
+            )
+        else:
+            await run_request(
+                engine,
+                sampling_params,
+                input_num_tokens,
+                output_steps,
+                hidden_size,
+                metrics,
+                request_id,
+            )
 
 
 def init_metrics(num_requests: int):
@@ -280,16 +390,34 @@ async def main():
         action="store_true",
         help="Disable CUDA graph capture and run in eager mode",
     )
+    parser.add_argument(
+        "--use-shm",
+        action="store_true",
+        help="Use shared-memory decode channel instead of ZMQ for "
+             "decode-step I/O (requires custom_output_specs in model config)",
+    )
+    parser.add_argument(
+        "--input-coalesce-timeout-ms",
+        type=float,
+        default=0,
+        help="Wait up to this many ms for all requests to receive custom "
+             "inputs before running a forward pass (0 to disable)",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Skip warmup run",
+    )
 
     args = parser.parse_args()
 
+    mode = "SHM" if args.use_shm else "ZMQ"
     print(
-        f"Benchmark: concurrency={args.concurrency}, "
+        f"Benchmark ({mode}): concurrency={args.concurrency}, "
         f"requests={args.num_requests}, "
         f"in={args.input_len}, out={args.output_len}"
     )
 
-    # Compute max_num_batched_tokens to accommodate concurrency
     max_model_len = max(args.max_model_len, args.input_len + args.output_len)
     max_num_batched_tokens = max_model_len * args.concurrency * 2
 
@@ -306,10 +434,16 @@ async def main():
         trust_remote_code=True,
         enforce_eager=args.enforce_eager,
         compilation_config={"cudagraph_mode": "PIECEWISE"},
+        shm_decode=args.use_shm,
+        input_coalesce_timeout_ms=args.input_coalesce_timeout_ms,
     )
 
     print("Initializing engine...")
     engine = AsyncLLM.from_engine_args(engine_args)
+
+    executor = None
+    if args.use_shm:
+        executor = ThreadPoolExecutor(max_workers=args.concurrency)
 
     sampling_params = SamplingParams(
         max_tokens=max_model_len,
@@ -317,15 +451,16 @@ async def main():
     )
 
     # --- Warmup + Benchmark ---
+    warmup_num = 0 if args.no_warmup else 3 * args.concurrency
     for run, num_requests in enumerate(
-        [3 * args.concurrency, args.num_requests]
+        [warmup_num, args.num_requests]
     ):
+        if num_requests == 0:
+            continue
         metrics = init_metrics(num_requests)
 
-        if run == 0:
-            print("Warmup...")
-        else:
-            print("Running benchmark...")
+        run_name = "Warmup" if run == 0 else "Benchmark"
+        print(f"\n--- Starting {run_name} ({num_requests} requests) ---")
 
         start_time = time.perf_counter()
 
@@ -339,6 +474,8 @@ async def main():
                     output_steps=args.output_len,
                     hidden_size=args.hidden_size,
                     metrics=metrics,
+                    use_shm=args.use_shm,
+                    executor=executor,
                 )
             )
             for i in range(args.concurrency)
@@ -349,12 +486,15 @@ async def main():
         end_time = time.perf_counter()
         total_time = end_time - start_time
 
-        if run == 0:
-            print(f"Warmup done in {total_time:.2f}s "
-                  f"({metrics['completed_sequences']} sequences, "
-                  f"{metrics['failed_sequences']} failed)")
-        else:
+        print(f"{run_name} finished in {total_time:.2f}s "
+              f"({metrics['completed_sequences']} sequences, "
+              f"{metrics['failed_sequences']} failed)")
+
+        if run > 0:
             calculate_and_print_metrics(metrics, total_time, args)
+
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":

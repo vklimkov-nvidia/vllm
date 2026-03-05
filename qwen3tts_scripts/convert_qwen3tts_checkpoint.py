@@ -50,9 +50,13 @@ def _adjust_config(config: dict) -> None:
         ]
 
     # 2. Add custom_outputs
-    if "custom_outputs" not in config:
+    if "custom_output_specs" not in config:
         print("  Adding custom_outputs...")
-        config["custom_outputs"] = ["codes", "next_input_embeddings"]
+        codes_num = 16
+        config["custom_output_specs"] = [
+            {"name": "next_input_embeddings", "dim": dim},
+            {"name": "codes", "dim": codes_num, "dtype": "int64"},
+        ]
 
     # 3. Fix rope_scaling in talker_config
     if "talker_config" in config:
