@@ -299,6 +299,9 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free(preempted_req)
                 preempted_req.status = RequestStatus.PREEMPTED
                 preempted_req.num_computed_tokens = 0
+                if self.await_inputs and preempted_req.custom_inputs is not None:
+                    preempted_req.custom_inputs_num_consumed = 0
+                    preempted_req.custom_inputs_ready = True
                 preempted_req.num_preemptions += 1
                 if self.log_stats:
                     preempted_req.record_event(
@@ -1299,6 +1302,16 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def num_requests_needing_inputs(self) -> int:
+        """Count requests that need custom inputs before they can run."""
+        if not self.await_inputs:
+            return 0
+        count = len(self.waiting_input)
+        for req in self.running:
+            if not req.has_custom_inputs():
+                count += 1
+        return count
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)

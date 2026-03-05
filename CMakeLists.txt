@@ -96,6 +96,21 @@ else()
 endif()
 
 #
+# _shm_channel_cpp extension (Linux only, pure CPU C++)
+# Atomic flag ops, futex wait/wake, batched memcpy with GIL release.
+#
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(STATUS "Building shm_channel C++ extension.")
+  Python_add_library(_shm_channel_cpp MODULE WITH_SOABI
+    "csrc/shm_channel.cpp")
+  set_target_properties(_shm_channel_cpp PROPERTIES CXX_STANDARD 17)
+  target_compile_options(_shm_channel_cpp PRIVATE -O3)
+  install(TARGETS _shm_channel_cpp
+    LIBRARY DESTINATION vllm
+    COMPONENT _shm_channel_cpp)
+endif()
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND
