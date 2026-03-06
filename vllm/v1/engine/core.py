@@ -323,12 +323,9 @@ class EngineCore:
                 self.set_custom_inputs(request_id, inputs)
                 ch.decode_started = True
 
-    _SHM_POLL_TIMEOUT_S = 2.0
-
     def _wait_for_shm_inputs(self) -> None:
         """Wait for shm inputs using futex (kernel-assisted sleep)."""
-        timeout = max(self._input_coalesce_timeout_s, self._SHM_POLL_TIMEOUT_S)
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + self._input_coalesce_timeout_s
         while self.scheduler.num_requests_needing_inputs() > 0:
             self._poll_shm_channels()
             if self.scheduler.num_requests_needing_inputs() == 0:
