@@ -323,45 +323,53 @@ class EngineCore:
                 self.set_custom_inputs(request_id, inputs)
                 ch.decode_started = True
 
-    _SHM_POLL_TIMEOUT_S = 2.0
+    def _wait_for_custom_inputs(self) -> None:
+        """Wait for requests in waiting_input to receive custom inputs.
 
-    def _wait_for_shm_inputs(self) -> None:
-        """Wait for shm inputs using futex (kernel-assisted sleep)."""
-        timeout = max(self._input_coalesce_timeout_s, self._SHM_POLL_TIMEOUT_S)
-        deadline = time.monotonic() + timeout
-        while self.scheduler.num_requests_needing_inputs() > 0:
-            self._poll_shm_channels()
-            if self.scheduler.num_requests_needing_inputs() == 0:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            # Futex-wait on any non-ready channel.  For the typical
-            # single-channel case this sleeps until the client signals,
-            # waking in ~1-5 µs.  For multiple channels use a short
-            # timeout so we cycle between them.
-            wait_t = (remaining if len(self._shm_channels) == 1
-                      else min(remaining, 0.001))
-            for ch in self._shm_channels.values():
-                if not ch.check_input_ready():
-                    ch.wait_input_ready(timeout_s=wait_t)
-                    break
+        Blocks up to ``_input_coalesce_timeout_s`` so the next forward pass
+        can run a full batch instead of a partial one.  Sleeps in <=1 ms
+        slices to stay responsive to ABORT messages on the ZMQ queue.
+        """
+        if self._input_coalesce_timeout_s <= 0:
+            return
+        if not self.scheduler.waiting_input:
+            return
 
-    def _wait_for_queue_inputs(self) -> None:
-        """Original ZMQ path: block on queue for custom inputs."""
         deadline = time.monotonic() + self._input_coalesce_timeout_s
-        while self.scheduler.num_requests_needing_inputs() > 0:
+
+        while self.scheduler.waiting_input:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            try:
-                req = self.input_queue.get(timeout=remaining)
-                self._handle_client_request(*req)
-                while not self.input_queue.empty():
-                    req = self.input_queue.get_nowait()
+
+            if self._shm_channels:
+                self._poll_shm_channels()
+                if not self.scheduler.waiting_input:
+                    break
+                for req_id in self.scheduler.waiting_input:
+                    ch = self._shm_channels.get(req_id)
+                    if ch is not None and not ch.check_input_ready():
+                        ch.wait_input_ready(
+                            timeout_s=min(remaining, 0.001))
+                        break
+            else:
+                try:
+                    req = self.input_queue.get(
+                        timeout=min(remaining, 0.001))
                     self._handle_client_request(*req)
-            except queue.Empty:
-                break
+                except queue.Empty:
+                    pass
+
+            while not self.input_queue.empty():
+                req = self.input_queue.get_nowait()
+                self._handle_client_request(*req)
+
+        if self.scheduler.waiting_input:
+            logger.warning(
+                "Proceeding with forward pass while %d request(s) "
+                "still waiting for custom inputs: %s",
+                len(self.scheduler.waiting_input),
+                list(self.scheduler.waiting_input))
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -894,8 +902,9 @@ class EngineCoreProc(EngineCore):
         waited = False
         while (
             not self.engines_running
-            and not self.scheduler.has_requests()
+            and not self.scheduler.has_schedulable_requests()
             and not self.batch_queue
+            and not self._shm_channels
         ):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
@@ -911,27 +920,12 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-        # Wait for decode-step custom inputs (with timeout so a lagging
-        # client doesn't block the forward pass indefinitely).
-        # Two exclusive modes: shm spin-poll vs zmq queue block.
-        needing = self.scheduler.num_requests_needing_inputs()
-        if needing > 0:
-            if self._shm_channels:
-                self._wait_for_shm_inputs()
-            elif self._input_coalesce_timeout_s > 0:
-                self._wait_for_queue_inputs()
-            still_waiting = self.scheduler.num_requests_needing_inputs()
-            if still_waiting > 0:
-                waiting_ids = list(self.scheduler.waiting_input)
-                running_no_input = [
-                    r.request_id for r in self.scheduler.running
-                    if not r.has_custom_inputs()
-                ]
-                logger.warning(
-                    "Proceeding with forward pass while %d request(s) "
-                    "still waiting for custom inputs "
-                    "(waiting_input=%s, running_no_input=%s)",
-                    still_waiting, waiting_ids, running_no_input)
+        # Poll SHM channels for ready inputs and then wait for any
+        # remaining requests that still need custom inputs.
+        if self._shm_channels:
+            self._poll_shm_channels()
+
+        self._wait_for_custom_inputs()
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -954,6 +948,10 @@ class EngineCoreProc(EngineCore):
                             ch.signal_output_ready()
                         else:
                             remaining.append(out)
+                        if out.finish_reason is not None:
+                            # we don't implicitely finish request in case of shm,
+                            # but adding this for visibility
+                            self.unregister_shm_channel(out.request_id)
                     engine_outputs.outputs = remaining
                     if not remaining:
                         continue
@@ -971,7 +969,6 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
-
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             self.add_request(req, request_wave)
