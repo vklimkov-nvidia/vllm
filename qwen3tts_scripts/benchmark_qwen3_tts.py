@@ -36,6 +36,7 @@ os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 
 import argparse
 import asyncio
+import concurrent.futures
 import logging
 import random
 import time
@@ -238,7 +239,7 @@ async def run_request_shm(
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None,
+            _shm_thread_pool,
             _decode_loop_sync,
             engine,
             output_steps,
@@ -308,6 +309,7 @@ def calculate_and_print_metrics(
     print(f"{'='*60}\n")
 
 
+_shm_thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
 _JITTER_PCT = 20
 
 def _jittered_len(base: int) -> int:
@@ -480,6 +482,12 @@ async def main():
     )
 
     args = parser.parse_args()
+
+    global _shm_thread_pool
+    _shm_thread_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.concurrency,
+        thread_name_prefix="shm-decode",
+    )
 
     mode = "SHM" if args.use_shm else "ZMQ"
     jitter_str = f", jitter=±{_JITTER_PCT}%" if args.randomize_len else ""
