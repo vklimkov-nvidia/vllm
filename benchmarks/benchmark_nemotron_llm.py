@@ -1,18 +1,43 @@
+"""Benchmark script for Nemotron LLM (S2S backbone) on vLLM.
+
+Usage:
+    python benchmarks/benchmark_nemotron_llm.py \
+        --model /path/to/nemotron_llm \
+        --concurrency 16 \
+        --num-requests 512 \
+        --input-len 128 \
+        --output-len 256
+
+    # With shared-memory decode channel:
+    python benchmarks/benchmark_nemotron_llm.py \
+        --model /path/to/nemotron_llm \
+        --concurrency 16 \
+        --use-shm
+
+    # With torch profiler (output dir via VLLM_TORCH_PROFILER_DIR):
+    python benchmarks/benchmark_nemotron_llm.py \
+        --model /path/to/nemotron_llm \
+        --profile
+"""
+
 import argparse
 import asyncio
+import concurrent.futures
+import logging
+import random
 import time
 import uuid
-import logging
-from typing import Dict, Any
+from typing import Any, Dict
+
 import numpy as np
 import torch
 
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
 try:
-    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.async_llm import AsyncLLM
 except ImportError:
     print("Error: Failed to import vllm.")
     print("Please install vllm: pip install vllm")
@@ -23,13 +48,14 @@ async def run_request(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
     input_num_tokens: int,
+    output_steps: int,
     hidden_size: int,
     metrics: Dict[str, Any],
     request_id: str,
 ):
     """
     ZMQ mode: prefills with random combined embeddings, then decodes
-    step-by-step via generate() + append_request().
+    step-by-step via add_request/queue + append_request.
     """
     combined_embeds = torch.randn(
         input_num_tokens, hidden_size, dtype=torch.bfloat16
@@ -42,27 +68,31 @@ async def run_request(
 
     request_start_time = time.perf_counter()
     last_token_time = None
-    token_idx = 0
+    step_idx = 0
 
     try:
-        async for output in engine.generate(
-            inputs, sampling_params=sampling_params, request_id=request_id
-        ):
+        queue = await engine.add_request(request_id, inputs, sampling_params)
+
+        while True:
+            output = await queue.get()
             now = time.perf_counter()
 
-            if token_idx < 6:
+            if step_idx < 6:
                 token_latency = (
                     now - last_token_time
                     if last_token_time
                     else now - request_start_time
                 )
-                metrics["first_tokens"][token_idx].append(token_latency)
+                metrics["first_tokens"][step_idx].append(token_latency)
             elif last_token_time is not None:
-                itl = now - last_token_time
-                metrics["inter_token_latencies"].append(itl)
+                metrics["inter_token_latencies"].append(now - last_token_time)
 
             last_token_time = now
-            token_idx += 1
+            step_idx += 1
+
+            if step_idx >= output_steps:
+                await engine.abort(request_id)
+                break
 
             if output.finished:
                 break
@@ -74,34 +104,22 @@ async def run_request(
             )
 
         request_end_time = time.perf_counter()
-        request_latency = request_end_time - request_start_time
-
-        metrics["request_latencies"].append(request_latency)
+        metrics["request_latencies"].append(
+            request_end_time - request_start_time
+        )
         metrics["completed_sequences"] += 1
-        metrics["total_tokens"] += token_idx
+        metrics["total_tokens"] += step_idx
 
     except Exception as e:
         print(f"Request {request_id} failed: {e}")
         import traceback
-
         traceback.print_exc()
         metrics["failed_sequences"] += 1
 
 
-def _make_step_timing():
-    return {
-        'prepare_copy_us': [],
-        'write_signal_us': [],
-        'wait_output_us': [],
-        'build_result_us': [],
-        'turnaround_us': [],
-        'client_overhead_us': [],
-    }
-
-
 def _decode_loop_sync(
     engine: AsyncLLM,
-    sampling_params: SamplingParams,
+    output_steps: int,
     hidden_size: int,
     metrics: Dict[str, Any],
     request_id: str,
@@ -115,17 +133,15 @@ def _decode_loop_sync(
     write+wait) -> record metrics.  No event-loop round-trips means
     zero queuing delay between concurrent requests.
     """
-    step_embeds = torch.randn(1, hidden_size, dtype=torch.bfloat16)
     last_token_time = prefill_token_time
     token_idx = 1
-    timing = _make_step_timing()
 
     try:
-        for step in range(sampling_params.max_tokens - 1):
+        for _ in range(output_steps - 1):
+            step_embeds = torch.randn(1, hidden_size, dtype=torch.bfloat16)
             custom_inputs = {"combined_embeds": step_embeds}
             engine.decode_step_shm(
                 request_id, custom_inputs=custom_inputs,
-                timing=timing,
             )
             now = time.perf_counter()
 
@@ -141,10 +157,6 @@ def _decode_loop_sync(
             last_token_time = now
             token_idx += 1
 
-            timing['client_overhead_us'].append(
-                (time.perf_counter() - now) * 1e6
-            )
-
         request_end_time = time.perf_counter()
         metrics["request_latencies"].append(
             request_end_time - request_start_time
@@ -158,18 +170,12 @@ def _decode_loop_sync(
         traceback.print_exc()
         metrics["failed_sequences"] += 1
 
-    if metrics.get("step_timing") is not None:
-        dst = metrics["step_timing"]
-        for key in timing:
-            if key.startswith('_'):
-                continue
-            dst[key].extend(timing[key])
-
 
 async def run_request_shm(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
     input_num_tokens: int,
+    output_steps: int,
     hidden_size: int,
     metrics: Dict[str, Any],
     request_id: str,
@@ -199,10 +205,10 @@ async def run_request_shm(
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None,
+            _shm_thread_pool,
             _decode_loop_sync,
             engine,
-            sampling_params,
+            output_steps,
             hidden_size,
             metrics,
             request_id,
@@ -228,17 +234,12 @@ def calculate_and_print_metrics(
         return
 
     total_tokens = metrics["total_tokens"]
-    avg_tokens_per_sec = total_tokens / total_time
-    avg_seq_per_sec = total_sequences / total_time
 
-    print("\n--- Nemotron LLM Benchmark Results ---")
-    print(
-        f"Concurrency: {args.concurrency}, "
-        f"Input: {args.input_len}, Output: {args.output_len}, "
-        f"Hidden: {args.hidden_size}"
-    )
-    print(f"Total duration: {total_time:.2f} s")
-    print(f"Completed: {total_sequences}, Failed: {metrics['failed_sequences']}")
+    print(f"\n{'='*60}")
+    print(f"Nemotron LLM Benchmark Results  (concurrency={args.concurrency}, "
+          f"requests={args.num_requests}, "
+          f"in={args.input_len}, out={args.output_len})")
+    print(f"{'='*60}")
 
     print("\n--- First 6 Tokens (mean latency in ms) ---")
     for i in range(6):
@@ -267,37 +268,29 @@ def calculate_and_print_metrics(
     print(f"  Average: {avg_request_time:.2f} s (P95: {p95_request_time:.2f} s)")
 
     print(f"\n--- Throughput ---")
-    print(f"  Sequences/sec: {avg_seq_per_sec:.2f}")
-    print(f"  Tokens/sec: {avg_tokens_per_sec:.2f}")
+    print(f"  Total time: {total_time:.2f} s")
+    print(f"  Completed sequences: {total_sequences}")
+    print(f"  Failed sequences: {metrics['failed_sequences']}")
+    print(f"  Total decode steps: {total_tokens}")
+    print(f"  Throughput: {total_tokens / total_time:.2f} steps/s")
+    print(f"  Sequence throughput: {total_sequences / total_time:.2f} seq/s")
 
     # S2S real-time factor: each LLM step corresponds to 80ms of audio
     audio_duration_per_seq = args.output_len * 0.08
     avg_rtf = avg_request_time / audio_duration_per_seq
     print(f"\n--- S2S Real-Time Factor (80ms/frame) ---")
     print(f"  RTF: {avg_rtf:.4f}x (< 1.0 means faster than real-time)")
+    print(f"{'='*60}\n")
 
-    st = metrics.get("step_timing")
-    if st:
-        print(f"\n--- SHM Decode Step Breakdown (µs) ---")
-        print(f"  {'phase':<20s} {'mean':>8s} {'p50':>8s} "
-              f"{'p95':>8s} {'p99':>8s} {'max':>8s}")
-        for key in ['prepare_copy_us', 'write_signal_us',
-                     'wait_output_us', 'build_result_us',
-                     'client_overhead_us', 'turnaround_us']:
-            vals = st.get(key, [])
-            if not vals:
-                continue
-            a = np.array(vals)
-            label = key.replace('_us', '')
-            print(f"  {label:<20s} {np.mean(a):>8.1f} {np.median(a):>8.1f} "
-                  f"{np.percentile(a, 95):>8.1f} "
-                  f"{np.percentile(a, 99):>8.1f} {np.max(a):>8.1f}")
-        turnaround = st.get('turnaround_us', [])
-        if turnaround:
-            print(f"\n  turnaround = time from output received to input "
-                  f"sent (what core waits for)")
 
-    print("---------------------------------------")
+_shm_thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_JITTER_PCT = 20
+
+
+def _jittered_len(base: int) -> int:
+    """Return *base* perturbed by uniform +/- _JITTER_PCT %, min 1."""
+    factor = 1.0 + random.uniform(-_JITTER_PCT, _JITTER_PCT) / 100.0
+    return max(1, int(round(base * factor)))
 
 
 async def worker(
@@ -305,9 +298,12 @@ async def worker(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
     input_num_tokens: int,
+    output_steps: int,
     hidden_size: int,
     metrics: Dict[str, Any],
     use_shm: bool = False,
+    len_jitter: bool = False,
+    randomize_delay: bool = False,
 ):
     while True:
         async with metrics["lock"]:
@@ -315,21 +311,29 @@ async def worker(
                 break
             metrics["requests_to_run"] -= 1
 
+        if randomize_delay:
+            tokens = (_JITTER_PCT / 100) * output_steps
+            sec = tokens / 12.5
+            await asyncio.sleep(random.uniform(0, sec))
+
+        req_input_len = _jittered_len(input_num_tokens) if len_jitter else input_num_tokens
+        req_output_len = _jittered_len(output_steps) if len_jitter else output_steps
+
         request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
         if use_shm:
             await run_request_shm(
-                engine, sampling_params, input_num_tokens, hidden_size,
-                metrics, request_id,
+                engine, sampling_params, req_input_len, req_output_len,
+                hidden_size, metrics, request_id,
             )
         else:
             await run_request(
-                engine, sampling_params, input_num_tokens, hidden_size,
-                metrics, request_id
+                engine, sampling_params, req_input_len, req_output_len,
+                hidden_size, metrics, request_id,
             )
 
 
-def init_metrics(num_requests: int, use_shm: bool = False):
-    m = {
+def init_metrics(num_requests: int):
+    return {
         "request_latencies": [],
         "inter_token_latencies": [],
         "first_tokens": [[] for _ in range(6)],
@@ -339,14 +343,17 @@ def init_metrics(num_requests: int, use_shm: bool = False):
         "requests_to_run": num_requests,
         "lock": asyncio.Lock(),
     }
-    if use_shm:
-        m["step_timing"] = _make_step_timing()
-    return m
 
 
 async def main():
     parser = argparse.ArgumentParser(
         description="vLLM Nemotron LLM (S2S backbone) Benchmarking Script"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Path to the converted Nemotron LLM model directory",
     )
     parser.add_argument(
         "-c",
@@ -395,12 +402,6 @@ async def main():
         help="GPU memory utilization (0.0 to 1.0)",
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Path to the converted Nemotron LLM model directory",
-    )
-    parser.add_argument(
         "--load-format",
         type=str,
         default="auto",
@@ -410,7 +411,13 @@ async def main():
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Enforce eager mode (disable CUDA graphs)",
+        help="Disable CUDA graph capture and run in eager mode",
+    )
+    parser.add_argument(
+        "--use-shm",
+        action="store_true",
+        help="Use shared-memory decode channel instead of ZMQ for "
+             "decode-step I/O",
     )
     parser.add_argument(
         "--input-coalesce-timeout-ms",
@@ -427,29 +434,48 @@ async def main():
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Run with torch profiler",
+        help="Call engine.start_profile() before and engine.stop_profile() after "
+             "the benchmark run. Trace output dir: VLLM_TORCH_PROFILER_DIR.",
     )
     parser.add_argument(
-        "--use-shm",
+        "--randomize-len",
         action="store_true",
-        help="Use shared-memory decode channel (prefill via ZMQ, "
-             "decode via SHM)",
+        help="Randomize input/output lengths per request by +/- 20%%",
     )
+    parser.add_argument(
+        "--randomize-delay",
+        action="store_true",
+        help="Add a random delay between requests per worker.  Delay is "
+             "uniform(0, T) where T = (_JITTER_PCT/100)*output_len / 12.5 s.",
+    )
+
     args = parser.parse_args()
 
-    mode = "SHM" if args.use_shm else "ZMQ"
-    print(f"Starting Nemotron LLM benchmark ({mode} mode)...")
-    print(
-        f"Concurrency: {args.concurrency}, Requests: {args.num_requests}, "
-        f"Input: {args.input_len}, Output: {args.output_len}, "
-        f"Hidden: {args.hidden_size}"
+    global _shm_thread_pool
+    _shm_thread_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.concurrency,
+        thread_name_prefix="shm-decode",
     )
 
-    engine_args_kwargs = {
+    mode = "SHM" if args.use_shm else "ZMQ"
+    jitter_str = f", jitter=±{_JITTER_PCT}%" if args.randomize_len else ""
+    delay_str = ", randomize-delay" if args.randomize_delay else ""
+    print(
+        f"Benchmark ({mode}): concurrency={args.concurrency}, "
+        f"requests={args.num_requests}, "
+        f"in={args.input_len}, out={args.output_len}{jitter_str}{delay_str}"
+        + (" [profiling enabled]" if args.profile else "")
+    )
+
+    jitter_headroom = (1.0 + _JITTER_PCT / 100.0) if args.randomize_len else 1.0
+    max_input = int(args.input_len * jitter_headroom) + 1
+    max_output = int(args.output_len * jitter_headroom) + 1
+    max_model_len = max(args.max_model_len, max_input + max_output)
+
+    engine_args_kwargs: Dict[str, Any] = {
         "model": args.model,
         "dtype": "bfloat16",
-        "max_model_len": args.max_model_len,
-        "max_num_batched_tokens": args.max_model_len,
+        "max_model_len": max_model_len,
         "gpu_memory_utilization": args.gpu_mem,
         "trust_remote_code": True,
         "mamba_ssm_cache_dtype": "float32",
@@ -457,61 +483,67 @@ async def main():
         "enable_prefix_caching": False,
         "enforce_eager": args.enforce_eager,
         "disable_log_stats": True,
+        "compilation_config": {"cudagraph_mode": "PIECEWISE"},
+        "shm_decode": args.use_shm,
         "input_coalesce_timeout_ms": args.input_coalesce_timeout_ms,
     }
-    if args.load_format == "dummy":
-        engine_args_kwargs["load_format"] = "dummy"
-    if args.use_shm:
-        engine_args_kwargs["shm_decode"] = True
+    if args.load_format != "auto":
+        engine_args_kwargs["load_format"] = args.load_format
 
     engine_args = AsyncEngineArgs(**engine_args_kwargs)
+
+    print("Initializing engine...")
     engine = AsyncLLM.from_engine_args(engine_args)
 
-    if args.profile:
-        await engine.start_profile()
-
     sampling_params = SamplingParams(
-        max_tokens=args.output_len,
+        max_tokens=max_model_len,
         skip_sampling=True,
-        ignore_eos=True,
     )
 
     warmup_num = 0 if args.no_warmup else 3 * args.concurrency
     for run, num_requests in enumerate([warmup_num, args.num_requests]):
         if num_requests == 0:
             continue
-        metrics = init_metrics(num_requests, use_shm=args.use_shm)
+        metrics = init_metrics(num_requests)
 
         run_name = "Warmup" if run == 0 else "Benchmark"
         print(f"\n--- Starting {run_name} ({num_requests} requests) ---")
+
         start_time = time.perf_counter()
 
-        tasks = []
-        for i in range(args.concurrency):
-            tasks.append(
+        if run > 0 and args.profile:
+            await engine.start_profile()
+        try:
+            tasks = [
                 asyncio.create_task(
                     worker(
                         worker_id=i,
                         engine=engine,
                         sampling_params=sampling_params,
                         input_num_tokens=args.input_len,
+                        output_steps=args.output_len,
                         hidden_size=args.hidden_size,
                         metrics=metrics,
                         use_shm=args.use_shm,
+                        len_jitter=args.randomize_len,
+                        randomize_delay=args.randomize_delay,
                     )
                 )
-            )
-
-        await asyncio.gather(*tasks)
+                for i in range(args.concurrency)
+            ]
+            await asyncio.gather(*tasks)
+        finally:
+            if run > 0 and args.profile:
+                await engine.stop_profile()
 
         end_time = time.perf_counter()
         total_time = end_time - start_time
 
-        print(f"{run_name} finished in {total_time:.2f}s")
+        print(f"{run_name} finished in {total_time:.2f}s "
+              f"({metrics['completed_sequences']} sequences, "
+              f"{metrics['failed_sequences']} failed)")
 
         if run > 0:
-            if args.profile:
-                await engine.stop_profile()
             calculate_and_print_metrics(metrics, total_time, args)
 
 
@@ -519,4 +551,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Benchmark interrupted.")
+        print("\nBenchmark interrupted.")
