@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Standalone Qwen3-TTS inference script with NVTX markers for nsys profiling.
 
+Uses decode_step_shm for low-latency decode steps via shared memory.
+
 vLLM runs the EngineCore/GPU worker in a forked child process, so you need
 --trace-fork-before-exec=true for nsys to capture CUDA activity.
 
@@ -15,9 +17,6 @@ import asyncio
 import os
 
 os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
-# Force fork so nsys can follow the child process.
-# (If CUDA gets initialized before the engine, vLLM auto-switches to spawn
-#  and nsys loses the child.)
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 
 import torch
@@ -30,7 +29,6 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 
 async def main(profile: bool, nsys: bool):
-    # ── engine setup ──────────────────────────────────────────────────────
     type_str = "bfloat16"
     max_len = 256
     config_path = Path("dummy_qwen3_tts_model")
@@ -45,6 +43,8 @@ async def main(profile: bool, nsys: bool):
         enable_prefix_caching=False,
         trust_remote_code=True,
         compilation_config={"cudagraph_mode": "PIECEWISE"},
+        input_coalesce_timeout_ms=5,
+        shm_decode=True,
     )
 
     print("Initializing engine...")
@@ -52,7 +52,6 @@ async def main(profile: bool, nsys: bool):
     sampling_params = SamplingParams(max_tokens=max_len, skip_sampling=True)
     print("Engine initialized successfully")
 
-    # ── load prefill embeddings ───────────────────────────────────────────
     prefill_data = torch.load(
         "/home/vklimkov/workspace/vllm/vllm/dummy_qwen3_tts_model/prefill_input.pt"
     )
@@ -60,7 +59,6 @@ async def main(profile: bool, nsys: bool):
     prompt_len = prefill_emb.shape[0]
     print(f"Prefill embedding shape: {prefill_emb.shape}")
 
-    # ── prepare request ───────────────────────────────────────────────────
     request_id = "test_request_1"
     inputs = {
         "prompt_token_ids": [0] * prompt_len,
@@ -69,11 +67,9 @@ async def main(profile: bool, nsys: bool):
         },
     }
 
-    print(f"Starting generation – prompt_len={prompt_len}, max_len={max_len}")
-
-    # ── generation loop ───────────────────────────────────────────────────
     codec_eos_token_id = 2150
-    step_count = 0
+
+    print(f"Starting generation – prompt_len={prompt_len}, max_len={max_len}")
 
     if profile:
         await engine.start_profile()
@@ -81,41 +77,50 @@ async def main(profile: bool, nsys: bool):
         torch.cuda.synchronize()
         torch.cuda.profiler.start()
 
-
     nvtx.range_push("generation_total")
 
-    async for output in engine.generate(
-        inputs, sampling_params=sampling_params, request_id=request_id
-    ):
-        nvtx.range_push(f"step_{step_count}")
+    # Prefill: submit request and wait for the first output via the queue.
+    nvtx.range_push("prefill")
+    queue = await engine.add_request(request_id, inputs, sampling_params)
+    prefill_output = await queue.get()
+    next_input = prefill_output.outputs[0].custom_outputs[
+        "next_input_embeddings"
+    ][-1:, :]
+    next_tokens = prefill_output.outputs[0].custom_outputs["codes"][-1:]
+    nvtx.range_pop()  # prefill
 
-        codec_tokens = output.outputs[0].custom_outputs["codes"][-1:]
+    generated_codecs = []
+    step_count = 0
 
-        if codec_tokens[0, 0].item() == codec_eos_token_id:
-            print(f"EOS at step {step_count + 1}, stopping.")
-            nvtx.range_pop()  # step
+    for i in range(max_len):
+        nvtx.range_push(f"step_{i}")
+        generated_codecs.append(next_tokens)
+
+        if next_tokens[0, 0].item() == codec_eos_token_id:
+            print(f"EOS at step {i + 1}, stopping.")
+            nvtx.range_pop()
             await engine.abort(request_id)
             break
 
-        next_input = output.outputs[0].custom_outputs["next_input_embeddings"]
+        if i >= max_len - prompt_len:
+            nvtx.range_pop()
+            await engine.abort(request_id)
+            break
+
+        outputs = engine.decode_step_shm(
+            request_id,
+            custom_inputs={"combined_embeddings": next_input},
+        )
+
+        next_input = outputs["next_input_embeddings"][-1:, :]
+        next_tokens = outputs["codes"][-1:].clone()
         step_count += 1
+
         print(
-            f"Step {step_count}: codecs {codec_tokens.shape}, "
+            f"Step {step_count}: codecs {next_tokens.shape}, "
             f"next_input {next_input.shape}"
         )
-
         nvtx.range_pop()  # step
-
-        if step_count >= max_len - prompt_len:
-            await engine.abort(request_id)
-            break
-
-        new_custom_inputs = {
-            "combined_embeddings": next_input[-1:, :],
-        }
-        await engine.append_request(
-            request_id=request_id, custom_inputs=new_custom_inputs
-        )
 
     nvtx.range_pop()  # generation_total
 
@@ -130,8 +135,11 @@ async def main(profile: bool, nsys: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", action="store_true", help="Enable engine profiling")
-    parser.add_argument("--nsys", action="store_true", help="Enable nsys profiling")
+    parser.add_argument(
+        "--profile", action="store_true", help="Enable engine profiling"
+    )
+    parser.add_argument(
+        "--nsys", action="store_true", help="Enable nsys profiling"
+    )
     args = parser.parse_args()
     asyncio.run(main(args.profile, args.nsys))
-

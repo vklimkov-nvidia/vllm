@@ -13,6 +13,22 @@ Usage:
         --model dummy_qwen3_tts_model \
         --concurrency 16 \
         --use-shm
+
+    # With torch profiler (output dir via VLLM_TORCH_PROFILER_DIR):
+    #   VLLM_TORCH_PROFILER_DIR=/path/to/traces python benchmark_qwen3_tts.py --profile
+    python benchmarks/benchmark_qwen3_tts.py \
+        --model dummy_qwen3_tts_model \
+        --profile
+
+Scheduling note (why you see 1+3 or 2+2 prefills instead of 4):
+    add_request messages were already in the queue when the engine woke.
+    With 4 concurrent workers each calling add_request, that number is a race
+    between the client event loop and the engine's receiver (ZMQ/shm), so you
+    often see 1 or 2 prefills in the first step, then 3 or 2 in the next, and
+    then prefill+decode mixed as the first request(s) move to decode while
+    the rest are still prefill. Use --burst-first-batch to add the first
+    concurrency requests from a single task so they are all enqueued before
+    the first step (deterministic batch prefill).
 """
 
 import os
@@ -21,9 +37,9 @@ os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 import argparse
 import asyncio
 import logging
+import random
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 import numpy as np
@@ -75,16 +91,11 @@ async def run_request(
     step_idx = 0
 
     try:
-        results_generator = engine.generate(
-            inputs, sampling_params=sampling_params, request_id=request_id
-        )
+        queue = await engine.add_request(request_id, inputs, sampling_params)
 
-        async for output in results_generator:
+        while True:
+            output = await queue.get()
             now = time.perf_counter()
-
-            custom_out = output.outputs[0].custom_outputs
-            codec_tokens = custom_out["codes"][-1:]  # [1, 16]
-            next_input = custom_out["next_input_embeddings"]
 
             # Track first 6 steps separately
             if step_idx < 6:
@@ -110,6 +121,7 @@ async def run_request(
                 break
 
             # Feed next decode step embeddings
+            next_input = output.outputs[0].custom_outputs["next_input_embeddings"]
             new_custom_inputs = {
                 "combined_embeddings": next_input[-1:, :],
             }
@@ -131,6 +143,62 @@ async def run_request(
         metrics["failed_sequences"] += 1
 
 
+def _decode_loop_sync(
+    engine: AsyncLLM,
+    output_steps: int,
+    metrics: Dict[str, Any],
+    request_id: str,
+    prefill_custom_outputs: Dict[str, Any],
+    prefill_token_time: float,
+    request_start_time: float,
+):
+    """Run the entire decode loop in a plain OS thread (no asyncio).
+
+    After prefill completes on the event loop, this function takes over.
+    Each step is: prepare input from previous output -> shm decode_step
+    (futex write+wait) -> record metrics.  No event-loop round-trips
+    means zero queuing delay between concurrent requests.
+    """
+    next_input = prefill_custom_outputs["next_input_embeddings"]
+    last_token_time = prefill_token_time
+    token_idx = 1
+
+    try:
+        for _ in range(output_steps - 1):
+            custom_inputs = {"combined_embeddings": next_input[-1:, :]}
+            custom_outputs = engine.decode_step_shm(
+                request_id, custom_inputs=custom_inputs,
+            )
+            now = time.perf_counter()
+
+            next_input = custom_outputs["next_input_embeddings"]
+
+            if token_idx < 6:
+                metrics["first_tokens"][token_idx].append(
+                    now - last_token_time
+                )
+            else:
+                metrics["inter_token_latencies"].append(
+                    now - last_token_time
+                )
+
+            last_token_time = now
+            token_idx += 1
+
+        request_end_time = time.perf_counter()
+        metrics["request_latencies"].append(
+            request_end_time - request_start_time
+        )
+        metrics["completed_sequences"] += 1
+        metrics["total_tokens"] += token_idx
+
+    except Exception as e:
+        print(f"Request {request_id} decode loop failed: {e}")
+        import traceback
+        traceback.print_exc()
+        metrics["failed_sequences"] += 1
+
+
 async def run_request_shm(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
@@ -139,16 +207,12 @@ async def run_request_shm(
     hidden_size: int,
     metrics: Dict[str, Any],
     request_id: str,
-    executor: ThreadPoolExecutor,
 ):
     """
-    SHM-based decode loop: prefill via the regular async path, then all
-    subsequent decode steps via shared-memory (decode_step_shm).
-
-    decode_step_shm is synchronous (blocks in a futex), so each call is
-    dispatched to *executor* to keep the event loop responsive.
+    SHM mode: prefill via ZMQ (add_request on event loop), then the
+    entire decode loop runs in a dedicated OS thread — no event-loop
+    round-trips between steps.
     """
-
     prefill_emb = torch.randn(
         input_num_tokens, hidden_size, dtype=torch.bfloat16
     )
@@ -161,58 +225,31 @@ async def run_request_shm(
     }
 
     request_start_time = time.perf_counter()
-    step_idx = 0
-    loop = asyncio.get_event_loop()
 
     try:
         queue = await engine.add_request(request_id, inputs, sampling_params)
         prefill_output = await queue.get()
-
-        now = time.perf_counter()
-        metrics["first_tokens"][0].append(now - request_start_time)
-        last_token_time = now
-        step_idx = 1
+        prefill_token_time = time.perf_counter()
+        metrics["first_tokens"][0].append(
+            prefill_token_time - request_start_time
+        )
 
         custom_out = prefill_output.outputs[0].custom_outputs
-        next_input = custom_out["next_input_embeddings"]
 
-        if prefill_output.finished or step_idx >= output_steps:
-            await engine.abort(request_id)
-            metrics["request_latencies"].append(now - request_start_time)
-            metrics["completed_sequences"] += 1
-            metrics["total_tokens"] += step_idx
-            return
-
-        while step_idx < output_steps:
-            custom_inputs = {"combined_embeddings": next_input[-1:, :]}
-
-            custom_outputs = await loop.run_in_executor(
-                executor,
-                engine.decode_step_shm,
-                request_id,
-                custom_inputs,
-            )
-
-            now = time.perf_counter()
-            next_input = custom_outputs["next_input_embeddings"]
-
-            if step_idx < 6:
-                metrics["first_tokens"][step_idx].append(
-                    now - last_token_time)
-            else:
-                metrics["inter_token_latencies"].append(
-                    now - last_token_time)
-
-            last_token_time = now
-            step_idx += 1
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _decode_loop_sync,
+            engine,
+            output_steps,
+            metrics,
+            request_id,
+            custom_out,
+            prefill_token_time,
+            request_start_time,
+        )
 
         await engine.abort(request_id)
-
-        request_end_time = time.perf_counter()
-        metrics["request_latencies"].append(
-            request_end_time - request_start_time)
-        metrics["completed_sequences"] += 1
-        metrics["total_tokens"] += step_idx
 
     except Exception as e:
         print(f"Request {request_id} failed: {e}")
@@ -271,6 +308,14 @@ def calculate_and_print_metrics(
     print(f"{'='*60}\n")
 
 
+_JITTER_PCT = 20
+
+def _jittered_len(base: int) -> int:
+    """Return *base* perturbed by uniform +/- _JITTER_PCT %, min 1."""
+    factor = 1.0 + random.uniform(-_JITTER_PCT, _JITTER_PCT) / 100.0
+    return max(1, int(round(base * factor)))
+
+
 async def worker(
     worker_id: int,
     engine: AsyncLLM,
@@ -280,7 +325,8 @@ async def worker(
     hidden_size: int,
     metrics: Dict[str, Any],
     use_shm: bool = False,
-    executor: ThreadPoolExecutor = None,
+    len_jitter: bool = False,
+    randomize_delay: bool = False,
 ):
     """
     A persistent worker that continuously sends requests until
@@ -292,24 +338,31 @@ async def worker(
                 break
             metrics["requests_to_run"] -= 1
 
+        if randomize_delay:
+            tokens = (_JITTER_PCT / 100) * output_steps
+            sec = tokens / 12.5
+            await asyncio.sleep(random.uniform(0, sec))
+
+        req_input_len = _jittered_len(input_num_tokens) if len_jitter else input_num_tokens
+        req_output_len = _jittered_len(output_steps) if len_jitter else output_steps
+
         request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
         if use_shm:
             await run_request_shm(
                 engine,
                 sampling_params,
-                input_num_tokens,
-                output_steps,
+                req_input_len,
+                req_output_len,
                 hidden_size,
                 metrics,
                 request_id,
-                executor,
             )
         else:
             await run_request(
                 engine,
                 sampling_params,
-                input_num_tokens,
-                output_steps,
+                req_input_len,
+                req_output_len,
                 hidden_size,
                 metrics,
                 request_id,
@@ -408,24 +461,47 @@ async def main():
         action="store_true",
         help="Skip warmup run",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Call engine.start_profile() before and engine.stop_profile() after "
+             "the benchmark run. Trace output dir: VLLM_TORCH_PROFILER_DIR.",
+    )
+    parser.add_argument(
+        "--randomize-len",
+        action="store_true",
+        help="Randomize input/output lengths per request by +/- 15%%",
+    )
+    parser.add_argument(
+        "--randomize-delay",
+        action="store_true",
+        help="Add a random delay between requests per worker.  Delay is "
+             "uniform(0, T) where T = (_JITTER_PCT/100)*output_len / 12.5 s.",
+    )
 
     args = parser.parse_args()
 
     mode = "SHM" if args.use_shm else "ZMQ"
+    jitter_str = f", jitter=±{_JITTER_PCT}%" if args.randomize_len else ""
+    delay_str = ", randomize-delay" if args.randomize_delay else ""
     print(
         f"Benchmark ({mode}): concurrency={args.concurrency}, "
         f"requests={args.num_requests}, "
-        f"in={args.input_len}, out={args.output_len}"
+        f"in={args.input_len}, out={args.output_len}{jitter_str}{delay_str}"
+        + (" [profiling enabled]" if args.profile else "")
     )
 
-    max_model_len = max(args.max_model_len, args.input_len + args.output_len)
-    max_num_batched_tokens = max_model_len * args.concurrency * 2
+    jitter_headroom = (1.0 + _JITTER_PCT / 100.0) if args.randomize_len else 1.0
+    max_input = int(args.input_len * jitter_headroom) + 1
+    max_output = int(args.output_len * jitter_headroom) + 1
+    max_model_len = max(args.max_model_len, max_input + max_output)
+    #max_num_batched_tokens = args.concurrency * 32
 
     engine_args = AsyncEngineArgs(
         model=args.model,
         dtype="bfloat16",
         max_model_len=max_model_len,
-        max_num_batched_tokens=max_num_batched_tokens,
+        #max_num_batched_tokens=max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_mem,
         skip_tokenizer_init=True,
         load_format="dummy",
@@ -436,14 +512,11 @@ async def main():
         compilation_config={"cudagraph_mode": "PIECEWISE"},
         shm_decode=args.use_shm,
         input_coalesce_timeout_ms=args.input_coalesce_timeout_ms,
+        #enable_chunked_prefill=True,
     )
 
     print("Initializing engine...")
     engine = AsyncLLM.from_engine_args(engine_args)
-
-    executor = None
-    if args.use_shm:
-        executor = ThreadPoolExecutor(max_workers=args.concurrency)
 
     sampling_params = SamplingParams(
         max_tokens=max_model_len,
@@ -464,24 +537,30 @@ async def main():
 
         start_time = time.perf_counter()
 
-        tasks = [
-            asyncio.create_task(
-                worker(
-                    worker_id=i,
-                    engine=engine,
-                    sampling_params=sampling_params,
-                    input_num_tokens=args.input_len,
-                    output_steps=args.output_len,
-                    hidden_size=args.hidden_size,
-                    metrics=metrics,
-                    use_shm=args.use_shm,
-                    executor=executor,
+        if run > 0 and args.profile:
+            await engine.start_profile()
+        try:
+            tasks = [
+                asyncio.create_task(
+                    worker(
+                        worker_id=i,
+                        engine=engine,
+                        sampling_params=sampling_params,
+                        input_num_tokens=args.input_len,
+                        output_steps=args.output_len,
+                        hidden_size=args.hidden_size,
+                        metrics=metrics,
+                        use_shm=args.use_shm,
+                        len_jitter=args.randomize_len,
+                        randomize_delay=args.randomize_delay,
+                    )
                 )
-            )
-            for i in range(args.concurrency)
-        ]
-
-        await asyncio.gather(*tasks)
+                for i in range(args.concurrency)
+            ]
+            await asyncio.gather(*tasks)
+        finally:
+            if run > 0 and args.profile:
+                await engine.stop_profile()
 
         end_time = time.perf_counter()
         total_time = end_time - start_time
@@ -492,9 +571,6 @@ async def main():
 
         if run > 0:
             calculate_and_print_metrics(metrics, total_time, args)
-
-    if executor is not None:
-        executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
