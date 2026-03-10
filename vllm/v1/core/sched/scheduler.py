@@ -857,6 +857,18 @@ class Scheduler(SchedulerInterface):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
+        # Move requests whose custom inputs were just consumed to
+        # waiting_input immediately, so _wait_for_custom_inputs can
+        # see them before the next schedule() call.
+        if self.await_inputs:
+            i = 0
+            while i < len(self.running):
+                if not self.running[i].has_custom_inputs():
+                    req = self.running.pop(i)
+                    self.waiting_input.add(req.request_id)
+                else:
+                    i += 1
+
         # Clear the finished request IDs.
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
         # it will also affect the scheduler output.
@@ -1511,18 +1523,17 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
-    def num_requests_needing_inputs(self) -> int:
-        """Count requests that need custom inputs before they can run."""
-        if not self.await_inputs:
-            return 0
-        count = len(self.waiting_input)
-        for req in self.running:
-            if not req.has_custom_inputs():
-                count += 1
-        return count
-
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.running)
+        return len(self.waiting) + len(self.running) + len(self.waiting_input)
+
+    def has_schedulable_requests(self) -> bool:
+        """Whether there are requests that can be scheduled right now.
+
+        Unlike has_unfinished_requests(), this excludes requests in
+        waiting_input — those can't make forward progress until their
+        custom inputs arrive (via ZMQ or SHM).
+        """
+        return len(self.waiting) > 0 or len(self.running) > 0
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0

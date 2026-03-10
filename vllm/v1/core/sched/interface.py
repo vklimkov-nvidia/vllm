@@ -122,6 +122,15 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def has_schedulable_requests(self) -> bool:
+        """Whether there are requests that can be scheduled right now.
+
+        By default same as has_unfinished_requests().  Overridden when
+        the scheduler tracks requests waiting for external inputs that
+        cannot make forward progress yet.
+        """
+        return self.has_unfinished_requests()
+
     def has_requests(self) -> bool:
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
