@@ -25,6 +25,7 @@ Usage:
 
 import json
 import argparse
+import shutil
 from pathlib import Path
 
 import torch
@@ -212,6 +213,18 @@ def convert(input_dir: str, output_dir: str) -> None:
     out_sf = out_path / "model.safetensors"
     print(f"  Saving {out_sf} ...")
     save_file(weights, str(out_sf))
+
+    # ── 4. Copy tokenizer files so AutoTokenizer works from output_dir
+    tokenizer_files = [
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+    ]
+    for fname in tokenizer_files:
+        src = in_path / fname
+        if src.exists():
+            shutil.copy2(str(src), str(out_path / fname))
+            print(f"  Copied {fname}")
 
     print("Done!")
 
