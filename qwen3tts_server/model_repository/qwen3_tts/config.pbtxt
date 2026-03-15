@@ -1,6 +1,6 @@
 name: "qwen3_tts"
 backend: "python"
-max_batch_size: 0
+max_batch_size: 8
 
 input [
   {
@@ -24,6 +24,11 @@ output [
   }
 ]
 
+dynamic_batching {
+  max_queue_delay_microseconds: 50000
+  preferred_batch_size: [ 4, 8 ]
+}
+
 instance_group [
   {
     count: 1
@@ -42,10 +47,6 @@ parameters {
 parameters {
   key: "prefill_assembler_path"
   value: { string_value: "/workspace/server/models/encoder.jit" }
-}
-parameters {
-  key: "codec_engine_path"
-  value: { string_value: "/workspace/server/models/codec.trt" }
 }
 parameters {
   key: "max_tokens"
