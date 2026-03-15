@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/tritonserver:26.02-trtllm-python-py3
+FROM nvcr.io/nvidia/tritonserver:26.02-py3
 
 # 1. System dependencies for audio libraries
 RUN apt-get update && \
@@ -7,7 +7,8 @@ RUN apt-get update && \
 
 # 2. Python packages for checkpoint conversion
 RUN pip install --no-cache-dir \
-    transformers \
+    transformers==4.57.3 \
+    torchaudio==2.10.0 \
     onnxruntime-gpu \
     librosa \
     sox \
@@ -26,10 +27,11 @@ RUN pip install --no-cache-dir \
 # 4. Clone fork, build from source, clean up
 #    --no-build-isolation: reuse the base image's torch/CUDA for compilation
 #    --no-deps: don't install/upgrade any runtime deps (preserves TRT-LLM, TensorRT, torch, etc.)
+#    WARNING: TORCH_CUDA_ARCH_LIST="8.6" is for RTX6000, modify if needed
 RUN git clone --single-branch --branch vklimkov/qwen3_tts \
         https://github.com/vklimkov-nvidia/vllm.git /tmp/vllm-fork && \
     cd /tmp/vllm-fork && \
-    pip install --no-build-isolation --no-deps . && \
+    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install --no-build-isolation --no-deps . && \
     cd / && rm -rf /tmp/vllm-fork
 
 # 5. vllm runtime deps omitted by --no-deps
@@ -47,15 +49,20 @@ RUN pip install --no-cache-dir \
     py-cpuinfo \
     pybase64 \
     cbor2 \
-    cachetools
+    cachetools \
+    prometheus_client \
+    einops \
+    lark==1.2.2 \
+    blake3 \
+    Pillow \
+    pyzqm \
+    tensorrt==10.1.5.1
 
 # 6. Verify the shm_channel extension compiled and loads
 RUN python3 -c 'import vllm._shm_channel_cpp as m; print("OK:", m.__file__)'
 
 # 7. Clone the official Qwen3-TTS repository
 RUN git clone https://github.com/QwenLM/Qwen3-TTS.git /workspace/Qwen3-TTS
-
-# 8. Copy local export script into the cloned repo
-COPY export_codec_decoder_onnx.py /workspace/Qwen3-TTS/
+RUN pip install -e /workspace/Qwen3-TTS/ --no-deps
 
 WORKDIR /workspace
