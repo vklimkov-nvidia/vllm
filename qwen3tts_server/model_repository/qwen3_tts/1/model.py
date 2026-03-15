@@ -139,6 +139,10 @@ class TritonPythonModel:
         self._codec_stream = torch.cuda.Stream(device=self.device)
         logger.info("Loaded TensorRT codec engine from %s", engine_path)
 
+        # hardcode the samples per frame.
+        # 12.5 frames per second at 24khz
+        self._samples_per_frame = int(24000 / 12.5)
+
     def _init_vllm_engine(self, params: dict, model_dir: Path):
         os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 
@@ -240,6 +244,8 @@ class TritonPythonModel:
 
     async def _generate_codec_tokens(self, prefill_emb: torch.Tensor) -> torch.Tensor:
         """Run vLLM generation loop and collect codec tokens."""
+        t_total_start = time.perf_counter()
+
         request_id = str(uuid.uuid4())
         prompt_len = prefill_emb.shape[0]
 
@@ -249,31 +255,43 @@ class TritonPythonModel:
                 "combined_embeddings": prefill_emb,
             },
         }
-        print(f">>>>>>>>>>>>>>>> input: {prefill_emb.dtype}; {prefill_emb.shape} {prefill_emb.device};", flush=True)
 
+        t_prefill_start = time.perf_counter()
         queue = await self.engine.add_request(request_id, inputs, self.sampling_params)
         prefill_output = await queue.get()
+        t_prefill_end = time.perf_counter()
 
         next_input = prefill_output.outputs[0].custom_outputs["next_input_embeddings"][-1:, :]
         next_tokens = prefill_output.outputs[0].custom_outputs["codes"][-1:]
-        print(f">>>>>>>>>>>>>>>> next_input: {next_input.dtype}; {next_input.shape} {next_input.device};", flush=True)
-        print(f">>>>>>>>>>>>>>>> next_tokens: {next_tokens.dtype}; {next_tokens.shape} {next_tokens.device};", flush=True)
 
         generated_codecs = [next_tokens]
 
+        decode_times = []
         for step in range(self.max_tokens - 1):
+            t_step_start = time.perf_counter()
             outputs = self.engine.decode_step_shm(
                 request_id,
                 custom_inputs={"combined_embeddings": next_input},
             )
+            t_step_end = time.perf_counter()
+            decode_times.append(t_step_end - t_step_start)
+
             next_input = outputs["next_input_embeddings"][-1:, :]
             next_tokens = outputs["codes"][-1:].clone()
-            generated_codecs.append(next_tokens)
 
             if next_tokens[0, 0].item() == self.codec_eos_token_id:
                 break
 
+            generated_codecs.append(next_tokens)
+
         await self.engine.abort(request_id)
+        t_total_end = time.perf_counter()
+
+        avg_decode = sum(decode_times) / len(decode_times) if decode_times else 0
+        print(f"[vLLM timing] prefill: {(t_prefill_end - t_prefill_start)*1000:.1f}ms | "
+              f"decode steps: {len(decode_times)} | avg decode_step_shm: {avg_decode*1000:.2f}ms | "
+              f"total generation: {(t_total_end - t_total_start)*1000:.1f}ms", flush=True)
+
         return torch.cat(generated_codecs, dim=0)  # [T, num_code_groups]
 
     # ------------------------------------------------------------------
@@ -286,6 +304,7 @@ class TritonPythonModel:
         The TRT engine expects input ``audio_codes`` of shape [B, T, Q] (int64)
         and produces ``audio_values`` of shape [B, samples] (float32).
         """
+        num_frames = codec_tokens.shape[0]
         codes = codec_tokens.unsqueeze(0).to(self.device, dtype=torch.int64).contiguous()
         input_shape = tuple(codes.shape)
 
@@ -294,6 +313,8 @@ class TritonPythonModel:
 
         output_shape = tuple(ctx.get_tensor_shape("audio_values"))
         audio_out = torch.empty(output_shape, dtype=torch.float32, device=self.device)
+
+        print(f"TRT codec: input_shape={input_shape}, output_shape={output_shape}", flush=True)
 
         ctx.set_tensor_address("audio_codes", codes.data_ptr())
         ctx.set_tensor_address("audio_values", audio_out.data_ptr())
@@ -305,7 +326,16 @@ class TritonPythonModel:
         if not ok:
             raise RuntimeError("TensorRT codec decoder execution failed")
 
-        return audio_out.squeeze(0).cpu().numpy()
+        waveform = audio_out.squeeze(0).cpu().numpy()
+
+        # TRT may return a buffer sized for the optimization profile rather
+        # than the actual input.  Trim to the expected sample count.
+        expected_samples = num_frames * self._samples_per_frame
+        if waveform.shape[0] > expected_samples:
+            print(f"Trimming TRT output from {waveform.shape[0]} to {expected_samples} samples", flush=True)
+            waveform = waveform[:expected_samples]
+
+        return waveform
 
     # ------------------------------------------------------------------
     # Full pipeline: text -> audio
@@ -313,15 +343,28 @@ class TritonPythonModel:
 
     def _synthesize(self, text: str, language: str) -> np.ndarray:
         """Run the full TTS pipeline synchronously (called from a thread)."""
+        t_synth_start = time.perf_counter()
+
+        t_prefill_build_start = time.perf_counter()
         prefill = self._build_prefill(text, language)
-        prefill_emb = prefill[0].contiguous().cpu()  # [S, D] — must be on CPU for vLLM serialization
+        prefill_emb = prefill[0].contiguous().cpu()
+        t_prefill_build_end = time.perf_counter()
 
         future = asyncio.run_coroutine_threadsafe(
             self._generate_codec_tokens(prefill_emb), self._loop
         )
         codec_tokens = future.result(timeout=600)
+        print(f"Codec tokens to decode: {codec_tokens.shape[0]} frames x {codec_tokens.shape[1]} quantizers", flush=True)
 
+        t_codec_start = time.perf_counter()
         audio = self._decode_codec(codec_tokens)
+        t_codec_end = time.perf_counter()
+
+        t_synth_end = time.perf_counter()
+        print(f"[Pipeline timing] prefill_build: {(t_prefill_build_end - t_prefill_build_start)*1000:.1f}ms | "
+              f"codec decode: {(t_codec_end - t_codec_start)*1000:.1f}ms | "
+              f"total synthesis: {(t_synth_end - t_synth_start)*1000:.1f}ms", flush=True)
+
         return audio
 
     # ------------------------------------------------------------------
