@@ -1,0 +1,65 @@
+name: "qwen3_tts"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "text"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "language"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "audio"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+parameters {
+  key: "vllm_model_path"
+  value: { string_value: "/workspace/server/models/qwen3tts_vllm_model" }
+}
+parameters {
+  key: "reference_path"
+  value: { string_value: "/workspace/server/models/reference.pt" }
+}
+parameters {
+  key: "prefill_assembler_path"
+  value: { string_value: "/workspace/server/models/encoder.jit" }
+}
+parameters {
+  key: "codec_engine_path"
+  value: { string_value: "/workspace/server/models/codec.trt" }
+}
+parameters {
+  key: "max_tokens"
+  value: { string_value: "2048" }
+}
+parameters {
+  key: "dtype"
+  value: { string_value: "bfloat16" }
+}
+parameters {
+  key: "gpu_memory_utilization"
+  value: { string_value: "0.6" }
+}
+parameters {
+  key: "max_concurrency"
+  value: { string_value: "8" }
+}
