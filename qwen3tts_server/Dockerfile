@@ -5,10 +5,14 @@ RUN apt-get update && \
     apt-get install -y sox libsox-fmt-all && \
     rm -rf /var/lib/apt/lists/*
 
-# 2. Python packages for checkpoint conversion
+# 2a. Install torch + torchaudio from the CUDA 12.8 index
+RUN pip install --no-cache-dir \
+    torch torchaudio==2.10.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 2b. Python packages for checkpoint conversion (from PyPI)
 RUN pip install --no-cache-dir \
     transformers==4.57.3 \
-    torchaudio==2.10.0 \
     onnxruntime-gpu \
     librosa \
     sox \
@@ -55,8 +59,8 @@ RUN pip install --no-cache-dir \
     lark==1.2.2 \
     blake3 \
     Pillow \
-    pyzqm \
-    tensorrt==10.1.5.1
+    pyzmq \
+    tensorrt==10.15.1.29
 
 # 6. Verify the shm_channel extension compiled and loads
 RUN python3 -c 'import vllm._shm_channel_cpp as m; print("OK:", m.__file__)'
