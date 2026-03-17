@@ -1,6 +1,6 @@
 name: "qwen3_tts"
 backend: "python"
-max_batch_size: 8
+max_batch_size: 64
 
 input [
   {
@@ -61,5 +61,5 @@ parameters {
 }
 parameters {
   key: "max_concurrency"
-  value: { string_value: "8" }
+  value: { string_value: "64" }
 }

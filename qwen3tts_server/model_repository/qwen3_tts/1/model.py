@@ -146,11 +146,11 @@ class TritonPythonModel:
             model=str(Path(vllm_model).absolute()),
             dtype=dtype_str,
             max_model_len=self.max_tokens,
-            gpu_memory_utilization=float(_get_param(params, "gpu_memory_utilization", "0.6")),
+            gpu_memory_utilization=float(_get_param(params, "gpu_memory_utilization", "0.7")),
             skip_tokenizer_init=True,
             enable_prefix_caching=False,
             trust_remote_code=True,
-            input_coalesce_timeout_ms=5,
+            input_coalesce_timeout_ms=30,
             compilation_config={"cudagraph_mode": "PIECEWISE"},
             shm_decode=True,
         )
@@ -305,14 +305,9 @@ class TritonPythonModel:
         Triton's dynamic batcher on codec_decoder collects concurrent BLS
         requests from multiple pipeline threads into efficient TRT batches.
         """
-        # MOCK: return dummy audio instead of calling codec_decoder
-        #num_frames = codec_tokens.shape[0]
-        #samples_per_frame = int(24000 / 12.5)
-        #return np.zeros(num_frames * samples_per_frame, dtype=np.float32)
-
         codes_np = codec_tokens.cpu().numpy().astype(np.int64)
         codes_np = np.expand_dims(codes_np, axis=0)  # [T, Q] -> [1, T, Q] batch dim
-        #
+
         input_tensor = pb_utils.Tensor("audio_codes", codes_np)
         request = pb_utils.InferenceRequest(
             model_name="codec_decoder",
@@ -320,10 +315,10 @@ class TritonPythonModel:
             inputs=[input_tensor],
         )
         response = request.exec()
-        #
+
         if response.has_error():
             raise RuntimeError(f"Codec decode failed: {response.error().message()}")
-        #
+
         audio = pb_utils.get_output_tensor_by_name(
             response, "audio_values"
         ).as_numpy()

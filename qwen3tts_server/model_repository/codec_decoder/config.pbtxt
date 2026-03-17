@@ -1,6 +1,6 @@
 name: "codec_decoder"
 backend: "python"
-max_batch_size: 32
+max_batch_size: 64
 
 input [
   {
@@ -19,8 +19,8 @@ output [
 ]
 
 dynamic_batching {
-  max_queue_delay_microseconds: 10000
-  preferred_batch_size: [ 4, 8, 16 ]
+  max_queue_delay_microseconds: 30000
+  preferred_batch_size: [ 4, 8, 16, 32, 64 ]
 }
 
 instance_group [
