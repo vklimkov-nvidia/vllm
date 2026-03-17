@@ -146,7 +146,7 @@ class TritonPythonModel:
             model=str(Path(vllm_model).absolute()),
             dtype=dtype_str,
             max_model_len=self.max_tokens,
-            gpu_memory_utilization=float(_get_param(params, "gpu_memory_utilization", "0.7")),
+            gpu_memory_utilization=float(_get_param(params, "gpu_memory_utilization", "0.6")),
             skip_tokenizer_init=True,
             enable_prefix_caching=False,
             trust_remote_code=True,

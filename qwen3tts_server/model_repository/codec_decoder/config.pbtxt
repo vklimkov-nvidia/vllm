@@ -1,6 +1,6 @@
 name: "codec_decoder"
 backend: "python"
-max_batch_size: 64
+max_batch_size: 32
 
 input [
   {
@@ -20,7 +20,7 @@ output [
 
 dynamic_batching {
   max_queue_delay_microseconds: 30000
-  preferred_batch_size: [ 4, 8, 16, 32, 64 ]
+  preferred_batch_size: [ 32 ]
 }
 
 instance_group [
@@ -32,5 +32,5 @@ instance_group [
 
 parameters {
   key: "codec_engine_path"
-  value: { string_value: "/workspace/server/models/codec.trt" }
+  value: { string_value: "/workspace/server/models/codec_fp16.trt" }
 }
