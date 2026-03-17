@@ -305,9 +305,14 @@ class TritonPythonModel:
         Triton's dynamic batcher on codec_decoder collects concurrent BLS
         requests from multiple pipeline threads into efficient TRT batches.
         """
+        # MOCK: return dummy audio instead of calling codec_decoder
+        #num_frames = codec_tokens.shape[0]
+        #samples_per_frame = int(24000 / 12.5)
+        #return np.zeros(num_frames * samples_per_frame, dtype=np.float32)
+
         codes_np = codec_tokens.cpu().numpy().astype(np.int64)
         codes_np = np.expand_dims(codes_np, axis=0)  # [T, Q] -> [1, T, Q] batch dim
-
+        #
         input_tensor = pb_utils.Tensor("audio_codes", codes_np)
         request = pb_utils.InferenceRequest(
             model_name="codec_decoder",
@@ -315,10 +320,10 @@ class TritonPythonModel:
             inputs=[input_tensor],
         )
         response = request.exec()
-
+        #
         if response.has_error():
             raise RuntimeError(f"Codec decode failed: {response.error().message()}")
-
+        #
         audio = pb_utils.get_output_tensor_by_name(
             response, "audio_values"
         ).as_numpy()
@@ -357,9 +362,8 @@ class TritonPythonModel:
     # ------------------------------------------------------------------
 
     def execute(self, requests):
-        futures = []
-
         for request in requests:
+            response_sender = request.get_response_sender()
             try:
                 text_tensor = pb_utils.get_input_tensor_by_name(request, "text")
                 text = text_tensor.as_numpy().flatten()[0].decode("utf-8")
@@ -371,41 +375,40 @@ class TritonPythonModel:
                     language = "auto"
 
                 logger.info("Synthesizing text=%r language=%s", text[:80], language)
-                future = self._thread_pool.submit(self._synthesize, text, language)
-                futures.append((future, None))
-
-            except Exception as e:
-                futures.append((None, e))
-
-        responses = []
-        for future, parse_error in futures:
-            if parse_error is not None:
-                logger.error("Request parse failed: %s", parse_error, exc_info=True)
-                responses.append(
-                    pb_utils.InferenceResponse(
-                        output_tensors=[],
-                        error=pb_utils.TritonError(str(parse_error)),
-                    )
+                self._thread_pool.submit(
+                    self._handle_request, text, language, response_sender,
                 )
-                continue
-
-            try:
-                audio = future.result(timeout=600)
-                logger.info("Generated %d audio samples (%.2f s @ 24 kHz)", len(audio), len(audio) / 24000.0)
-
-                out_tensor = pb_utils.Tensor("audio", audio)
-                responses.append(pb_utils.InferenceResponse(output_tensors=[out_tensor]))
 
             except Exception as e:
-                logger.error("Request failed: %s", e, exc_info=True)
-                responses.append(
+                logger.error("Request parse failed: %s", e, exc_info=True)
+                response_sender.send(
                     pb_utils.InferenceResponse(
                         output_tensors=[],
                         error=pb_utils.TritonError(str(e)),
-                    )
+                    ),
+                    flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
                 )
 
-        return responses
+        return None
+
+    def _handle_request(self, text: str, language: str, response_sender):
+        try:
+            audio = self._synthesize(text, language)
+            logger.info("Generated %d audio samples (%.2f s @ 24 kHz)", len(audio), len(audio) / 24000.0)
+            out_tensor = pb_utils.Tensor("audio", audio)
+            response_sender.send(
+                pb_utils.InferenceResponse(output_tensors=[out_tensor]),
+                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
+            )
+        except Exception as e:
+            logger.error("Request failed: %s", e, exc_info=True)
+            response_sender.send(
+                pb_utils.InferenceResponse(
+                    output_tensors=[],
+                    error=pb_utils.TritonError(str(e)),
+                ),
+                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
+            )
 
     def finalize(self):
         logger.info("Shutting down Qwen3-TTS TritonPythonModel")

@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Benchmark script for Qwen3-TTS Triton server.
+Benchmark script for Qwen3-TTS Triton server (decoupled mode, gRPC).
 
 Spawns N concurrent workers that send TTS requests in parallel.
 Texts are randomly sampled from a provided text file (one line per utterance).
 
 Usage:
-    python benchmark.py --text-file texts.txt --num-requests 100 --num-workers 8
-    python benchmark.py --text-file texts.txt --num-requests 50 --num-workers 4 --triton-url localhost:8000
+    python benchmark_server.py --text-file texts.txt --num-requests 100 --num-workers 8
+    python benchmark_server.py --text-file texts.txt --num-requests 50 --num-workers 4 --triton-url localhost:8001
 """
 
 import argparse
+import queue
 import random
 import threading
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
-import tritonclient.http as httpclient
+import tritonclient.grpc as grpcclient
 
 SAMPLE_RATE = 24_000
 MODEL_NAME = "qwen3_tts"
@@ -41,22 +42,15 @@ class BenchmarkStats:
             self.results.append(result)
 
 
-def synthesize(triton_url: str, text: str) -> int:
-    client = httpclient.InferenceServerClient(url=triton_url)
-
-    text_input = httpclient.InferInput("text", [1, 1], "BYTES")
+def _make_inputs(text: str, language: str = "english"):
+    text_input = grpcclient.InferInput("text", [1, 1], "BYTES")
     text_input.set_data_from_numpy(np.array([[text]], dtype=object))
 
-    lang_input = httpclient.InferInput("language", [1, 1], "BYTES")
-    lang_input.set_data_from_numpy(np.array([["english"]], dtype=object))
+    lang_input = grpcclient.InferInput("language", [1, 1], "BYTES")
+    lang_input.set_data_from_numpy(np.array([[language]], dtype=object))
 
-    result = client.infer(
-        model_name=MODEL_NAME,
-        inputs=[text_input, lang_input],
-        outputs=[httpclient.InferRequestedOutput("audio")],
-    )
-    audio = result.as_numpy("audio").squeeze()
-    return len(audio)
+    outputs = [grpcclient.InferRequestedOutput("audio")]
+    return [text_input, lang_input], outputs
 
 
 def worker(
@@ -67,26 +61,47 @@ def worker(
     queue_lock: threading.Lock,
     stats: BenchmarkStats,
 ):
-    while True:
-        with queue_lock:
-            if not task_queue:
-                return
-            task_idx = task_queue.pop()
+    result_q: queue.Queue = queue.Queue()
 
-        text = random.choice(texts)
-        t0 = time.perf_counter()
-        try:
-            num_samples = synthesize(triton_url, text)
-            elapsed = time.perf_counter() - t0
-            stats.add(RequestResult(text=text, num_samples=num_samples, duration_s=elapsed))
-            print(
-                f"[worker {worker_id:02d}] request {task_idx} done — "
-                f"{num_samples / SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s"
+    def _on_response(result, error):
+        result_q.put((result, error))
+
+    client = grpcclient.InferenceServerClient(url=triton_url)
+    client.start_stream(callback=_on_response)
+
+    try:
+        while True:
+            with queue_lock:
+                if not task_queue:
+                    return
+                task_idx = task_queue.pop()
+
+            text = random.choice(texts)
+            inputs, outputs = _make_inputs(text)
+
+            t0 = time.perf_counter()
+            client.async_stream_infer(
+                model_name=MODEL_NAME,
+                inputs=inputs,
+                outputs=outputs,
             )
-        except Exception as e:
+
+            result, error = result_q.get(timeout=120)
             elapsed = time.perf_counter() - t0
-            stats.add(RequestResult(text=text, num_samples=0, duration_s=elapsed, error=str(e)))
-            print(f"[worker {worker_id:02d}] request {task_idx} FAILED — {e}")
+
+            if error:
+                stats.add(RequestResult(text=text, num_samples=0, duration_s=elapsed, error=str(error)))
+                print(f"[worker {worker_id:02d}] request {task_idx} FAILED — {error}")
+            else:
+                audio = result.as_numpy("audio").squeeze()
+                num_samples = len(audio)
+                stats.add(RequestResult(text=text, num_samples=num_samples, duration_s=elapsed))
+                print(
+                    f"[worker {worker_id:02d}] request {task_idx} done — "
+                    f"{num_samples / SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s"
+                )
+    finally:
+        client.stop_stream()
 
 
 def main():
@@ -94,7 +109,7 @@ def main():
     parser.add_argument("--text-file", required=True, help="Path to file with one text per line")
     parser.add_argument("--num-requests", type=int, required=True, help="Total number of requests to send")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
-    parser.add_argument("--triton-url", default="localhost:8000", help="Triton HTTP endpoint (default: localhost:8000)")
+    parser.add_argument("--triton-url", default="localhost:8001", help="Triton gRPC endpoint (default: localhost:8001)")
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (3 requests per worker)")
     args = parser.parse_args()
 
@@ -115,24 +130,14 @@ def main():
         print(f"Warmup: {total_warmup} requests ({WARMUP_PER_WORKER} per worker) ...")
         warmup_queue = list(range(total_warmup))
         warmup_lock = threading.Lock()
-        warmup_barrier = threading.Barrier(args.num_workers)
-
-        def warmup_worker(wid: int):
-            while True:
-                with warmup_lock:
-                    if not warmup_queue:
-                        break
-                    warmup_queue.pop()
-                text = random.choice(texts)
-                try:
-                    synthesize(args.triton_url, text)
-                except Exception:
-                    pass
-            warmup_barrier.wait()
+        warmup_stats = BenchmarkStats()
 
         warmup_threads = []
         for i in range(args.num_workers):
-            t = threading.Thread(target=warmup_worker, args=(i,))
+            t = threading.Thread(
+                target=worker,
+                args=(i, args.triton_url, texts, warmup_queue, warmup_lock, warmup_stats),
+            )
             t.start()
             warmup_threads.append(t)
         for t in warmup_threads:

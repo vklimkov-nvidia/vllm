@@ -24,7 +24,9 @@ output [
   }
 ]
 
-dynamic_batching {}
+model_transaction_policy {
+  decoupled: true
+}
 
 instance_group [
   {
