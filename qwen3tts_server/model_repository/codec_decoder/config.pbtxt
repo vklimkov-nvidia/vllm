@@ -1,5 +1,5 @@
 name: "codec_decoder"
-backend: "python"
+platform: "tensorrt_plan"
 max_batch_size: 32
 
 input [
@@ -29,8 +29,3 @@ instance_group [
     kind: KIND_GPU
   }
 ]
-
-parameters {
-  key: "codec_engine_path"
-  value: { string_value: "/workspace/server/models/codec_fp16.trt" }
-}

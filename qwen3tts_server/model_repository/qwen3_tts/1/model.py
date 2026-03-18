@@ -25,6 +25,8 @@ Model config parameters (set in config.pbtxt):
   - reference_path            : path to reference.pt         (default: reference.pt)
   - prefill_assembler_path    : path to TorchScript .pt      (default: prefill_assembler.pt)
   - max_tokens                : max decode steps              (default: 2048)
+  - codec_chunk_size          : max codec frames per TRT call (default: 128)
+  - codec_left_context        : overlap frames between chunks (default: 25)
   - dtype                     : bfloat16 / float16 / float32 (default: bfloat16)
 """
 
@@ -99,6 +101,9 @@ class TritonPythonModel:
         }[dtype_str]
 
         self.max_tokens = int(_get_param(params, "max_tokens", "2048"))
+        self.codec_chunk_size = int(_get_param(params, "codec_chunk_size", "128"))
+        self.codec_left_context = int(_get_param(params, "codec_left_context", "25"))
+        self._samples_per_frame = int(24000 / 12.5)
 
         self._load_tokenizer(params, model_dir)
         self._load_prefill_assembler(params, model_dir)
@@ -299,14 +304,24 @@ class TritonPythonModel:
     # Codec decode: tokens -> waveform via BLS to codec_decoder model
     # ------------------------------------------------------------------
 
-    def _decode_codec_bls(self, codec_tokens: torch.Tensor) -> np.ndarray:
-        """Send codec tokens to the codec_decoder Triton model via BLS.
+    def _decode_codec_single(self, codec_tokens: torch.Tensor,
+                             actual_frames: int) -> np.ndarray:
+        """Decode a single chunk via BLS, padding to codec_chunk_size.
 
-        Triton's dynamic batcher on codec_decoder collects concurrent BLS
-        requests from multiple pipeline threads into efficient TRT batches.
+        All chunks are padded to a uniform size so the codec_decoder TRT
+        engine always sees identical input shapes, enabling optimal batching.
+        The output is trimmed back to actual_frames worth of audio.
         """
+        num_q = codec_tokens.shape[1]
+        pad_frames = self.codec_chunk_size - codec_tokens.shape[0]
+        if pad_frames > 0:
+            codec_tokens = torch.cat([
+                codec_tokens,
+                torch.zeros(pad_frames, num_q, dtype=codec_tokens.dtype),
+            ], dim=0)
+
         codes_np = codec_tokens.cpu().numpy().astype(np.int64)
-        codes_np = np.expand_dims(codes_np, axis=0)  # [T, Q] -> [1, T, Q] batch dim
+        codes_np = np.expand_dims(codes_np, axis=0)  # [T, Q] -> [1, T, Q]
 
         input_tensor = pb_utils.Tensor("audio_codes", codes_np)
         request = pb_utils.InferenceRequest(
@@ -319,12 +334,51 @@ class TritonPythonModel:
         if response.has_error():
             raise RuntimeError(f"Codec decode failed: {response.error().message()}")
 
-        audio = pb_utils.get_output_tensor_by_name(
+        audio_tensor = pb_utils.get_output_tensor_by_name(
             response, "audio_values"
-        ).as_numpy()
+        )
+        if audio_tensor.is_cpu():
+            audio = audio_tensor.as_numpy()
+        else:
+            audio = torch.from_dlpack(audio_tensor.to_dlpack()).cpu().numpy()
         if audio.ndim > 1:
-            audio = audio[0]  # strip batch dim from codec_decoder response
-        return audio
+            audio = audio[0]
+
+        expected_samples = actual_frames * self._samples_per_frame
+        return audio[:expected_samples]
+
+    def _decode_codec_bls(self, codec_tokens: torch.Tensor) -> np.ndarray:
+        """Decode codec tokens to waveform, chunking if needed.
+
+        When the sequence exceeds codec_chunk_size, it is split into
+        overlapping chunks (with codec_left_context frames of overlap).
+        Each chunk is padded to codec_chunk_size and sent via BLS to
+        codec_decoder.  Triton's dynamic batcher batches these uniform-
+        size chunks across concurrent requests for efficient TRT execution.
+        """
+        total_frames = codec_tokens.shape[0]
+        chunk_size = self.codec_chunk_size
+        left_context = self.codec_left_context
+
+        if total_frames <= chunk_size:
+            return self._decode_codec_single(codec_tokens, total_frames)
+
+        wavs = []
+        start = 0
+        while start < total_frames:
+            ctx = left_context if start >= left_context else start
+            end = min(start + chunk_size - ctx, total_frames)
+            chunk = codec_tokens[start - ctx : end]
+            wav_chunk = self._decode_codec_single(chunk, chunk.shape[0])
+            trim_samples = ctx * self._samples_per_frame
+            wavs.append(wav_chunk[trim_samples:])
+            start = end
+
+        logger.info(
+            "Chunked codec decode: %d frames -> %d chunks (chunk_size=%d, left_context=%d)",
+            total_frames, len(wavs), chunk_size, left_context,
+        )
+        return np.concatenate(wavs)
 
     # ------------------------------------------------------------------
     # Full pipeline: text -> audio  (runs in a thread-pool thread)

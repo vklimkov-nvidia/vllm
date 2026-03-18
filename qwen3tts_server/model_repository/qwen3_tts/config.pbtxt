@@ -49,7 +49,15 @@ parameters {
 }
 parameters {
   key: "max_tokens"
-  value: { string_value: "512" }
+  value: { string_value: "1024" }
+}
+parameters {
+  key: "codec_chunk_size"
+  value: { string_value: "128" }
+}
+parameters {
+  key: "codec_left_context"
+  value: { string_value: "25" }
 }
 parameters {
   key: "dtype"

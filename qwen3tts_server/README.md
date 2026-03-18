@@ -32,7 +32,7 @@ python3 extract_reference.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base
 python3 export_prefill_encoder.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3/ --ref-data models/reference.pt --text "hello world!" --language "english" --output models/prefill.pt --device cuda --dtype bfloat16 --torchscript-path models/encoder.jit
 
 # trace codec that converts audio tokens to audio
-python3 export_codec.py --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8/ --onnx-path models/codec.onnx --trt-path models/codec.trt
+python3 export_codec.py --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8/ --onnx-path models/codec.onnx --trt-path model_repository/codec_decoder/1/codec.trt
 ```
 
 Finally you can start a server with 
