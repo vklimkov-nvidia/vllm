@@ -1066,6 +1066,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
+        prev_group0_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate **all** codec groups given the talker hidden states.
 
@@ -1089,6 +1090,8 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             top_k: Top-k sampling
             top_p: Top-p (nucleus) sampling
             repetition_penalty: Penalty for repeated tokens
+            prev_group0_tokens: [seq_len, window] - recent group-0 token
+                history for cross-step repetition penalty (optional)
 
         Returns:
             all_codecs: [seq_len, num_code_groups] - all codec tokens
@@ -1124,7 +1127,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
-            previous_tokens=None,
+            previous_tokens=prev_group0_tokens,
         )
 
         all_codecs[:, 0] = first_codec
@@ -1145,9 +1148,10 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
                 hidden_states[:, current_len - 1, :], step
             )  # [seq_len, vocab]
 
-            # Repetition penalty context (view into persistent codecs buf)
-            if repetition_penalty != 1.0:
-                current_context = all_codecs[:, : step + 1]
+            # Repetition penalty context: only prior inner-group tokens
+            # (skip group 0 — it uses a different, larger vocab)
+            if repetition_penalty != 1.0 and step > 0:
+                current_context = all_codecs[:, 1: step + 1]
             else:
                 current_context = None
 
@@ -1310,6 +1314,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         combined_embeddings: Optional[torch.Tensor] = None,
+        prev_group0_tokens: Optional[torch.Tensor] = None,
     ) -> Union[IntermediateTensors, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Forward pass through the talker model.
         
@@ -1352,11 +1357,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 top_k=self.top_k,
                 top_p=self.top_p,
                 repetition_penalty=self.repetition_penalty,
+                prev_group0_tokens=prev_group0_tokens,
             )
             return hidden_states, all_codecs, next_input_embeds
         else:
             # run code predictor only for tokens that are to be decoded
             selected_states = hidden_states[logits_indices].contiguous()
+            selected_prev_g0 = (prev_group0_tokens[logits_indices]
+                                if prev_group0_tokens is not None else None)
             ctx = get_forward_context()
             old_batch_descriptor = ctx.batch_descriptor
             old_mode = ctx.cudagraph_runtime_mode
@@ -1373,6 +1381,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                     top_k=self.top_k,
                     top_p=self.top_p,
                     repetition_penalty=self.repetition_penalty,
+                    prev_group0_tokens=selected_prev_g0,
                 )
             finally:
                 ctx.batch_descriptor = old_batch_descriptor
