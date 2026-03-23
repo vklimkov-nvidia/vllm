@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""Convert a Qwen3-TTS HuggingFace checkpoint to vLLM-compatible format.
+"""Convert a Qwen3-TTS CustomVoice checkpoint to vLLM-compatible format.
 
 Takes an input directory containing config.json and model.safetensors,
 applies vLLM-specific config adjustments, precomputes additional weight
 tensors required for CUDA-graph-safe inference, renames weights to match
 the vLLM model layout, and writes everything to an output directory.
 
-Weight renames applied (to match the refactored vLLM model):
-  - talker.model.codec_embedding.* → talker.code_predictor.codec_embedding.*
-  - talker.codec_head.*            → talker.code_predictor.codec_head.*
-
-Precomputed weights added to model.safetensors:
-  - talker.tts_pad_embed                    [hidden_size]  float
-      = text_projection(text_embedding(tts_pad_token_id))
-      Added to codec embeddings at every autoregressive step to
-      maintain the dual-stream text+codec architecture.
-  - talker.code_predictor.suppress_mask     [vocab_size]   bool
-      True for the top 1024 token IDs (except codec_eos_token_id).
-      Used to suppress reserved/invalid tokens during sampling.
+The CustomVoice model has built-in known speakers (e.g. Aiden, Vivian, Ryan)
+whose embeddings are stored in the codec embedding table.  Speaker IDs are
+preserved in config.json under talker_config.spk_id.
 
 Usage:
     python convert_qwen3tts_checkpoint.py INPUT_DIR OUTPUT_DIR
@@ -178,6 +169,19 @@ def convert(input_dir: str, output_dir: str) -> None:
     print("Reading config.json ...")
     with open(in_path / "config.json") as f:
         config = json.load(f)
+
+    model_type = config.get("tts_model_type", "base")
+    print(f"  Model type: {model_type}")
+
+    tc = config.get("talker_config", {})
+    spk_id = tc.get("spk_id", {})
+    if spk_id:
+        print(f"  Known speakers ({len(spk_id)}): {', '.join(spk_id.keys())}")
+    spk_is_dialect = tc.get("spk_is_dialect", {})
+    if spk_is_dialect:
+        dialects = {k: v for k, v in spk_is_dialect.items() if v}
+        if dialects:
+            print(f"  Dialect speakers: {dialects}")
 
     _adjust_config(config)
 

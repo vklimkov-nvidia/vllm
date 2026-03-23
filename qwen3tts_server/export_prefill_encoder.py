@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Build prefill embeddings from pre-extracted reference data + target text.
+Export TorchScript PrefillAssembler for Qwen3-TTS CustomVoice inference.
+
+The PrefillAssembler builds dense prefill embeddings from a known speaker ID
+and target text — no reference audio needed.  Speaker identity is a learned
+embedding stored in the codec embedding table.
 
 This script avoids importing top-level `qwen_tts` so it can run in
 environments without `torchaudio` (for example Triton inference images).
@@ -18,7 +22,7 @@ from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
 
 
 # ============================================================================
-# Helper MLP (same as in prefill_encoder.py — duplicated to be self-contained)
+# Helper MLP
 # ============================================================================
 
 class ResizeMLP(nn.Module):
@@ -34,26 +38,29 @@ class ResizeMLP(nn.Module):
 
 
 # ============================================================================
-# PrefillAssembler — embedding-only module, no audio encoders
+# PrefillAssembler — CustomVoice only
 # ============================================================================
 
 class PrefillAssembler(nn.Module):
     """
-    Assembles the dense prefill embedding from pre-computed artefacts.
+    Assembles dense prefill embedding for a known speaker (CustomVoice).
 
-    All inputs are integer IDs or pre-computed float tensors — no raw audio.
-    The module contains only embedding tables and a projection MLP, so it can
-    be exported to TorchScript for lightweight per-request execution.
+    Speaker identity comes from the codec embedding table — no reference
+    audio, no speaker encoder, no speech tokenizer needed.
 
-    Inputs (all on the same device / dtype as the module):
-        speaker_embedding  : [1, D]           speaker embedding vector
-        ref_audio_codes    : [T_audio, G]     discrete codes from speech tokenizer
-        text_ids           : [1, T_text]      target text token IDs
-        ref_text_ids       : [1, T_ref]       reference transcript token IDs
-        language_id        : [1] or None      codec language id; None means auto
+    Prefill layout:
+        A. Role prefix          (3)     text_proj(text_emb(role))  |  —
+        B+C. Ctrl + speaker     (N-1)   tts_pad/bos               |  codec header/spk/pad
+        D. Synth text + EOS     (T+1)   text embeds               |  codec pad
+        E. Final BOS            (1)     tts_pad                   |  codec bos
+
+    Inputs:
+        spk_id       : [1]          codec token ID for the speaker
+        text_ids     : [1, T_text]  target text token IDs
+        language_id  : [1] or None  codec language id; None means auto
 
     Output:
-        prefill_embeds     : [1, S, D]        dense embedding for the Talker
+        prefill_embeds : [1, S, D]  dense embedding for the Talker
     """
 
     def __init__(
@@ -62,8 +69,6 @@ class PrefillAssembler(nn.Module):
         text_hidden_size: int,
         codec_vocab_size: int,
         hidden_size: int,
-        num_code_groups: int,
-        sub_codec_vocab_size: int,
         codec_pad_id: int,
         codec_bos_id: int,
         codec_think_id: int,
@@ -78,7 +83,6 @@ class PrefillAssembler(nn.Module):
         super().__init__()
 
         self.hidden_size = hidden_size
-        self.num_code_groups = num_code_groups
         self.codec_pad_id = codec_pad_id
         self.codec_bos_id = codec_bos_id
         self.codec_think_id = codec_think_id
@@ -94,36 +98,20 @@ class PrefillAssembler(nn.Module):
             text_hidden_size, text_hidden_size, hidden_size, hidden_act, bias=True,
         )
         self.codec_embedding = nn.Embedding(codec_vocab_size, hidden_size)
-        self.sub_codec_embeddings = nn.ModuleList([
-            nn.Embedding(sub_codec_vocab_size, hidden_size)
-            for _ in range(num_code_groups - 1)
-        ])
-        self.register_buffer("role_prefix_ids", torch.zeros((1, 3), dtype=torch.long), persistent=True)
-
-    def set_role_prefix_ids(self, role_prefix_ids: torch.Tensor) -> None:
-        role_prefix_ids = role_prefix_ids.to(device=self.role_prefix_ids.device, dtype=torch.long)
-        if role_prefix_ids.dim() == 1:
-            role_prefix_ids = role_prefix_ids.unsqueeze(0)
-        if role_prefix_ids.shape != (1, 3):
-            raise ValueError(f"Expected role_prefix_ids shape [1, 3], got {tuple(role_prefix_ids.shape)}")
-        self.role_prefix_ids.copy_(role_prefix_ids)
-
-    def _embed_ref_codes(self, ref_audio_codes: torch.Tensor) -> torch.Tensor:
-        """Sum codebook embeddings per timestep.  ``[T, G] → [1, T, D]``."""
-        parts = [self.codec_embedding(ref_audio_codes[:, 0:1])]
-        for i, embed in enumerate(self.sub_codec_embeddings):
-            parts.append(embed(ref_audio_codes[:, i + 1 : i + 2]))
-        return torch.cat(parts, dim=1).sum(dim=1).unsqueeze(0)
+        self.register_buffer("role_prefix_ids", torch.zeros((1, 3), dtype=torch.long))
 
     def forward(
         self,
-        speaker_embedding: torch.Tensor,
-        ref_audio_codes: torch.Tensor,
+        spk_id: torch.Tensor,
         text_ids: torch.Tensor,
-        ref_text_ids: torch.Tensor,
         language_id: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         device = self.codec_embedding.weight.device
+
+        # Speaker embedding: a single row from the codec embedding table
+        speaker_embedding = self.codec_embedding(
+            spk_id.view(1).to(device=device, dtype=torch.long)
+        )  # [1, D]
 
         # --- TTS special-token embeddings ---
         special_ids = torch.tensor(
@@ -136,75 +124,67 @@ class PrefillAssembler(nn.Module):
         tts_eos = special[:, 1:2]
         tts_pad = special[:, 2:3]
 
-        # A. Role prefix (pure text, no codec side)
+        # A. Role prefix (baked into module at export time)
         role = self.text_projection(
-            self.text_embedding(self.role_prefix_ids.to(device=device)))  # [1, 3, D]
+            self.text_embedding(self.role_prefix_ids.to(device=device)))
 
-        # B+C. Codec control:
-        # - language_id is None: AUTO/NOTHINK mode [nothink_id, think_bos, think_eos]
-        # - language_id provided: THINK mode [think_id, think_bos, language_id, think_eos]
+        # B+C. Codec control header + speaker
         if language_id is None:
             codec_header_ids = torch.tensor(
-                [[self.codec_nothink_id, self.codec_think_bos_id, self.codec_think_eos_id]],
-                device=device,
-                dtype=torch.long,
-            )  # [1, 3]
+                [[self.codec_nothink_id, self.codec_think_bos_id,
+                  self.codec_think_eos_id]],
+                device=device, dtype=torch.long,
+            )
         else:
             lang = language_id.view(1, 1).to(device=device, dtype=torch.long)
             if bool((lang < 0).item()):
                 codec_header_ids = torch.tensor(
-                    [[self.codec_nothink_id, self.codec_think_bos_id, self.codec_think_eos_id]],
-                    device=device,
-                    dtype=torch.long,
-                )  # [1, 3]
+                    [[self.codec_nothink_id, self.codec_think_bos_id,
+                      self.codec_think_eos_id]],
+                    device=device, dtype=torch.long,
+                )
             else:
                 header_ids = torch.tensor(
-                    [[self.codec_think_id, self.codec_think_bos_id, self.codec_think_eos_id]],
-                    device=device,
-                    dtype=torch.long,
+                    [[self.codec_think_id, self.codec_think_bos_id,
+                      self.codec_think_eos_id]],
+                    device=device, dtype=torch.long,
                 )
                 codec_header_ids = torch.cat(
                     [header_ids[:, :2], lang, header_ids[:, 2:]], dim=1
-                )  # [1, 4]
-        header_embed = self.codec_embedding(codec_header_ids)  # [1, H, D]
+                )
+
+        header_embed = self.codec_embedding(codec_header_ids)
         suffix_ids = torch.tensor(
             [[self.codec_pad_id, self.codec_bos_id]],
             device=device, dtype=torch.long,
         )
-        suffix_embed = self.codec_embedding(suffix_ids)        # [1, 2, D]
-        spk = speaker_embedding.view(1, 1, -1)                # [1, 1, D]
+        suffix_embed = self.codec_embedding(suffix_ids)
+        spk = speaker_embedding.view(1, 1, -1)
         codec_ctrl = torch.cat(
-            [header_embed, spk, suffix_embed], dim=1)          # [1, N, D]
+            [header_embed, spk, suffix_embed], dim=1)
 
         n_ctrl = codec_ctrl.shape[1]
         text_ctrl = torch.cat([
             tts_pad.expand(-1, n_ctrl - 2, -1),
             tts_bos,
-        ], dim=1)                                              # [1, N-1, D]
-        ctrl = text_ctrl + codec_ctrl[:, :-1]                  # [1, N-1, D]
+        ], dim=1)
+        ctrl = text_ctrl + codec_ctrl[:, :-1]
 
-        # D. Text: ref_text + synth_text + TTS-EOS, paired with codec_pad.
-        combined_text = torch.cat([ref_text_ids, text_ids], dim=-1)   # [1, T1-1]
-        text_embed = self.text_projection(self.text_embedding(combined_text))
-        text_embed = torch.cat([text_embed, tts_eos], dim=1)  # [1, T1, D]
+        # D. Synth text + TTS_EOS, paired with codec_pad
+        text_embed = self.text_projection(self.text_embedding(text_ids))
+        text_embed = torch.cat([text_embed, tts_eos], dim=1)
         t1 = text_embed.shape[1]
-
         codec_pad_ids = torch.full(
             (1, t1), self.codec_pad_id, device=device, dtype=torch.long,
         )
         text_part = text_embed + self.codec_embedding(codec_pad_ids)
 
-        # E. Ref audio codes: BOS + Σ-codebook embeddings, paired with tts_pad
-        ref_embed = self._embed_ref_codes(ref_audio_codes)     # [1, T_audio, D]
-        bos_id = torch.tensor(
-            [[self.codec_bos_id]], device=device, dtype=torch.long,
-        )
-        codec_part_raw = torch.cat(
-            [self.codec_embedding(bos_id), ref_embed], dim=1)  # [1, T2, D]
-        t2 = codec_part_raw.shape[1]
-        codec_part = codec_part_raw + tts_pad.expand(-1, t2, -1)
+        # E. Final position: tts_pad + codec_bos
+        bos_embed = self.codec_embedding(
+            torch.tensor([[self.codec_bos_id]], device=device, dtype=torch.long))
+        final_pos = tts_pad + bos_embed
 
-        return torch.cat([role, ctrl, text_part, codec_part], dim=1)
+        return torch.cat([role, ctrl, text_part, final_pos], dim=1)
 
     # ------------------------------------------------------------------
     # Loading from the full TTS model
@@ -221,8 +201,6 @@ class PrefillAssembler(nn.Module):
             text_hidden_size=tc.text_hidden_size,
             codec_vocab_size=tc.vocab_size,
             hidden_size=tc.hidden_size,
-            num_code_groups=tc.num_code_groups,
-            sub_codec_vocab_size=talker.code_predictor.model.codec_embedding[0].num_embeddings,
             codec_pad_id=tc.codec_pad_id,
             codec_bos_id=tc.codec_bos_id,
             codec_think_id=tc.codec_think_id,
@@ -241,99 +219,87 @@ class PrefillAssembler(nn.Module):
             talker.text_projection.state_dict())
         assembler.codec_embedding.load_state_dict(
             talker.model.codec_embedding.state_dict())
-        for i in range(assembler.num_code_groups - 1):
-            assembler.sub_codec_embeddings[i].load_state_dict(
-                talker.code_predictor.model.codec_embedding[i].state_dict())
 
         return assembler
 
 
-def load_model_and_processor(
-    model_path: str,
-    device: str,
-    dtype: torch.dtype,
-):
+def load_model_and_processor(model_path: str, device: str, dtype: torch.dtype):
     model = Qwen3TTSForConditionalGeneration.from_pretrained(
-        model_path,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation="eager",
+        model_path, device_map=device, dtype=dtype, attn_implementation="eager",
     )
     processor = Qwen3TTSProcessor.from_pretrained(model_path)
     return model, processor
 
 
 # ============================================================================
-# Text tokenization (runs outside the model — not traceable)
+# Helpers
 # ============================================================================
 
-def tokenize_target_text(
-    processor,
-    synth_text: str,
-) -> torch.Tensor:
-    """
-    Tokenize target synthesis text into token IDs.
-
-    This runs *before* the PrefillAssembler and is intentionally kept as a
-    plain function (not part of the nn.Module) since HF tokenizers are not
-    TorchScript-exportable.
-
-    Args:
-        processor: Qwen3TTS processor / tokenizer.
-        synth_text: The text to synthesize.
-
-    Returns:
-        text_ids: ``[1, T_text]`` int64 tensor (CPU).
-    """
+def tokenize_target_text(processor, synth_text: str) -> torch.Tensor:
+    """``synth_text`` → ``[1, T_text]`` int64 token IDs (CPU)."""
     synth_full = f"<|im_start|>assistant\n{synth_text}<|im_end|>\n<|im_start|>assistant\n"
     tok = processor(text=synth_full, return_tensors="pt", padding=True)
     full_ids = tok["input_ids"]
     if full_ids.dim() == 1:
         full_ids = full_ids.unsqueeze(0)
-    text_ids = full_ids[:, 3:-5].to(torch.long)
-    return text_ids
+    return full_ids[:, 3:-5].to(torch.long)
+
+
+def compute_role_prefix_ids(processor) -> torch.Tensor:
+    """Tokenize ``<|im_start|>assistant\\n`` → ``[1, 3]`` int64."""
+    ids = processor.tokenizer.encode("<|im_start|>assistant\n")
+    return torch.tensor([ids[:3]], dtype=torch.long)
+
+
+def get_speaker_id(model, speaker_name: str) -> int:
+    spk_id_map = getattr(model.config.talker_config, "spk_id", None)
+    if not spk_id_map:
+        raise ValueError("Model config has no talker_config.spk_id — not a CustomVoice model?")
+    key = speaker_name.strip().lower()
+    if key not in spk_id_map:
+        available = ", ".join(sorted(spk_id_map.keys()))
+        raise ValueError(f"Unknown speaker '{speaker_name}'. Available: {available}")
+    return int(spk_id_map[key])
 
 
 def get_codec_language_mapping(model) -> Dict[str, int]:
     mapping = getattr(model.config.talker_config, "codec_language_id", None)
     if not isinstance(mapping, dict) or len(mapping) == 0:
-        raise ValueError(
-            "Model config does not contain a valid talker_config.codec_language_id mapping."
-        )
+        raise ValueError("Model config has no valid talker_config.codec_language_id mapping.")
     return {str(name).lower(): int(lang_id) for name, lang_id in mapping.items()}
 
 
-def print_codec_language_mapping(mapping: Dict[str, int]) -> None:
-    print("Available codec language mappings (language -> id):")
-    print("  auto: -1")
-    for language, lang_id in sorted(mapping.items(), key=lambda item: (item[1], item[0])):
-        print(f"  {language}: {lang_id}")
-
-
-def resolve_codec_language_id(language: str, mapping: Dict[str, int]) -> int:
+def resolve_codec_language_id(language: str, mapping: Dict[str, int]) -> Optional[int]:
     key = language.strip().lower()
     if key == "auto":
         return None
     if key in mapping:
         return mapping[key]
     available = ", ".join(["auto"] + sorted(mapping.keys()))
-    raise ValueError(f"Unknown language '{language}'. Supported languages: {available}")
+    raise ValueError(f"Unknown language '{language}'. Supported: {available}")
+
+
+def resolve_dialect_language(model, speaker_name: str, language: str, language_id):
+    """Override language_id if the speaker has a dialect and language is chinese/auto."""
+    tc = model.config.talker_config
+    spk_is_dialect = getattr(tc, "spk_is_dialect", {})
+    if not spk_is_dialect:
+        return language_id
+    key = speaker_name.strip().lower()
+    dialect = spk_is_dialect.get(key, False)
+    if dialect and language.lower() in ("chinese", "auto"):
+        lang_map = getattr(tc, "codec_language_id", {})
+        if dialect in lang_map:
+            return int(lang_map[dialect])
+    return language_id
 
 
 # ============================================================================
 # TorchScript export
 # ============================================================================
 
-def export_torchscript(
-    assembler: PrefillAssembler,
-    torchscript_path: str,
-    freeze: bool = True,
-) -> str:
-    """
-    Export the PrefillAssembler to a TorchScript module with weights.
-
-    Returns the path to the exported file.
-    """
+def export_torchscript(assembler: PrefillAssembler, torchscript_path: str,
+                       freeze: bool = True) -> str:
     ts_file = Path(torchscript_path)
     ts_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -353,103 +319,82 @@ def export_torchscript(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build prefill embeddings and optionally export a TorchScript PrefillAssembler."
+        description="Export TorchScript PrefillAssembler for Qwen3-TTS CustomVoice.",
     )
-    parser.add_argument("--model-path", default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-    parser.add_argument("--ref-data", required=True)
-    parser.add_argument("--text", required=True)
-    parser.add_argument(
-        "--language",
-        default="auto",
-        help="Codec language string (e.g. 'english') or 'auto'.",
-    )
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--model-path", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    parser.add_argument("--text", required=True,
+                        help="Test text to verify the assembler.")
+    parser.add_argument("--speaker", default="Aiden",
+                        help="Speaker name (default: Aiden).")
+    parser.add_argument("--language", default="auto",
+                        help="Codec language (e.g. 'english') or 'auto'.")
+    parser.add_argument("--output", required=True,
+                        help="Output path for test prefill embedding (.pt).")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
-    parser.add_argument(
-        "--torchscript-path",
-        default=None,
-        help="Optional output path for scripted PrefillAssembler (.pt).",
-    )
+    parser.add_argument("--dtype", default="bfloat16",
+                        choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--torchscript-path", default=None,
+                        help="Output path for TorchScript PrefillAssembler (.pt).")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
+    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
 
-    print(f"Loading model from {args.model_path} (torchaudio-free import path) ...")
-    model, processor = load_model_and_processor(
-        model_path=args.model_path,
-        device=args.device,
-        dtype=dtype,
-    )
+    print(f"Loading model from {args.model_path} ...")
+    model, processor = load_model_and_processor(args.model_path, args.device, dtype)
 
     assembler = PrefillAssembler.from_pretrained_model(model).to(args.device).to(dtype).eval()
-    print(
-        f"PrefillAssembler: hidden_size={assembler.hidden_size} "
-        f"num_code_groups={assembler.num_code_groups}"
-    )
+    print(f"PrefillAssembler: hidden_size={assembler.hidden_size}")
+
+    # Speaker
+    spk_id_val = get_speaker_id(model, args.speaker)
+    print(f"Speaker '{args.speaker}' -> spk_id={spk_id_val}")
+
+    # Language
     language_mapping = get_codec_language_mapping(model)
-    print_codec_language_mapping(language_mapping)
     language_id = resolve_codec_language_id(args.language, language_mapping)
-    print(f"Resolved language '{args.language}' -> language_id={language_id}")
+    language_id = resolve_dialect_language(model, args.speaker, args.language, language_id)
+    print(f"Language '{args.language}' -> language_id={language_id}")
 
-    ref_data = torch.load(args.ref_data, map_location="cpu", weights_only=False)
-    print(f"Loaded reference data from {args.ref_data}")
-    assembler.set_role_prefix_ids(ref_data["role_prefix_ids"])
+    # Bake role prefix IDs into the module
+    role_prefix_ids = compute_role_prefix_ids(processor)
+    assembler.role_prefix_ids.copy_(role_prefix_ids.to(assembler.role_prefix_ids.device))
+    print(f"Role prefix IDs: {assembler.role_prefix_ids.tolist()}")
 
-    text_ids = tokenize_target_text(processor=processor, synth_text=args.text)
-    ref_text_ids = ref_data["ref_text_ids"].to(torch.long)
-
-    if language_id:
-        language_id = torch.tensor([language_id], device=args.device, dtype=torch.long)
-
-    inputs = {
-        "speaker_embedding": ref_data["speaker_embedding"].unsqueeze(0).to(args.device, dtype),
-        "ref_audio_codes": ref_data["ref_audio_codes"].to(args.device, torch.long),
-        "text_ids": text_ids.to(args.device, torch.long),
-        "ref_text_ids": ref_text_ids.to(args.device, torch.long),
-    }
+    # Test forward
+    text_ids = tokenize_target_text(processor, args.text)
+    spk_id_tensor = torch.tensor([spk_id_val], device=args.device, dtype=torch.long)
+    language_id_tensor = (
+        torch.tensor([language_id], device=args.device, dtype=torch.long)
+        if language_id is not None else None
+    )
 
     with torch.inference_mode():
         prefill = assembler(
-            inputs["speaker_embedding"],
-            inputs["ref_audio_codes"],
-            inputs["text_ids"],
-            inputs["ref_text_ids"],
-            language_id,
+            spk_id_tensor, text_ids.to(args.device, torch.long),
+            language_id_tensor,
         )
 
-    print(f"Prefill embeds: {prefill.shape} (target tokens={inputs['text_ids'].shape[1]})")
+    print(f"Prefill embeds: {prefill.shape} (target tokens={text_ids.shape[1]})")
 
     out_file = Path(args.output)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "prefill_embeds": prefill.cpu(),
-            "text": args.text,
-            "language": args.language,
-            "language_id": language_id,
-            "ref_data_path": args.ref_data,
-            "text_ids": inputs["text_ids"].cpu(),
-            "ref_text_ids": inputs["ref_text_ids"].cpu(),
-        },
-        out_file,
-    )
-    print(f"Saved prefill embedding to {out_file}")
+    torch.save({
+        "prefill_embeds": prefill.cpu(),
+        "text": args.text,
+        "speaker": args.speaker,
+        "spk_id": spk_id_val,
+        "language": args.language,
+        "language_id": language_id,
+        "text_ids": text_ids.cpu(),
+    }, out_file)
+    print(f"Saved test prefill to {out_file}")
 
     if args.torchscript_path:
-        export_torchscript(
-            assembler=assembler.eval(),
-            torchscript_path=args.torchscript_path,
-            freeze=True,
-        )
+        export_torchscript(assembler.eval(), args.torchscript_path, freeze=True)
 
 
 if __name__ == "__main__":

@@ -40,12 +40,12 @@ parameters {
   value: { string_value: "/workspace/server/models/qwen3tts_vllm_model" }
 }
 parameters {
-  key: "reference_path"
-  value: { string_value: "/workspace/server/models/reference.pt" }
-}
-parameters {
   key: "prefill_assembler_path"
   value: { string_value: "/workspace/server/models/encoder.jit" }
+}
+parameters {
+  key: "default_speaker"
+  value: { string_value: "aiden" }
 }
 parameters {
   key: "max_tokens"

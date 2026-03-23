@@ -55,15 +55,28 @@ def _make_inputs(text: str, language: str = "english"):
     return [text_input, lang_input], outputs
 
 
-def _collect_streaming_response(result_q: queue.Queue, timeout: float = 120):
+def _collect_streaming_response(
+    result_q: queue.Queue,
+    deadline: float,
+    chunk_timeout: float = 60,
+):
     """Collect all streamed audio chunks for a single request.
 
-    Returns (chunks, error_str, ttfa_elapsed) where ttfa_elapsed is the
-    time from call start to the first audio chunk (set by caller).
+    Returns (chunks, error_str).  Raises queue.Empty if *deadline*
+    (absolute perf_counter timestamp) is exceeded while waiting.
     """
     chunks = []
     while True:
-        result, error = result_q.get(timeout=timeout)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return chunks, "request timed out (total deadline exceeded)"
+        wait = min(chunk_timeout, remaining)
+
+        try:
+            result, error = result_q.get(timeout=wait)
+        except queue.Empty:
+            return chunks, "request timed out (no response chunk within deadline)"
+
         if error:
             return chunks, str(error)
 
@@ -84,6 +97,7 @@ def worker(
     task_queue: list[int],
     queue_lock: threading.Lock,
     stats: BenchmarkStats,
+    request_timeout: float = 120,
 ):
     result_q: queue.Queue = queue.Queue()
     first_chunk_time: list[float | None] = [None]
@@ -113,22 +127,30 @@ def worker(
 
             first_chunk_time[0] = None
             t0 = time.perf_counter()
+            deadline = t0 + request_timeout
             client.async_stream_infer(
                 model_name=MODEL_NAME,
                 inputs=inputs,
                 outputs=outputs,
             )
 
-            chunks, error_str = _collect_streaming_response(result_q)
+            chunks, error_str = _collect_streaming_response(result_q, deadline)
             elapsed = time.perf_counter() - t0
             ttfa = (first_chunk_time[0] - t0) if first_chunk_time[0] else elapsed
 
             if error_str:
+                if "timed out" in error_str:
+                    # Drain any late-arriving chunks so they don't
+                    # bleed into the next request on this stream.
+                    client.stop_stream()
+                    client.start_stream(callback=_on_response)
+
                 stats.add(RequestResult(
                     text=text, num_samples=0, duration_s=elapsed,
                     ttfa_s=ttfa, error=error_str,
                 ))
-                print(f"[worker {worker_id:02d}] request {task_idx} FAILED — {error_str}")
+                print(f"[worker {worker_id:02d}] request {task_idx} FAILED "
+                      f"({elapsed:.1f}s) — {error_str}")
             else:
                 audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
                 num_samples = len(audio)
@@ -152,6 +174,8 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
     parser.add_argument("--triton-url", default="localhost:8001", help="Triton gRPC endpoint (default: localhost:8001)")
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (3 requests per worker)")
+    parser.add_argument("--request-timeout", type=float, default=60,
+                        help="Per-request timeout in seconds (default: 120)")
     args = parser.parse_args()
 
     with open(args.text_file) as f:
@@ -177,7 +201,8 @@ def main():
         for i in range(args.num_workers):
             t = threading.Thread(
                 target=worker,
-                args=(i, args.triton_url, texts, warmup_queue, warmup_lock, warmup_stats),
+                args=(i, args.triton_url, texts, warmup_queue, warmup_lock,
+                      warmup_stats, args.request_timeout),
             )
             t.start()
             warmup_threads.append(t)
@@ -196,7 +221,8 @@ def main():
     for i in range(args.num_workers):
         t = threading.Thread(
             target=worker,
-            args=(i, args.triton_url, texts, task_queue, queue_lock, stats),
+            args=(i, args.triton_url, texts, task_queue, queue_lock,
+                  stats, args.request_timeout),
         )
         t.start()
         threads.append(t)
