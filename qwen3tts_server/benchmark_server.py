@@ -72,7 +72,8 @@ def _collect_streaming_response(result_q: queue.Queue, timeout: float = 120):
             chunks.append(audio)
 
         response = result.get_response()
-        if "triton_final_response" in response.parameters:
+        final_param = response.parameters.get("triton_final_response")
+        if final_param and getattr(final_param, "bool_param", False):
             return chunks, None
 
 
