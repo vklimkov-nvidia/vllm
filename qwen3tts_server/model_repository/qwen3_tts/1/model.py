@@ -153,7 +153,7 @@ class TritonPythonModel:
             skip_tokenizer_init=True,
             enable_prefix_caching=False,
             trust_remote_code=True,
-            input_coalesce_timeout_ms=30,
+            input_coalesce_timeout_ms=40,
             compilation_config={"cudagraph_mode": "PIECEWISE"},
             shm_decode=True,
         )
@@ -412,6 +412,7 @@ class TritonPythonModel:
             outputs = self.engine.decode_step_shm(
                 request_id,
                 custom_inputs={"combined_embeddings": next_input},
+                timeout=60,
             )
             decode_step_times.append(time.perf_counter() - t_step)
 
