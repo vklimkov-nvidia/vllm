@@ -32,8 +32,8 @@ python3 extract_reference.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base
 python3 export_prefill_encoder.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3/ --ref-data models/reference.pt --text "hello world!" --language "english" --output models/prefill.pt --device cuda --dtype bfloat16 --torchscript-path models/encoder.jit
 
 # trace codec that converts audio tokens to audio
-# we pass constant shape input to codec. by default 128 frames (10 sec) for max throughput or less for real streaming synthesis
-python3 export_codec.py --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8/ --onnx-path models/codec.onnx --trt-path model_repository/codec_decoder/1/codec.trt --trt-fp16 [--trt-frames-profile 1 30 64]
+# we pass constant shape input to codec. by default 128 frames (10 sec) for max throughput, specify less for better ttft
+python3 export_codec.py --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8/ --onnx-path models/codec.onnx --trt-path model_repository/codec_decoder/1/codec.trt --trt-fp16 --trt-frames-profile 1 35 64 --frames 35
 ```
 
 Finally you can start a server with 

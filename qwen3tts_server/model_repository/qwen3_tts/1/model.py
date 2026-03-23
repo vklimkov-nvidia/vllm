@@ -231,23 +231,19 @@ class TritonPythonModel:
     # Codec decode: tokens -> waveform via BLS to codec_decoder model
     # ------------------------------------------------------------------
 
-    def _decode_codec_single(self, codec_tokens: torch.Tensor,
-                             actual_frames: int) -> np.ndarray:
+    def _decode_codec_single(self, codec_tokens: torch.Tensor, ctx_frames: int) -> np.ndarray:
         """Decode a single chunk via BLS, padding to codec_chunk_size.
-
-        All chunks are padded to a uniform size so the codec_decoder TRT
-        engine always sees identical input shapes, enabling optimal batching.
-        The output is trimmed back to actual_frames worth of audio.
+        Padding is done on the right since codec is causal and right padding would not affect output.
+        tokens might contain context which should be discarded.
         """
-        num_q = codec_tokens.shape[1]
-        pad_frames = self.codec_chunk_size - codec_tokens.shape[0]
-        if pad_frames > 0:
-            codec_tokens = torch.cat([
-                codec_tokens,
-                torch.zeros(pad_frames, num_q, dtype=codec_tokens.dtype),
-            ], dim=0)
+        codes_np = codec_tokens.cpu().numpy().astype(np.int64)  # (T, Q)
 
-        codes_np = codec_tokens.cpu().numpy().astype(np.int64)
+        # Calculate padding for the time dimension (axis 0)
+        pad_frames = self.codec_chunk_size - codes_np.shape[0]
+        if pad_frames > 0:
+            codes_np = np.pad(codes_np, ((0, pad_frames), (0, 0)), mode='constant', constant_values=0)
+
+        # Add batch dimension
         codes_np = np.expand_dims(codes_np, axis=0)  # [T, Q] -> [1, T, Q]
 
         input_tensor = pb_utils.Tensor("audio_codes", codes_np)
@@ -271,8 +267,12 @@ class TritonPythonModel:
         if audio.ndim > 1:
             audio = audio[0]
 
-        expected_samples = actual_frames * self._samples_per_frame
-        return audio[:expected_samples]
+        left_pad = ctx_frames * self._samples_per_frame
+        right_pad = pad_frames * self._samples_per_frame
+        if right_pad > 0:
+            return audio[left_pad: -right_pad]
+        else:
+            return audio[left_pad:]
 
     def _send_audio_chunk(self, response_sender, audio: np.ndarray, final: bool):
         out = pb_utils.Tensor("audio", audio.astype(np.float32))
@@ -317,12 +317,8 @@ class TritonPythonModel:
                 chunk_tokens, ctx, is_final = item
 
                 t0 = time.perf_counter()
-                audio = self._decode_codec_single(chunk_tokens,
-                                                  chunk_tokens.shape[0])
+                audio = self._decode_codec_single(chunk_tokens, ctx)
                 t1 = time.perf_counter()
-
-                trim = ctx * self._samples_per_frame
-                audio = audio[trim:]
 
                 self._send_audio_chunk(response_sender, audio, final=is_final)
                 finalized = is_final
@@ -382,10 +378,7 @@ class TritonPythonModel:
 
         generated_codecs = [first_token]
 
-        chunk_size = self.codec_chunk_size
-        left_context = self.codec_left_context
         sent_frames = 0
-
         codec_q: queue.Queue = queue.Queue()
         state = {
             "t_first_audio": None,
@@ -425,28 +418,24 @@ class TritonPythonModel:
             generated_codecs.append(next_tokens)
             total_frames = len(generated_codecs)
 
-            if sent_frames == 0:
-                ctx = 0
-                needed = chunk_size
-            else:
-                ctx = left_context
-                needed = chunk_size - left_context
 
-            if total_frames - sent_frames >= needed:
+            new_frames = total_frames - sent_frames
+            if new_frames >= self.codec_chunk_size - self.codec_left_context:
+                # send new frames for decoding
+                ctx = min(sent_frames, self.codec_left_context)
                 chunk = torch.cat(
-                    generated_codecs[sent_frames - ctx : sent_frames + needed],
+                    generated_codecs[sent_frames - ctx : sent_frames + new_frames],
                     dim=0,
                 )
                 codec_q.put((chunk, ctx, False))
-                sent_frames += needed
+                sent_frames += new_frames
 
         t_decode_end = time.perf_counter()
 
         total_frames = len(generated_codecs)
         remaining = total_frames - sent_frames
-
         if remaining > 0:
-            ctx = left_context if sent_frames > 0 else 0
+            ctx = min(sent_frames, self.codec_left_context)
             chunk = torch.cat(
                 generated_codecs[sent_frames - ctx :], dim=0,
             )

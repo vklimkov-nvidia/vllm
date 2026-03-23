@@ -53,7 +53,7 @@ parameters {
 }
 parameters {
   key: "codec_chunk_size"
-  value: { string_value: "128" }
+  value: { string_value: "35" }
 }
 parameters {
   key: "codec_left_context"
