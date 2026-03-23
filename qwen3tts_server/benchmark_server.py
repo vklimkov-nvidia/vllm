@@ -29,6 +29,8 @@ class RequestResult:
     text: str
     num_samples: int
     duration_s: float
+    ttfa_s: float = 0.0
+    num_chunks: int = 1
     error: str | None = None
 
 
@@ -53,6 +55,27 @@ def _make_inputs(text: str, language: str = "english"):
     return [text_input, lang_input], outputs
 
 
+def _collect_streaming_response(result_q: queue.Queue, timeout: float = 120):
+    """Collect all streamed audio chunks for a single request.
+
+    Returns (chunks, error_str, ttfa_elapsed) where ttfa_elapsed is the
+    time from call start to the first audio chunk (set by caller).
+    """
+    chunks = []
+    while True:
+        result, error = result_q.get(timeout=timeout)
+        if error:
+            return chunks, str(error)
+
+        audio = result.as_numpy("audio").squeeze()
+        if audio.size > 0:
+            chunks.append(audio)
+
+        response = result.get_response()
+        if "triton_final_response" in response.parameters:
+            return chunks, None
+
+
 def worker(
     worker_id: int,
     triton_url: str,
@@ -62,8 +85,16 @@ def worker(
     stats: BenchmarkStats,
 ):
     result_q: queue.Queue = queue.Queue()
+    first_chunk_time: list[float | None] = [None]
 
     def _on_response(result, error):
+        if first_chunk_time[0] is None and result is not None:
+            try:
+                audio = result.as_numpy("audio").squeeze()
+                if audio.size > 0:
+                    first_chunk_time[0] = time.perf_counter()
+            except Exception:
+                pass
         result_q.put((result, error))
 
     client = grpcclient.InferenceServerClient(url=triton_url)
@@ -79,6 +110,7 @@ def worker(
             text = random.choice(texts)
             inputs, outputs = _make_inputs(text)
 
+            first_chunk_time[0] = None
             t0 = time.perf_counter()
             client.async_stream_infer(
                 model_name=MODEL_NAME,
@@ -86,19 +118,27 @@ def worker(
                 outputs=outputs,
             )
 
-            result, error = result_q.get(timeout=120)
+            chunks, error_str = _collect_streaming_response(result_q)
             elapsed = time.perf_counter() - t0
+            ttfa = (first_chunk_time[0] - t0) if first_chunk_time[0] else elapsed
 
-            if error:
-                stats.add(RequestResult(text=text, num_samples=0, duration_s=elapsed, error=str(error)))
-                print(f"[worker {worker_id:02d}] request {task_idx} FAILED — {error}")
+            if error_str:
+                stats.add(RequestResult(
+                    text=text, num_samples=0, duration_s=elapsed,
+                    ttfa_s=ttfa, error=error_str,
+                ))
+                print(f"[worker {worker_id:02d}] request {task_idx} FAILED — {error_str}")
             else:
-                audio = result.as_numpy("audio").squeeze()
+                audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
                 num_samples = len(audio)
-                stats.add(RequestResult(text=text, num_samples=num_samples, duration_s=elapsed))
+                stats.add(RequestResult(
+                    text=text, num_samples=num_samples, duration_s=elapsed,
+                    ttfa_s=ttfa, num_chunks=len(chunks),
+                ))
                 print(
                     f"[worker {worker_id:02d}] request {task_idx} done — "
-                    f"{num_samples / SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s"
+                    f"{num_samples / SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s "
+                    f"(TTFA: {ttfa:.3f}s, {len(chunks)} chunks)"
                 )
     finally:
         client.stop_stream()
@@ -186,15 +226,24 @@ def main():
     print(f"  Throughput:               {len(successes) / wall_elapsed:.2f} requests/s")
 
     if successes:
-        latencies = [r.duration_s for r in successes]
-        latencies.sort()
+        latencies = sorted(r.duration_s for r in successes)
+        ttfas = sorted(r.ttfa_s for r in successes)
+        avg_chunks = sum(r.num_chunks for r in successes) / len(successes)
         print()
-        print("  Per-request latency:")
+        print("  Per-request latency (end-to-end):")
         print(f"    min:    {latencies[0]:.3f} s")
         print(f"    median: {latencies[len(latencies) // 2]:.3f} s")
         print(f"    p90:    {latencies[int(len(latencies) * 0.9)]:.3f} s")
         print(f"    p99:    {latencies[int(len(latencies) * 0.99)]:.3f} s")
         print(f"    max:    {latencies[-1]:.3f} s")
+        print()
+        print("  Time to first audio (TTFA):")
+        print(f"    min:    {ttfas[0]:.3f} s")
+        print(f"    median: {ttfas[len(ttfas) // 2]:.3f} s")
+        print(f"    p90:    {ttfas[int(len(ttfas) * 0.9)]:.3f} s")
+        print(f"    max:    {ttfas[-1]:.3f} s")
+        print()
+        print(f"  Avg chunks per request: {avg_chunks:.1f}")
 
     print("=" * 70)
 

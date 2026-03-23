@@ -1,14 +1,15 @@
 """
-Triton Python Model for Qwen3-TTS end-to-end inference.
+Triton Python Model for Qwen3-TTS end-to-end **streaming** inference.
 
 Pipeline:
   1. Receive text (+ optional language) from Triton request
   2. Tokenize text with HuggingFace processor
   3. Run TorchScript PrefillAssembler to build dense prefill embeddings
-  4. Submit to vLLM engine for autoregressive codec token generation
-  5. Decode codec tokens to waveform via BLS call to the codec_decoder model
-     (Triton's dynamic batcher batches these calls for efficient TRT inference)
-  6. Return audio waveform as Triton response
+  4. Run vLLM decode loop; every time codec_chunk_size frames accumulate,
+     decode the chunk to audio via BLS (codec_decoder) and send it back
+     as a partial Triton response.  The final partial response carries
+     the TRITONSERVER_RESPONSE_COMPLETE_FINAL flag.
+  5. Client concatenates received audio chunks.
 
 Required artifacts in the model directory:
   - reference.pt              : pre-extracted speaker data (speaker_embedding,
@@ -34,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -62,24 +64,20 @@ def _get_param(parameters: dict, key: str, default: str) -> str:
 
 
 class TritonPythonModel:
-    """Qwen3-TTS end-to-end Triton model (orchestrator).
+    """Qwen3-TTS streaming Triton model (orchestrator).
 
     Inputs  (per request):
         text     : STRING [1]        — text to synthesize
         language : STRING [1]        — optional, codec language (e.g. "english", "auto")
 
-    Outputs (per request):
-        audio    : FP32 [samples]    — synthesized waveform @ 24 kHz
+    Outputs (streamed, multiple responses per request):
+        audio    : FP32 [samples]    — audio chunk @ 24 kHz
 
-    With max_batch_size > 0 and dynamic_batching enabled, Triton collects
-    up to N requests before calling execute().  Each request is processed
-    concurrently via a thread pool:
-      - PrefillAssembler runs in-thread (lightweight, GPU, thread-safe)
-      - vLLM generation runs a synchronous decode loop per thread; the
-        engine batches across active requests internally
-      - Codec decoding is dispatched via BLS to the ``codec_decoder`` model,
-        whose own dynamic batcher groups concurrent decode requests into
-        efficient TRT batches
+    The model is **decoupled**: each request receives multiple partial
+    responses (one per audio chunk) followed by a final response with
+    the TRITONSERVER_RESPONSE_COMPLETE_FINAL flag.  Audio chunks are
+    sent as soon as codec_chunk_size frames have been generated, so the
+    client starts receiving audio well before the full utterance is done.
     """
 
     # ------------------------------------------------------------------
@@ -230,77 +228,6 @@ class TritonPythonModel:
         return prefill  # [1, S, D]
 
     # ------------------------------------------------------------------
-    # vLLM generation: prefill_emb -> codec tokens
-    #
-    # This is a *synchronous* method designed to run in a thread-pool
-    # thread.  The async parts (add_request, queue.get, abort) are
-    # dispatched to the dedicated event loop via run_coroutine_threadsafe.
-    # The decode loop itself runs synchronously in the calling thread,
-    # which allows multiple threads to drive their own decode loops
-    # concurrently — vLLM's engine batches across all active requests.
-    # ------------------------------------------------------------------
-
-    def _generate_codec_tokens(self, prefill_emb: torch.Tensor) -> torch.Tensor:
-        t_total_start = time.perf_counter()
-
-        request_id = str(uuid.uuid4())
-        prompt_len = prefill_emb.shape[0]
-
-        inputs = {
-            "prompt_token_ids": [0] * prompt_len,
-            "custom_inputs": {
-                "combined_embeddings": prefill_emb,
-            },
-        }
-
-        t_prefill_start = time.perf_counter()
-        queue = asyncio.run_coroutine_threadsafe(
-            self.engine.add_request(request_id, inputs, self.sampling_params),
-            self._loop,
-        ).result(timeout=30)
-
-        prefill_output = asyncio.run_coroutine_threadsafe(
-            queue.get(), self._loop,
-        ).result(timeout=60)
-        t_prefill_end = time.perf_counter()
-
-        next_input = prefill_output.outputs[0].custom_outputs["next_input_embeddings"][-1:, :]
-        next_tokens = prefill_output.outputs[0].custom_outputs["codes"][-1:]
-
-        generated_codecs = [next_tokens]
-
-        decode_times = []
-        for step in range(self.max_tokens - 1):
-            t_step_start = time.perf_counter()
-            outputs = self.engine.decode_step_shm(
-                request_id,
-                custom_inputs={"combined_embeddings": next_input},
-            )
-            t_step_end = time.perf_counter()
-            decode_times.append(t_step_end - t_step_start)
-
-            next_input = outputs["next_input_embeddings"][-1:, :]
-            next_tokens = outputs["codes"][-1:].clone()
-
-            if next_tokens[0, 0].item() == self.codec_eos_token_id:
-                break
-
-            generated_codecs.append(next_tokens)
-
-        asyncio.run_coroutine_threadsafe(
-            self.engine.abort(request_id), self._loop,
-        ).result(timeout=10)
-
-        t_total_end = time.perf_counter()
-
-        avg_decode = sum(decode_times) / len(decode_times) if decode_times else 0
-        print(f"[vLLM timing] prefill: {(t_prefill_end - t_prefill_start)*1000:.1f}ms | "
-              f"decode steps: {len(decode_times)} | avg decode_step_shm: {avg_decode*1000:.2f}ms | "
-              f"total generation: {(t_total_end - t_total_start)*1000:.1f}ms", flush=True)
-
-        return torch.cat(generated_codecs, dim=0)  # [T, num_code_groups]
-
-    # ------------------------------------------------------------------
     # Codec decode: tokens -> waveform via BLS to codec_decoder model
     # ------------------------------------------------------------------
 
@@ -347,64 +274,217 @@ class TritonPythonModel:
         expected_samples = actual_frames * self._samples_per_frame
         return audio[:expected_samples]
 
-    def _decode_codec_bls(self, codec_tokens: torch.Tensor) -> np.ndarray:
-        """Decode codec tokens to waveform, chunking if needed.
-
-        When the sequence exceeds codec_chunk_size, it is split into
-        overlapping chunks (with codec_left_context frames of overlap).
-        Each chunk is padded to codec_chunk_size and sent via BLS to
-        codec_decoder.  Triton's dynamic batcher batches these uniform-
-        size chunks across concurrent requests for efficient TRT execution.
-        """
-        total_frames = codec_tokens.shape[0]
-        chunk_size = self.codec_chunk_size
-        left_context = self.codec_left_context
-
-        if total_frames <= chunk_size:
-            return self._decode_codec_single(codec_tokens, total_frames)
-
-        wavs = []
-        start = 0
-        while start < total_frames:
-            ctx = left_context if start >= left_context else start
-            end = min(start + chunk_size - ctx, total_frames)
-            chunk = codec_tokens[start - ctx : end]
-            wav_chunk = self._decode_codec_single(chunk, chunk.shape[0])
-            trim_samples = ctx * self._samples_per_frame
-            wavs.append(wav_chunk[trim_samples:])
-            start = end
-
-        logger.info(
-            "Chunked codec decode: %d frames -> %d chunks (chunk_size=%d, left_context=%d)",
-            total_frames, len(wavs), chunk_size, left_context,
+    def _send_audio_chunk(self, response_sender, audio: np.ndarray, final: bool):
+        out = pb_utils.Tensor("audio", audio.astype(np.float32))
+        flags = (pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL if final else 0)
+        response_sender.send(
+            pb_utils.InferenceResponse(output_tensors=[out]),
+            flags=flags,
         )
-        return np.concatenate(wavs)
 
     # ------------------------------------------------------------------
-    # Full pipeline: text -> audio  (runs in a thread-pool thread)
+    # Codec worker thread: reads (chunk_tokens, ctx) from a queue,
+    # decodes via BLS, and sends audio to the client.  Runs in its
+    # own thread so the vLLM decode loop is never blocked by TRT.
     # ------------------------------------------------------------------
 
-    def _synthesize(self, text: str, language: str) -> np.ndarray:
-        t_synth_start = time.perf_counter()
+    def _codec_worker(self, codec_q, response_sender, state):
+        """Drains *codec_q* until a sentinel is received.
 
-        t_prefill_build_start = time.perf_counter()
+        Each item is a ``(chunk_tokens, ctx_frames, is_final)`` tuple.
+        The chunk is decoded via BLS and streamed back as a partial
+        response.  The last real chunk carries ``COMPLETE_FINAL`` so no
+        empty trailing response is needed.
+
+        **All** sends happen on this thread so that Triton sees a
+        single-threaded FIFO stream of responses.
+
+        *state* is a dict written by this thread and read (after join)
+        by the caller for timing / error propagation.
+        """
+        finalized = False
+        try:
+            while True:
+                item = codec_q.get()
+                if item is None:
+                    self._send_audio_chunk(
+                        response_sender,
+                        np.array([], dtype=np.float32),
+                        final=True,
+                    )
+                    finalized = True
+                    break
+                chunk_tokens, ctx, is_final = item
+
+                t0 = time.perf_counter()
+                audio = self._decode_codec_single(chunk_tokens,
+                                                  chunk_tokens.shape[0])
+                t1 = time.perf_counter()
+
+                trim = ctx * self._samples_per_frame
+                audio = audio[trim:]
+
+                self._send_audio_chunk(response_sender, audio, final=is_final)
+                finalized = is_final
+
+                state["chunks_sent"] += 1
+                state["total_samples"] += len(audio)
+                state["codec_decode_ms"] += (t1 - t0) * 1000
+                if state["t_first_audio"] is None:
+                    state["t_first_audio"] = time.perf_counter()
+
+                if is_final:
+                    return
+        except Exception as e:
+            state["error"] = e
+            if not finalized:
+                try:
+                    response_sender.send(
+                        pb_utils.InferenceResponse(output_tensors=[]),
+                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
+                    )
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Streaming pipeline: the decode thread generates codec tokens at
+    # full speed and feeds chunks to the codec worker via a Queue.
+    # ------------------------------------------------------------------
+
+    def _synthesize_streaming(self, text: str, language: str, response_sender):
+        t_start = time.perf_counter()
+
         prefill = self._build_prefill(text, language)
         prefill_emb = prefill[0].contiguous().cpu()
-        t_prefill_build_end = time.perf_counter()
+        t_prefill_done = time.perf_counter()
 
-        codec_tokens = self._generate_codec_tokens(prefill_emb)
-        print(f"Codec tokens to decode: {codec_tokens.shape[0]} frames x {codec_tokens.shape[1]} quantizers", flush=True)
+        request_id = str(uuid.uuid4())
+        prompt_len = prefill_emb.shape[0]
 
-        t_codec_start = time.perf_counter()
-        audio = self._decode_codec_bls(codec_tokens)
-        t_codec_end = time.perf_counter()
+        inputs = {
+            "prompt_token_ids": [0] * prompt_len,
+            "custom_inputs": {"combined_embeddings": prefill_emb},
+        }
 
-        t_synth_end = time.perf_counter()
-        print(f"[Pipeline timing] prefill_build: {(t_prefill_build_end - t_prefill_build_start)*1000:.1f}ms | "
-              f"codec decode: {(t_codec_end - t_codec_start)*1000:.1f}ms | "
-              f"total synthesis: {(t_synth_end - t_synth_start)*1000:.1f}ms", flush=True)
+        output_queue = asyncio.run_coroutine_threadsafe(
+            self.engine.add_request(request_id, inputs, self.sampling_params),
+            self._loop,
+        ).result(timeout=30)
 
-        return audio
+        prefill_output = asyncio.run_coroutine_threadsafe(
+            output_queue.get(), self._loop,
+        ).result(timeout=60)
+
+        next_input = prefill_output.outputs[0].custom_outputs[
+            "next_input_embeddings"
+        ][-1:, :]
+        first_token = prefill_output.outputs[0].custom_outputs["codes"][-1:]
+
+        generated_codecs = [first_token]
+
+        chunk_size = self.codec_chunk_size
+        left_context = self.codec_left_context
+        sent_frames = 0
+
+        codec_q: queue.Queue = queue.Queue()
+        state = {
+            "t_first_audio": None,
+            "total_samples": 0,
+            "chunks_sent": 0,
+            "codec_decode_ms": 0.0,
+            "error": None,
+        }
+        codec_thread = threading.Thread(
+            target=self._codec_worker,
+            args=(codec_q, response_sender, state),
+            daemon=True,
+        )
+        codec_thread.start()
+
+        t_decode_start = time.perf_counter()
+        decode_step_times = []
+
+        for step in range(self.max_tokens - 1):
+            if state["error"] is not None:
+                break
+
+            t_step = time.perf_counter()
+            outputs = self.engine.decode_step_shm(
+                request_id,
+                custom_inputs={"combined_embeddings": next_input},
+            )
+            decode_step_times.append(time.perf_counter() - t_step)
+
+            next_input = outputs["next_input_embeddings"][-1:, :]
+            next_tokens = outputs["codes"][-1:].clone()
+
+            if next_tokens[0, 0].item() == self.codec_eos_token_id:
+                break
+
+            generated_codecs.append(next_tokens)
+            total_frames = len(generated_codecs)
+
+            if sent_frames == 0:
+                ctx = 0
+                needed = chunk_size
+            else:
+                ctx = left_context
+                needed = chunk_size - left_context
+
+            if total_frames - sent_frames >= needed:
+                chunk = torch.cat(
+                    generated_codecs[sent_frames - ctx : sent_frames + needed],
+                    dim=0,
+                )
+                codec_q.put((chunk, ctx, False))
+                sent_frames += needed
+
+        t_decode_end = time.perf_counter()
+
+        total_frames = len(generated_codecs)
+        remaining = total_frames - sent_frames
+
+        if remaining > 0:
+            ctx = left_context if sent_frames > 0 else 0
+            chunk = torch.cat(
+                generated_codecs[sent_frames - ctx :], dim=0,
+            )
+            codec_q.put((chunk, ctx, True))
+        else:
+            codec_q.put(None)
+
+        t_abort_start = time.perf_counter()
+        asyncio.run_coroutine_threadsafe(
+            self.engine.abort(request_id), self._loop,
+        ).result(timeout=10)
+        t_abort_end = time.perf_counter()
+
+        codec_thread.join(timeout=30)
+
+        if state["error"] is not None:
+            raise state["error"]
+
+        t_first_audio = state["t_first_audio"] or time.perf_counter()
+        t_end = time.perf_counter()
+        avg_step = (sum(decode_step_times) / len(decode_step_times) * 1000
+                    if decode_step_times else 0)
+        logger.info(
+            "[Streaming] prefill: %.1fms | vllm_prefill: %.1fms | "
+            "decode_loop: %.1fms (%d steps, avg %.2fms/step) | "
+            "abort: %.1fms | codec_bls: %.1fms (%d chunks) | "
+            "TTFA: %.1fms | total: %.1fms | "
+            "frames: %d | audio: %.2fs",
+            (t_prefill_done - t_start) * 1000,
+            (t_decode_start - t_prefill_done) * 1000,
+            (t_decode_end - t_decode_start) * 1000,
+            len(decode_step_times), avg_step,
+            (t_abort_end - t_abort_start) * 1000,
+            state["codec_decode_ms"], state["chunks_sent"],
+            (t_first_audio - t_start) * 1000,
+            (t_end - t_start) * 1000,
+            total_frames,
+            state["total_samples"] / 24000.0,
+        )
 
     # ------------------------------------------------------------------
     # Triton execute — concurrent via thread pool
@@ -442,22 +522,19 @@ class TritonPythonModel:
 
     def _handle_request(self, text: str, language: str, response_sender):
         try:
-            audio = self._synthesize(text, language)
-            logger.info("Generated %d audio samples (%.2f s @ 24 kHz)", len(audio), len(audio) / 24000.0)
-            out_tensor = pb_utils.Tensor("audio", audio)
-            response_sender.send(
-                pb_utils.InferenceResponse(output_tensors=[out_tensor]),
-                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
-            )
+            self._synthesize_streaming(text, language, response_sender)
         except Exception as e:
             logger.error("Request failed: %s", e, exc_info=True)
-            response_sender.send(
-                pb_utils.InferenceResponse(
-                    output_tensors=[],
-                    error=pb_utils.TritonError(str(e)),
-                ),
-                flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
-            )
+            try:
+                response_sender.send(
+                    pb_utils.InferenceResponse(
+                        output_tensors=[],
+                        error=pb_utils.TritonError(str(e)),
+                    ),
+                    flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL,
+                )
+            except Exception:
+                pass
 
     def finalize(self):
         logger.info("Shutting down Qwen3-TTS TritonPythonModel")
