@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir \
 #    --no-build-isolation: reuse the base image's torch/CUDA for compilation
 #    --no-deps: don't install/upgrade any runtime deps (preserves TRT-LLM, TensorRT, torch, etc.)
 #    WARNING: TORCH_CUDA_ARCH_LIST="8.6" is for RTX6000, modify if needed
-RUN git clone --single-branch --branch vklimkov/qwen3_tts \
+RUN git clone --single-branch --branch vklimkov/qwen3_tts_voices \
         https://github.com/vklimkov-nvidia/vllm.git /tmp/vllm-fork && \
     cd /tmp/vllm-fork && \
     MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install --no-build-isolation --no-deps . && \

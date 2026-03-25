@@ -31,14 +31,19 @@ def _adjust_config(config: dict) -> None:
     """Apply vLLM-specific adjustments to the config dict (in place)."""
 
     # 1. Add custom_input_specs for vLLM prompt-embed support
+    repetition_window = 256
     if "custom_input_specs" not in config:
         print("  Adding custom_input_specs...")
-        dim = 2048  # fallback
-        if "talker_config" in config:
-            tc = config["talker_config"]
-            dim = tc.get("text_hidden_size", tc.get("hidden_size", dim))
+        if "talker_config" not in config or "hidden_size" not in config["talker_config"]:
+            raise ValueError(
+                "Cannot determine talker hidden_size from config.json. "
+                "Ensure talker_config.hidden_size is present."
+            )
+        dim = config["talker_config"]["hidden_size"]
+        print(f"  Talker hidden_size (from config): {dim}")
         config["custom_input_specs"] = [
-            {"name": "combined_embeddings", "dim": dim}
+            {"name": "combined_embeddings", "dim": dim},
+            {"name": "prev_group0_tokens", "dim": repetition_window, "dtype": "int64"}
         ]
 
     # 2. Add custom_outputs
@@ -65,7 +70,8 @@ def _adjust_config(config: dict) -> None:
         "temperature": 0.9,
         "top_k": 50,
         "top_p": 1.0,
-        "repetition_penalty": 1.0,
+        "repetition_penalty": 1.1,
+        "repetition_window": repetition_window
     }
     for key, val in defaults.items():
         if key not in config:

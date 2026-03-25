@@ -1,19 +1,20 @@
-this branch has qwen3tts impl. to run it, convert the checkpoint:
-```
-python qwen3tts_scripts/convert_qwen3tts_checkpoint.py ~/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3/ qwen3tts_server/models/qwen3_tts_vllm_model
+Qwen3-TTS CustomVoice server using vLLM + Triton.
+
+Uses built-in speaker "Aiden" — no reference audio needed.
+
+## 1. Convert checkpoint
+
+```bash
+python qwen3tts_scripts/convert_qwen3tts_checkpoint.py \
+    ~/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/<hash>/ \
+    qwen3tts_server/models/qwen3_tts_vllm_model
 ```
 
-see `demo_qwen3_tts.ipynb` on how to run it or `qwen3tts_scripts/benchmark_qwen3_tts.py` to benchmark the implementation.
+## 2. Build and run the Triton container
 
-
-in order to serve the model, we need tritron inference server.
-```
+```bash
 cd qwen3tts_server
 docker build -t qwen3tts_server_py .
-```
-
-Run it
-```
 docker run --rm -it --gpus all \
     --shm-size=8g \
     -p 8000:8000 \
@@ -22,24 +23,38 @@ docker run --rm -it --gpus all \
     /bin/bash
 ```
 
-Inside the container, trace other model components:
+## 3. Export model components (inside container)
+
+```bash
+# trace prefill encoder (embeds speaker + text into prefill)
+python3 export_prefill_encoder.py \
+    --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/<hash>/ \
+    --speaker Aiden \
+    --text "hello world!" \
+    --language auto \
+    --output models/prefill.pt \
+    --device cuda --dtype bfloat16 \
+    --torchscript-path models/encoder.jit
+
+# trace codec (converts audio tokens → waveform)
+python3 export_codec.py \
+    --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/<hash>/ \
+    --onnx-path models/codec.onnx \
+    --trt-path model_repository/codec_decoder/1/codec.trt \
+    --trt-fp16 \
+    --trt-frames-profile 1 35 64 \
+    --frames 35
 ```
-# capture reference speaker information
-python3 extract_reference.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3/ --ref-text "I felt like, you know, you can be both, right? I mean, you can be both. What he was saying to me is like, are you here to do the work? Um, and you know, I in I internalize that. If your end goal is just to be a movie star, well" --ref-audio referencespeaker.wav --language english --output models/reference.pt --dtype float32
 
-# trace encoder that combines reference speaker info and text for synthesis.
-# this is a lighweight module that is run per request.
-python3 export_prefill_encoder.py --model-path models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3/ --ref-data models/reference.pt --text "hello world!" --language "english" --output models/prefill.pt --device cuda --dtype bfloat16 --torchscript-path models/encoder.jit
+## 4. Start the server
 
-# trace codec that converts audio tokens to audio
-# we pass constant shape input to codec. by default 128 frames (10 sec) for max throughput, specify less for better ttft
-python3 export_codec.py --tokenizer-path models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8/ --onnx-path models/codec.onnx --trt-path model_repository/codec_decoder/1/codec.trt --trt-fp16 --trt-frames-profile 1 35 64 --frames 35
-```
-
-Finally you can start a server with 
-
-```
+```bash
 tritonserver --model-repository=model_repository
 ```
 
-and send requests as shown in `run_request.ipynb`
+## 5. Send requests
+
+See `run_request.ipynb`. Just send text + optional language, speaker is Aiden by default.
+
+To change the default speaker, edit `default_speaker` in `model_repository/qwen3_tts/config.pbtxt`.
+Available speakers: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee.
