@@ -2,8 +2,8 @@
 Triton Python Model for Qwen3-TTS CustomVoice streaming inference.
 
 Pipeline:
-  1. Tokenize text, build dense prefill embeddings via TorchScript PrefillAssembler
-  2. Run vLLM decode loop; stream codec chunks to codec_decoder via BLS
+  1. Tokenize text into text_ids + acoustic_ids via build_prefill_tokens
+  2. Run vLLM prefill + decode loop; stream codec chunks to codec_decoder via BLS
   3. Client concatenates received audio chunks @ 24 kHz
 """
 
@@ -21,6 +21,7 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import triton_python_backend_utils as pb_utils
+from vllm.model_executor.models.qwen3_tts import Qwen3TTSTalkerForConditionalGeneration
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s]: %(message)s",
@@ -46,12 +47,6 @@ class TritonPythonModel:
         params = self.model_config.get("parameters", {})
 
         model_dir = Path(os.path.dirname(__file__))
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }[_get_param(params, "dtype", "bfloat16")]
 
         self.max_tokens = int(_get_param(params, "max_tokens", "2048"))
         self.codec_chunk_size = int(_get_param(params, "codec_chunk_size", "128"))
@@ -60,7 +55,6 @@ class TritonPythonModel:
         self._samples_per_frame = int(24000 / 12.5)
 
         self._load_tokenizer(params, model_dir)
-        self._load_prefill_assembler(params, model_dir)
         self._load_speaker_config(params, model_dir)
         self._init_vllm_engine(params, model_dir)
 
@@ -72,18 +66,17 @@ class TritonPythonModel:
         vllm_model = _get_param(params, "vllm_model_path", str(model_dir / "vllm_model"))
         self.tokenizer = AutoTokenizer.from_pretrained(vllm_model, trust_remote_code=True)
 
-    def _load_prefill_assembler(self, params: dict, model_dir: Path):
-        pa_path = model_dir / _get_param(params, "prefill_assembler_path", "prefill_assembler.pt")
-        self.prefill_assembler = torch.jit.load(str(pa_path), map_location=self.device)
-        self.prefill_assembler.eval()
-
     def _load_speaker_config(self, params: dict, model_dir: Path):
         vllm_model = _get_param(params, "vllm_model_path", str(model_dir / "vllm_model"))
         with open(str(Path(vllm_model) / "config.json")) as f:
             cfg = json.load(f)
 
+        self._model_config_dict = cfg
+
         tc = cfg.get("talker_config", {})
         self.codec_eos_token_id = int(tc.get("codec_eos_token_id", 2150))
+        self.tts_pad_token_id = int(cfg.get("tts_pad_token_id"))
+        self.num_code_groups = int(tc.get("num_code_groups", 16))
         self.codec_language_mapping: Optional[Dict[str, int]] = tc.get("codec_language_id")
         self.spk_id_mapping: Dict[str, int] = tc.get("spk_id", {})
         self.spk_is_dialect: Dict[str, object] = tc.get("spk_is_dialect", {})
@@ -96,7 +89,6 @@ class TritonPythonModel:
                 logger.warning("Requested speaker not found, using '%s'", self.default_speaker)
             else:
                 raise ValueError("No spk_id entries in model config.")
-        self.default_spk_id = self.spk_id_mapping[self.default_speaker]
 
     def _init_vllm_engine(self, params: dict, model_dir: Path):
         os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
@@ -140,31 +132,21 @@ class TritonPythonModel:
     async def _start_output_handler(self):
         self.engine._run_output_handler()
 
-    def _tokenize_text(self, text: str) -> torch.Tensor:
-        synth_full = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        ids = self.tokenizer(synth_full, return_tensors="pt", padding=True)["input_ids"]
-        if ids.dim() == 1:
-            ids = ids.unsqueeze(0)
-        return ids[:, 3:-5].to(torch.long)
+    def _resolve_language(self, language: str, speaker: str) -> Optional[str]:
+        """Resolve language string for build_prefill_tokens.
 
-    def _resolve_language_id(self, language: str) -> Optional[torch.Tensor]:
+        Returns a language name from codec_language_id, or None to omit
+        language (nothink control path).
+        """
         key = language.strip().lower()
         if key == "auto":
+            dialect = self.spk_is_dialect.get(speaker)
+            if dialect and self.codec_language_mapping and dialect in self.codec_language_mapping:
+                return dialect
             return None
         if self.codec_language_mapping and key in self.codec_language_mapping:
-            return torch.tensor([self.codec_language_mapping[key]], device=self.device, dtype=torch.long)
-
-        dialect = self.spk_is_dialect.get(self.default_speaker)
-        if (dialect and key in ("chinese", "auto")
-                and self.codec_language_mapping and dialect in self.codec_language_mapping):
-            return torch.tensor([self.codec_language_mapping[dialect]], device=self.device, dtype=torch.long)
+            return key
         return None
-
-    def _build_prefill(self, text: str, language: str) -> torch.Tensor:
-        text_ids = self._tokenize_text(text).to(self.device, torch.long)
-        spk_id = torch.tensor([self.default_spk_id], device=self.device, dtype=torch.long)
-        with torch.inference_mode():
-            return self.prefill_assembler(spk_id, text_ids, self._resolve_language_id(language))
 
     def _decode_codec_single(self, codec_tokens: torch.Tensor, ctx_frames: int) -> np.ndarray:
         codes_np = codec_tokens.cpu().numpy().astype(np.int64)
@@ -250,16 +232,24 @@ class TritonPythonModel:
                 except Exception:
                     pass
 
-    def _synthesize_streaming(self, text: str, language: str, response_sender):
+    def _synthesize_streaming(self, text: str, language: str,
+                              speaker: str, response_sender):
         t_start = time.perf_counter()
         request_deadline = t_start + self.max_request_timeout_s
 
-        prefill_emb = self._build_prefill(text, language)[0].contiguous().cpu()
+        resolved_lang = self._resolve_language(language, speaker)
+        text_ids, acoustic_ids = Qwen3TTSTalkerForConditionalGeneration.build_prefill_tokens(
+            tokenizer=self.tokenizer,
+            text=text,
+            speaker=speaker,
+            language=resolved_lang,
+            config=self._model_config_dict,
+        )
         t_prefill = time.perf_counter()
 
         request_id = str(uuid.uuid4())
         rid = request_id[:8]
-        prompt_len = prefill_emb.shape[0]
+        prompt_len = text_ids.shape[0]
         _W = self._rep_penalty_window
 
         codec_q: queue.Queue = queue.Queue()
@@ -274,7 +264,8 @@ class TritonPythonModel:
                 self.engine.add_request(request_id, {
                     "prompt_token_ids": [0] * prompt_len,
                     "custom_inputs": {
-                        "combined_embeddings": prefill_emb,
+                        "text_ids": text_ids,
+                        "acoustic_ids": acoustic_ids,
                         "prev_group0_tokens": torch.full(
                             (prompt_len, _W), self.codec_eos_token_id + 1, dtype=torch.long),
                     },
@@ -288,14 +279,16 @@ class TritonPythonModel:
             t_vllm_prefill = time.perf_counter()
 
             custom_out = prefill_output.outputs[0].custom_outputs
-            next_input = custom_out["next_input_embeddings"][-1:, :]
-            first_token = custom_out["codes"][-1:]
+            first_token = custom_out["codes"][-1:]  # [1, num_code_groups]
             generated_codecs = [first_token]
 
             prev_g0 = torch.full((1, _W), self.codec_eos_token_id + 1, dtype=torch.long)
             prev_g0[0, 0] = first_token[0, 0].item()
             g0_write_pos = 1
             sent_frames = 0
+
+            decode_text_id = torch.tensor([self.tts_pad_token_id], dtype=torch.long)
+            decode_acoustic_id = first_token.clone()  # [1, num_code_groups]
 
             codec_thread = threading.Thread(
                 target=self._codec_worker, args=(codec_q, response_sender, state), daemon=True)
@@ -316,7 +309,8 @@ class TritonPythonModel:
                     outputs = self.engine.decode_step_shm(
                         request_id,
                         custom_inputs={
-                            "combined_embeddings": next_input,
+                            "text_ids": decode_text_id,
+                            "acoustic_ids": decode_acoustic_id,
                             "prev_group0_tokens": prev_g0,
                         },
                         timeout=60,
@@ -326,13 +320,13 @@ class TritonPythonModel:
                     break
                 decode_step_times.append(time.perf_counter() - t_step)
 
-                next_input = outputs["next_input_embeddings"][-1:, :]
-                next_tokens = outputs["codes"][-1:].clone()
+                next_tokens = outputs["codes"][-1:].clone()  # [1, num_code_groups]
                 g0_tok = next_tokens[0, 0].item()
                 if g0_tok == self.codec_eos_token_id:
                     break
 
                 generated_codecs.append(next_tokens)
+                decode_acoustic_id = next_tokens
                 prev_g0[0, g0_write_pos % _W] = g0_tok
                 g0_write_pos += 1
 
@@ -372,11 +366,11 @@ class TritonPythonModel:
             rtx_p95 = sorted(rtx)[min(int(len(rtx) * 0.95), len(rtx) - 1)] if rtx else 0
 
             logger.info(
-                "Streaming rid=%s prefill=%.1fms vllm_prefill=%.1fms "
+                "Streaming rid=%s tokenize=%.1fms vllm_prefill=%.1fms "
                 "decode=%.1fms steps=%d step_avg=%.2fms "
                 "abort=%.1fms codec=%.1fms chunks=%d "
                 "ttfa=%.1fms rtx_mean=%.3f rtx_p95=%.3f "
-                "total=%.1fms audio=%.2fs text=%r",
+                "total=%.1fms audio=%.2fs speaker=%s text=%r",
                 rid,
                 (t_prefill - t_start) * 1000,
                 (t_vllm_prefill - t_prefill) * 1000,
@@ -388,6 +382,7 @@ class TritonPythonModel:
                 rtx_mean, rtx_p95,
                 (t_end - t_start) * 1000,
                 state["total_samples"] / 24000.0,
+                speaker,
                 text[:120],
             )
         except Exception:
@@ -407,7 +402,10 @@ class TritonPythonModel:
                 text = pb_utils.get_input_tensor_by_name(request, "text").as_numpy().flatten()[0].decode("utf-8")
                 lang_tensor = pb_utils.get_input_tensor_by_name(request, "language")
                 language = lang_tensor.as_numpy().flatten()[0].decode("utf-8") if lang_tensor else "auto"
-                self._thread_pool.submit(self._handle_request, text, language, response_sender)
+                spk_tensor = pb_utils.get_input_tensor_by_name(request, "speaker")
+                speaker = (spk_tensor.as_numpy().flatten()[0].decode("utf-8")
+                           if spk_tensor else self.default_speaker)
+                self._thread_pool.submit(self._handle_request, text, language, speaker, response_sender)
             except Exception as e:
                 logger.error("Request parse failed: %s", e, exc_info=True)
                 response_sender.send(
@@ -416,9 +414,9 @@ class TritonPythonModel:
                 )
         return None
 
-    def _handle_request(self, text: str, language: str, response_sender):
+    def _handle_request(self, text: str, language: str, speaker: str, response_sender):
         try:
-            self._synthesize_streaming(text, language, response_sender)
+            self._synthesize_streaming(text, language, speaker, response_sender)
         except Exception as e:
             logger.error("Streaming failed: %s", e, exc_info=True)
             try:

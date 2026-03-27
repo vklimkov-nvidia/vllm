@@ -20,7 +20,6 @@ import shutil
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 
@@ -32,6 +31,7 @@ def _adjust_config(config: dict) -> None:
 
     # 1. Add custom_input_specs for vLLM prompt-embed support
     repetition_window = 256
+    codes_num = 16
     if "custom_input_specs" not in config:
         print("  Adding custom_input_specs...")
         if "talker_config" not in config or "hidden_size" not in config["talker_config"]:
@@ -42,17 +42,16 @@ def _adjust_config(config: dict) -> None:
         dim = config["talker_config"]["hidden_size"]
         print(f"  Talker hidden_size (from config): {dim}")
         config["custom_input_specs"] = [
-            {"name": "combined_embeddings", "dim": dim},
+            {"name": "text_ids", "dtype": "int64"},
+            {"name": "acoustic_ids", "dim": codes_num, "dtype": "int64"},
             {"name": "prev_group0_tokens", "dim": repetition_window, "dtype": "int64"}
         ]
 
     # 2. Add custom_outputs
     if "custom_output_specs" not in config:
         print("  Adding custom_outputs...")
-        codes_num = 16
         config["custom_output_specs"] = [
-            {"name": "codes", "dim": codes_num, "dtype": "int64"},
-            {"name": "next_input_embeddings", "dim": dim},
+            {"name": "codes", "dim": codes_num, "dtype": "int64"}
         ]
 
     # 3. Fix rope_scaling in talker_config
@@ -81,39 +80,6 @@ def _adjust_config(config: dict) -> None:
 # ── Weight computation ───────────────────────────────────────────────
 
 
-def _compute_tts_pad_embed(
-    weights: dict[str, torch.Tensor],
-    tts_pad_token_id: int,
-    hidden_act: str,
-) -> torch.Tensor:
-    """Compute tts_pad_embed = text_projection(text_embedding(tts_pad_token_id)).
-
-    This runs the text_projection MLP (linear_fc1 -> act -> linear_fc2)
-    on the text embedding of the pad token, entirely in float32 for
-    numerical precision, then casts back to the embedding dtype.
-    """
-    text_emb_weight = weights["talker.model.text_embedding.weight"]
-    fc1_w = weights["talker.text_projection.linear_fc1.weight"]
-    fc1_b = weights["talker.text_projection.linear_fc1.bias"]
-    fc2_w = weights["talker.text_projection.linear_fc2.weight"]
-    fc2_b = weights["talker.text_projection.linear_fc2.bias"]
-
-    # Look up the pad-token embedding
-    x = text_emb_weight[tts_pad_token_id].float()
-
-    # Forward through the ResizeMLP: linear_fc1 -> act -> linear_fc2
-    x = x @ fc1_w.float().T + fc1_b.float()
-    if hidden_act == "silu":
-        x = F.silu(x)
-    elif hidden_act == "gelu":
-        x = F.gelu(x)
-    else:
-        raise ValueError(f"Unsupported hidden_act: {hidden_act}")
-    x = x @ fc2_w.float().T + fc2_b.float()
-
-    return x.to(text_emb_weight.dtype)
-
-
 def _compute_suppress_mask(
     vocab_size: int,
     codec_eos_token_id: int,
@@ -130,6 +96,77 @@ def _compute_suppress_mask(
         if codec_eos_token_id >= suppress_start:
             mask[codec_eos_token_id] = False
     return mask
+
+
+def _create_acoustic_zero_token(
+    weights: dict[str, torch.Tensor],
+    config: dict,
+) -> int:
+    """Pick a suppressed token and zero its row in ALL codec embeddings.
+
+    Zeroes the chosen token's embedding in the group-0 codec embedding
+    (``talker.model.codec_embedding.weight``) and in each code-predictor
+    codec embedding (groups 1..N-1).  If the code-predictor vocab is too
+    small to contain the chosen token ID, the embedding and lm_head
+    weight tensors are padded with zeroed rows and
+    ``code_predictor_config.vocab_size`` is updated.
+
+    The chosen ID is stored in ``config["talker_config"]["acoustic_zero_token_id"]``.
+
+    Returns the chosen token ID.
+    """
+    tc = config["talker_config"]
+    vocab_size = tc["vocab_size"]
+    codec_eos_token_id = tc["codec_eos_token_id"]
+    suppress_start = vocab_size - 1024
+
+    zero_token_id = suppress_start
+    if zero_token_id == codec_eos_token_id:
+        zero_token_id += 1
+
+    # Group-0 codec embedding (before renaming to talker.code_predictor.*)
+    key = "talker.model.codec_embedding.weight"
+    if key not in weights:
+        raise KeyError(f"Expected weight '{key}' not found in checkpoint")
+    weights[key][zero_token_id] = 0
+    print(f"  acoustic_zero_token_id: {zero_token_id} (zeroed in {key})")
+
+    # Groups 1..N-1: zero (and pad if needed) code-predictor codec embeddings
+    cp_config = tc["code_predictor_config"]
+    cp_vocab = cp_config["vocab_size"]
+    num_cp_groups = cp_config["num_code_groups"] - 1  # groups 1..N-1
+
+    need_pad = zero_token_id >= cp_vocab
+    if need_pad:
+        new_cp_vocab = zero_token_id + 1
+        pad_rows = new_cp_vocab - cp_vocab
+        print(f"  Expanding code_predictor vocab {cp_vocab} -> {new_cp_vocab} "
+              f"(+{pad_rows} rows) to accommodate zero_token_id={zero_token_id}")
+    else:
+        new_cp_vocab = cp_vocab
+
+    for i in range(num_cp_groups):
+        emb_key = f"talker.code_predictor.model.codec_embedding.{i}.weight"
+        if emb_key in weights:
+            if need_pad:
+                w = weights[emb_key]
+                pad = torch.zeros(pad_rows, w.shape[1], dtype=w.dtype)
+                weights[emb_key] = torch.cat([w, pad], dim=0)
+            weights[emb_key][zero_token_id] = 0
+
+        head_key = f"talker.code_predictor.lm_head.{i}.weight"
+        if head_key in weights and need_pad:
+            w = weights[head_key]
+            pad = torch.zeros(pad_rows, w.shape[1], dtype=w.dtype)
+            weights[head_key] = torch.cat([w, pad], dim=0)
+
+    if need_pad:
+        cp_config["vocab_size"] = new_cp_vocab
+    print(f"  Zeroed {num_cp_groups} code-predictor codec embeddings "
+          f"at token {zero_token_id}")
+
+    tc["acoustic_zero_token_id"] = zero_token_id
+    return zero_token_id
 
 
 # ── Weight renaming ──────────────────────────────────────────────────
@@ -191,40 +228,37 @@ def convert(input_dir: str, output_dir: str) -> None:
 
     _adjust_config(config)
 
-    with open(out_path / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"  Wrote {out_path / 'config.json'}")
-
     # ── 2. Load weights ──────────────────────────────────────────
     sf_file = in_path / "model.safetensors"
 
-    # Single safetensors file – load all, add new tensors, save
     print(f"  Loading {sf_file} ...")
     weights = load_file(str(sf_file))
 
     tc = config["talker_config"]
-    tts_pad_embed = _compute_tts_pad_embed(
-        weights, config["tts_pad_token_id"], tc["hidden_act"]
-    )
     suppress_mask = _compute_suppress_mask(
         tc["vocab_size"], tc["codec_eos_token_id"]
     )
 
-    print(f"  tts_pad_embed: shape={tts_pad_embed.shape}, dtype={tts_pad_embed.dtype}")
     print(f"  suppress_mask: shape={suppress_mask.shape}, "
             f"suppressed={suppress_mask.sum().item()} tokens")
 
-    weights["talker.tts_pad_embed"] = tts_pad_embed
     weights["talker.code_predictor.suppress_mask"] = suppress_mask
 
-    # ── 3. Rename weights to match refactored vLLM model ─────────
+    _create_acoustic_zero_token(weights, config)
+
+    # ── 3. Write config (after weight-derived fields are added) ──
+    with open(out_path / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  Wrote {out_path / 'config.json'}")
+
+    # ── 4. Rename weights to match refactored vLLM model ─────────
     weights = _rename_weights(weights)
 
     out_sf = out_path / "model.safetensors"
     print(f"  Saving {out_sf} ...")
     save_file(weights, str(out_sf))
 
-    # ── 4. Copy tokenizer files so AutoTokenizer works from output_dir
+    # ── 5. Copy tokenizer files so AutoTokenizer works from output_dir
     tokenizer_files = [
         "tokenizer_config.json",
         "vocab.json",

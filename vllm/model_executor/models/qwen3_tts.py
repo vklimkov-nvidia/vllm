@@ -947,14 +947,6 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             for _ in range(config.num_code_groups - 1)
         ])
         
-        # Precomputed tts_pad_embed (text_projection(text_embedding(pad_token))).
-        # Added to the summed codec embeddings at every autoregressive step
-        # to maintain the dual-stream text+codec architecture.
-        self.tts_pad_embed = nn.Parameter(
-            torch.zeros(talker_config.hidden_size),
-            requires_grad=False,
-        )
-
         # ── Persistent scratch buffers for generate_all_groups ───────────
         # Pre-allocated once to avoid per-call allocation overhead and to
         # ensure **constant memory addresses** for PIECEWISE / CUDA-graph
@@ -992,10 +984,6 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         # Codec token IDs: [max_tokens, N]
         self._cp_all_codecs = torch.empty(
             max_num_tokens, N, dtype=torch.long
-        )
-        # Running sum of codec embeddings: [max_tokens, hidden]
-        self._cp_codec_embed_sum = torch.empty(
-            max_num_tokens, hidden, dtype=dtype
         )
 
     def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1067,7 +1055,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
         prev_group0_tokens: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Generate **all** codec groups given the talker hidden states.
 
         First predicts group-0 from ``talker_hidden`` using ``codec_head``
@@ -1095,8 +1083,6 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
 
         Returns:
             all_codecs: [seq_len, num_code_groups] - all codec tokens
-            next_input_embeds: [seq_len, hidden_size] - sum of all codec
-                embeddings (groups 0..N-1) plus ``tts_pad_embed``.
         """
         seq_len = talker_hidden.shape[0]
         N = self.num_code_groups  # typically 16
@@ -1106,12 +1092,10 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         # same views (same memory address, same shape).
         inputs_embeds = self._cp_inputs_embeds[:seq_len]       # [S, 1+N, H]
         all_codecs = self._cp_all_codecs[:seq_len]             # [S, N]
-        codec_embed_sum = self._cp_codec_embed_sum[:seq_len]   # [S, H]
 
         # Zero the input buffer so unfilled positions are clean (no NaN).
         # The running-sum buffer also needs zeroing.
         inputs_embeds.zero_()
-        codec_embed_sum.zero_()
 
         # Fill position 0 with the talker context
         inputs_embeds[:, 0, :] = talker_hidden
@@ -1133,7 +1117,6 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         all_codecs[:, 0] = first_codec
         first_embed = self.codec_embedding(first_codec)  # [seq_len, hidden]
         inputs_embeds[:, 1, :] = first_embed
-        codec_embed_sum.add_(first_embed)
 
         # ── Generate groups 1 through N-1 ───────────────────────────────
         for step in range(N - 1):
@@ -1165,7 +1148,6 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             next_embed = self.get_group_embeddings()[step](
                 next_token
             )  # [seq_len, hidden]
-            codec_embed_sum.add_(next_embed)
 
             # Write embedding into buffer for the next iteration
             # (every position is written, including the last -- the
@@ -1173,10 +1155,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             # don't need another forward after the last step).
             inputs_embeds[:, current_len, :] = next_embed
 
-        # Add tts_pad_embed to the accumulated codec embedding sum
-        next_input_embeds = codec_embed_sum + self.tts_pad_embed.unsqueeze(0)
-
-        return all_codecs, next_input_embeds
+        return all_codecs
 
 
 @ignore_torch_compile
@@ -1243,6 +1222,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 prefix=maybe_prefix(prefix, "model"),
             )
         
+        # Text projection MLP: maps text embeddings from text_hidden_size
+        # to talker hidden_size.  Weights loaded from the checkpoint;
+        # used at runtime to compute input embeddings from text tokens.
+        self.text_projection = Qwen3TTSTalkerResizeMLP(
+            input_size=config.text_hidden_size,
+            intermediate_size=config.text_hidden_size,
+            output_size=config.hidden_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "text_projection"),
+        )
+
         # Compiled code predictor (native PyTorch SDPA, benefits from
         # torch.compile + CUDA-graph capture).  Owns codec_head,
         # suppress_mask, codec_embedding, and the code-predictor
@@ -1257,18 +1248,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-        # buffer for outputs: next embeddings and codes
+        # Persistent buffers for outputs and intermediate results.
+        # Fixed memory addresses are required for CUDA graph replay.
         max_num_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
-        hidden_size = self.config.hidden_size
         codes_num = self.code_predictor.num_code_groups
         dtype = vllm_config.model_config.dtype
         self._out_codes = torch.empty(
             max_num_tokens, codes_num, dtype=torch.long
         )
-        self._out_next_emb = torch.empty(
-            max_num_tokens, hidden_size, dtype=dtype
+        self._combined_embeddings = torch.empty(
+            max_num_tokens, config.hidden_size, dtype=dtype
         )
 
 
@@ -1301,7 +1292,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         indices = query_start_loc[1:] - 1
 
         num_requests = indices.shape[0]
-        padded_num_requests = self.vllm_config.pad_for_cudagraph(num_requests)
+        if self.vllm_config.compilation_config.use_cudagraph:
+            padded_num_requests = self.vllm_config.pad_for_cudagraph(num_requests)
+        else:
+            padded_num_requests = num_requests
         if num_requests != padded_num_requests:
             # need to pad indices so we run on known cuda kernel size
             indices = torch.nn.functional.pad(indices, (0, padded_num_requests - num_requests))
@@ -1313,7 +1307,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        combined_embeddings: Optional[torch.Tensor] = None,
+        text_ids: Optional[torch.Tensor] = None,
+        acoustic_ids: Optional[torch.Tensor] = None,
         prev_group0_tokens: Optional[torch.Tensor] = None,
     ) -> Union[IntermediateTensors, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Forward pass through the talker model.
@@ -1326,12 +1321,42 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             positions: Position IDs for rotary embeddings
             intermediate_tensors: For pipeline parallelism
             inputs_embeds: Pre-computed input embeddings
-            combined_embeddings: Pre-computed combined embeddings
+            text_ids: Text token IDs
+            acoustic_ids: 0th acoustic token IDs
+            prev_group0_tokens: Previous group 0 tokens
             
         Returns:
             For non-last PP rank: IntermediateTensors for pipeline parallelism
-            For last PP rank: tuple of (hidden_states, all_codecs, next_input_embeds)
+            For last PP rank: tuple of (hidden_states, codes)
         """
+
+        # Compute combined embeddings from text and acoustic token IDs.
+        # text_projection maps text_hidden_size → hidden_size; the group-0
+        # codec embedding is the same hidden_size.  Inactive acoustic
+        # positions use acoustic_zero_token_id whose embedding was zeroed
+        # during checkpoint conversion, so no explicit masking is needed.
+        #
+        # acoustic_ids shape: [seq_len, num_code_groups]
+        #   Column 0 → group-0 codec embedding (talker vocab)
+        #   Columns 1..N-1 → code-predictor codec embeddings
+        # The sum of all group embeddings replicates the original HF
+        # embedding logic where all codebook embeddings are summed.
+        if get_pp_group().is_first_rank:
+            text_embed = self.text_projection(
+                self.model.get_text_embeddings(text_ids)
+            )
+            codec_embed = self.get_input_embeddings(acoustic_ids[:, 0])
+            group_embeddings = self.code_predictor.get_group_embeddings()
+            for i in range(len(group_embeddings)):
+                codec_embed = codec_embed + group_embeddings[i](
+                    acoustic_ids[:, i + 1]
+                )
+            seq_len = text_embed.shape[0]
+            combined_embeddings = self._combined_embeddings[:seq_len]
+            torch.add(text_embed, codec_embed, out=combined_embeddings)
+        else:
+            combined_embeddings = None
+
         # Forward through the compiled transformer backbone
         hidden_states = self.model(
             input_ids, 
@@ -1350,7 +1375,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         num_tokens = hidden_states.shape[0]
         if logits_indices is None or logits_indices.shape[0] == num_tokens:
             # either dummy run or decode-only, run code predictor without slicing
-            all_codecs, next_input_embeds = self.code_predictor.generate_codes(
+            all_codecs = self.code_predictor.generate_codes(
                 talker_hidden=hidden_states,
                 do_sample=self.do_sample,
                 temperature=self.temperature,
@@ -1359,7 +1384,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 repetition_penalty=self.repetition_penalty,
                 prev_group0_tokens=prev_group0_tokens,
             )
-            return hidden_states, all_codecs, next_input_embeds
+            return hidden_states, all_codecs
         else:
             # run code predictor only for tokens that are to be decoded
             selected_states = hidden_states[logits_indices].contiguous()
@@ -1374,7 +1399,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             )
             ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
             try:
-                codes, embeds = self.code_predictor.generate_codes(
+                codes = self.code_predictor.generate_codes(
                     talker_hidden=selected_states,
                     do_sample=self.do_sample,
                     temperature=self.temperature,
@@ -1388,8 +1413,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 ctx.cudagraph_runtime_mode = old_mode
             # scatter results into buffer
             self._out_codes[logits_indices[:num_requests]] = codes[:num_requests]
-            self._out_next_emb[logits_indices[:num_requests]] = embeds[:num_requests]
-            return hidden_states, self._out_codes[:num_tokens], self._out_next_emb[:num_tokens]
+            return hidden_states, self._out_codes[:num_tokens]
         
         
 
@@ -1414,9 +1438,144 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         ("codec_head.", "code_predictor.codec_head."),
         # suppress_mask moved from root → code_predictor
         ("suppress_mask", "code_predictor.suppress_mask"),
-        # tts_pad_embed moved from root → code_predictor
-        ("tts_pad_embed", "code_predictor.tts_pad_embed"),
     ]
+
+    @staticmethod
+    def build_prefill_tokens(
+        tokenizer,
+        text: str,
+        speaker: Union[str, int],
+        language: Union[str, int, None],
+        config: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build ``text_ids`` and ``acoustic_ids`` for the prefill stage.
+
+        Pure-function, thread-safe helper that assembles the token sequences
+        the talker model expects as prefill input.  Can be called from any
+        thread without holding model state.
+
+        Prefill layout::
+
+            A. Role prefix        (3)     role token IDs      | zero_token
+            B+C. Ctrl + speaker   (N-1)   tts_pad / tts_bos   | codec ctrl tokens
+            D. Synth text + EOS   (T+1)   content token IDs   | codec_pad
+            E. Final BOS          (1)     tts_pad              | codec_bos
+
+        Args:
+            tokenizer: HuggingFace tokenizer for the model.
+            text: Text to synthesize.
+            speaker: Speaker name (``str``, looked up in
+                ``config["talker_config"]["spk_id"]``) or raw speaker
+                codec token ID (``int``).
+            language: Language name (``str``, looked up in
+                ``config["talker_config"]["codec_language_id"]``), raw
+                codec token ID (``int``), or ``None`` to omit language
+                (uses the nothink control path).
+            config: The **full** config dict from the converted checkpoint's
+                ``config.json`` (as produced by
+                ``convert_qwen3tts_checkpoint.py``).
+
+        Returns:
+            text_ids:     ``[L]`` int64 – text token IDs.
+            acoustic_ids: ``[L, num_code_groups]`` int64 – acoustic token IDs.
+                Column 0 holds group-0 control/codec tokens; columns
+                1..N-1 are filled with ``acoustic_zero_token_id`` (whose
+                embedding is zeroed in the converted checkpoint).
+        """
+        tc = config["talker_config"]
+
+        tts_bos = config["tts_bos_token_id"]
+        tts_eos = config["tts_eos_token_id"]
+        tts_pad = config["tts_pad_token_id"]
+        codec_pad = tc["codec_pad_id"]
+        codec_bos = tc["codec_bos_id"]
+        codec_nothink = tc["codec_nothink_id"]
+        codec_think = tc["codec_think_id"]
+        codec_think_bos = tc["codec_think_bos_id"]
+        codec_think_eos = tc["codec_think_eos_id"]
+        zero_token = tc["acoustic_zero_token_id"]
+        num_code_groups = tc.get("num_code_groups", 16)
+
+        # Resolve speaker name → codec token ID
+        if isinstance(speaker, str):
+            spk_map = tc.get("spk_id", {})
+            if speaker not in spk_map:
+                available = ", ".join(sorted(spk_map)) if spk_map else "(none)"
+                raise ValueError(
+                    f"Unknown speaker '{speaker}'. Available: {available}"
+                )
+            speaker_id = spk_map[speaker]
+        else:
+            speaker_id = int(speaker)
+
+        # Resolve language name → codec token ID
+        if isinstance(language, str):
+            lang_map = tc.get("codec_language_id", {})
+            if language not in lang_map:
+                available = ", ".join(sorted(lang_map)) if lang_map else "(none)"
+                raise ValueError(
+                    f"Unknown language '{language}'. Available: {available}"
+                )
+            language_id: Optional[int] = lang_map[language]
+        elif language is not None:
+            language_id = int(language)
+        else:
+            language_id = None
+
+        text_list: list[int] = []
+        g0_list: list[int] = []
+
+        # A. Role prefix
+        role_tokens = tokenizer.encode("<|im_start|>assistant\n")[:3]
+        for rid in role_tokens:
+            text_list.append(rid)
+            g0_list.append(zero_token)
+
+        # B+C. Control header + speaker
+        if language_id is None or language_id < 0:
+            codec_ctrl = [
+                codec_nothink, codec_think_bos, codec_think_eos,
+                speaker_id, codec_pad, codec_bos,
+            ]
+        else:
+            codec_ctrl = [
+                codec_think, codec_think_bos, language_id, codec_think_eos,
+                speaker_id, codec_pad, codec_bos,
+            ]
+        n_ctrl = len(codec_ctrl)
+        for i in range(n_ctrl - 1):
+            text_list.append(tts_pad if i < n_ctrl - 2 else tts_bos)
+            g0_list.append(codec_ctrl[i])
+
+        # D. Synth text + EOS
+        synth_full = (
+            f"<|im_start|>assistant\n{text}"
+            f"<|im_end|>\n<|im_start|>assistant\n"
+        )
+        full_ids = tokenizer.encode(synth_full)
+        content_ids = full_ids[3:-5]
+
+        for tid in content_ids:
+            text_list.append(tid)
+            g0_list.append(codec_pad)
+        text_list.append(tts_eos)
+        g0_list.append(codec_pad)
+
+        # E. Final BOS
+        text_list.append(tts_pad)
+        g0_list.append(codec_bos)
+
+        text_ids = torch.tensor(text_list, dtype=torch.long)
+
+        # Build [L, num_code_groups] acoustic_ids: group 0 gets control
+        # tokens, groups 1..N-1 get zero_token (zeroed embedding).
+        seq_len = len(g0_list)
+        acoustic_ids = torch.full(
+            (seq_len, num_code_groups), zero_token, dtype=torch.long
+        )
+        acoustic_ids[:, 0] = torch.tensor(g0_list, dtype=torch.long)
+
+        return text_ids, acoustic_ids
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
