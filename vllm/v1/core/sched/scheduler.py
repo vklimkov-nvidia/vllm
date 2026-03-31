@@ -1428,6 +1428,16 @@ class Scheduler(SchedulerInterface):
             raise ValueError(f"Request {request_id} not found")
         if not self.await_inputs:
             raise ValueError(f"Engine is not awaiting inputs, can't set custom inputs")
+
+        # Auto-extend: if custom_inputs cover more tokens than the current
+        # uncomputed gap, grow the sequence so the scheduler treats the
+        # extra positions as a prefill chunk (single forward pass).
+        first_tensor = next(iter(custom_inputs.values()))
+        num_input_tokens = first_tensor.shape[0]
+        num_uncomputed = request.num_tokens - request.num_computed_tokens
+        if num_input_tokens > num_uncomputed:
+            request.extend_sequence(num_input_tokens - num_uncomputed)
+
         request.set_custom_inputs(custom_inputs)
         if request_id in self.waiting_input:
             self.waiting_input.remove(request_id)
