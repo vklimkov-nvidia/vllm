@@ -303,6 +303,11 @@ class EngineCore:
 
     def set_custom_inputs(self, request_id: str, custom_inputs: dict[str, torch.Tensor]):
         """Set custom inputs for a request."""
+        first_tensor = next(iter(custom_inputs.values()))
+        if first_tensor.shape[0] > 1:
+            ch = self._shm_channels.get(request_id)
+            if ch is not None:
+                ch.decode_started = False
         self.scheduler.set_custom_inputs(request_id, custom_inputs)
 
     # ── Shared-memory decode channels ──────────────────────────────
