@@ -116,6 +116,11 @@ class TensorSpec:
         ).element_size()
 
 
+SAMPLED_TOKEN_IDS_SPEC = TensorSpec(
+    name="sampled_token_ids", shape=(1,), dtype=torch.int64,
+)
+
+
 def decode_step_tensor_specs(
     custom_specs: list,
     model_dtype: torch.dtype,
@@ -280,7 +285,11 @@ class SharedMemoryTensorChannel:
     # ── Core -> Client ─────────────────────────────────────────────
 
     def can_write_outputs(self, outputs: dict[str, torch.Tensor]) -> bool:
-        """Return True if every tensor matches its output spec."""
+        """Return True if every tensor matches its output spec.
+
+        Built-in slots (``sampled_token_ids``) are written separately and
+        are not required in *outputs*.
+        """
         for name, tensor in outputs.items():
             entry = self._output_slots.get(name)
             if entry is None:
@@ -300,6 +309,16 @@ class SharedMemoryTensorChannel:
     def write_outputs(self, outputs: dict[str, torch.Tensor]) -> None:
         _cpp.batch_copy(_prepare_copy_descs(
             self._output_shm_views, outputs))
+
+    def write_sampled_token_ids(self, token_ids: list[int]) -> None:
+        """Write sampled token id into the built-in SHM slot.
+
+        Called by the core alongside ``write_outputs`` so the client
+        can read the sampled token without going through ZMQ.
+        """
+        view = self._output_shm_views.get(SAMPLED_TOKEN_IDS_SPEC.name)
+        if view is not None:
+            view[0] = token_ids[0] if token_ids else -1
 
     def signal_output_ready(self) -> None:
         """Core: atomic set output_ready + FUTEX_WAKE."""

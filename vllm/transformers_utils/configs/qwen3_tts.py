@@ -83,6 +83,10 @@ class Qwen3TTSConfig(PretrainedConfig):
             rs = dict(text_cfg["rope_scaling"])
             rs.pop("mrope_section", None)
             text_cfg["rope_scaling"] = rs or None
+        # Set eos_token_id so vLLM can auto-detect end-of-generation.
+        text_cfg.setdefault(
+            "eos_token_id", text_cfg.get("codec_eos_token_id")
+        )
         self.text_config = PretrainedConfig(**text_cfg)
 
         super().__init__(**kwargs)

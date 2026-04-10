@@ -39,10 +39,6 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.config import CUDAGraphMode
-from vllm.forward_context import (
-    create_forward_context, get_forward_context, override_forward_context, BatchDescriptor
-)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -857,24 +853,17 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
 
 @support_torch_compile
 class Qwen3TTSTalkerCodePredictor(nn.Module):
-    """Code predictor for Qwen3TTS Talker.
-    
-    Predicts all codec groups: group 0 via ``codec_head`` (from the talker
-    hidden states) and groups 1..N-1 via the native code-predictor
-    transformer.
-    
-    This module uses native PyTorch operations instead of vLLM attention
-    since the code predictor:
-    - Runs independently for each global time step
-    - Has deterministic shapes (fixed 15 steps)
-    - Doesn't benefit from KV cache
-    - Can be captured in CUDA graphs
-    
-    Owns:
-    - ``codec_embedding`` – VocabParallelEmbedding for group-0 codec tokens
-      (shared with the outer model for input embedding lookups).
-    - ``codec_head`` – lm head for group-0 prediction.
-    - ``suppress_mask`` – precomputed bool mask for suppressing reserved tokens.
+    """Code predictor for Qwen3TTS Talker — groups 1..N-1 only.
+
+    Given the previous step's backbone hidden state and the group-0 token
+    (sampled by vLLM), autoregressively predicts codec groups 1 through
+    N-1 using a small native-attention transformer.
+
+    Group-0 prediction (``codec_head``, ``suppress_mask``) is handled by
+    the outer model's ``compute_logits()`` + vLLM sampler.
+
+    Also owns ``codec_embedding`` (group-0 codebook), shared with the
+    outer model for input-embedding lookups.
     """
 
     def __init__(
@@ -884,55 +873,32 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        
+
         hf_config = vllm_config.model_config.hf_config
         talker_config = _get_talker_config(hf_config)
         config = talker_config.code_predictor_config
         if isinstance(config, dict):
             config = _dict_to_namespace(config)
         quant_config = vllm_config.quant_config
-        
+
         self.config = config
         self.num_code_groups = config.num_code_groups
         self.hidden_size = config.hidden_size
         self.talker_hidden_size = talker_config.hidden_size
-        
-        # ── Group-0 codec embedding (moved from Qwen3TTSTalkerModel) ────
-        # Available on all ranks so the outer model can look up codec
-        # embeddings on the first PP rank and the code predictor can use
-        # them for generation on the last PP rank.
+
+        # Group-0 codec embedding (shared with outer model)
         self.codec_embedding = VocabParallelEmbedding(
             talker_config.vocab_size,
             talker_config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.codec_embedding",
         )
-        
-        # ── Group-0 prediction head (moved from outer model) ────────────
-        if get_pp_group().is_last_rank:
-            self.codec_head = ParallelLMHead(
-                talker_config.vocab_size,
-                talker_config.hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.codec_head",
-            )
-        else:
-            self.codec_head = PPMissingLayer()
-        
-        # Precomputed suppress mask (True for the top-1024 reserved token IDs
-        # except EOS).  Static tensor – CUDA-graph safe.
-        self.suppress_mask = nn.Parameter(
-            torch.zeros(talker_config.vocab_size, dtype=torch.bool),
-            requires_grad=False,
-        )
-        
-        self.logits_processor = LogitsProcessor(talker_config.vocab_size)
-        
-        # ── Code-predictor transformer backbone ─────────────────────────
+
+        # Code-predictor transformer backbone
         self.model = Qwen3TTSTalkerCodePredictorModel(
             config, self.talker_hidden_size
         )
-        
+
         # Projection from talker hidden size to code predictor hidden size
         if config.hidden_size != self.talker_hidden_size:
             self.small_to_mtp_projection = nn.Linear(
@@ -940,55 +906,51 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             )
         else:
             self.small_to_mtp_projection = nn.Identity()
-        
+
         # LM heads for each code group (1 to N-1)
         self.lm_head = nn.ModuleList([
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             for _ in range(config.num_code_groups - 1)
         ])
-        
-        # ── Persistent scratch buffers for generate_all_groups ───────────
-        # Pre-allocated once to avoid per-call allocation overhead and to
-        # ensure **constant memory addresses** for PIECEWISE / CUDA-graph
-        # capture.  Sized to max_num_tokens (the maximum seq_len the model
-        # runner will ever pass).  generate_all_groups slices these by
-        # seq_len each call; under CUDA graph, seq_len is constant so
-        # the slices are always the same view.
-        #
-        # Plain attributes (not register_buffer / nn.Parameter) because
-        # vLLM does not call .to(dtype) on the model after construction --
-        # it loads weights directly.  The device context manager active
-        # during __init__ places these on the correct GPU, and we set
-        # dtype explicitly from the model config.
-        max_num_tokens = (
-            vllm_config.scheduler_config.max_num_batched_tokens
-        )
-        N = config.num_code_groups  # typically 16
+
+        # Sampling parameters for the internal groups-1..N-1 loop
+        tts_config = _get_tts_config(hf_config)
+        if tts_config is not None:
+            self.do_sample = getattr(tts_config, "do_sample", True)
+            self.temperature = getattr(tts_config, "temperature", 1.0)
+            self.top_k = getattr(tts_config, "top_k", 50)
+            self.top_p = getattr(tts_config, "top_p", 1.0)
+            self.repetition_penalty = getattr(
+                tts_config, "repetition_penalty", 1.0
+            )
+        else:
+            self.do_sample = True
+            self.temperature = 1.0
+            self.top_k = 50
+            self.top_p = 1.0
+            self.repetition_penalty = 1.0
+
+        # ── Persistent scratch buffers ──────────────────────────────────
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        N = config.num_code_groups
         hidden = talker_config.hidden_size
         cp_hidden = config.hidden_size
         dtype = vllm_config.model_config.dtype
-        self._max_cp_len = 1 + N  # talker ctx + N codec groups
+        self._max_cp_len = 1 + N  # prev_hidden ctx + group0 + groups 1..N-1
 
-        # Input-embedding buffer: [max_tokens, 1+N, hidden]
-        # Position 0 = talker context; positions 1..N = codec group embeds.
-        # Zeroed so unfilled positions don't introduce NaN; the causal mask
-        # in SDPA prevents them from affecting filled positions' outputs.
         self._cp_inputs_embeds = torch.zeros(
             max_num_tokens, self._max_cp_len, hidden, dtype=dtype
         )
-        # Output buffer from code-predictor forward: [max_tokens, 1+N, cp_hidden]
-        # Pre-allocated so the compiled forward always writes to the same memory.
         self._cp_hidden_states = torch.empty(
             max_num_tokens, self._max_cp_len, cp_hidden, dtype=dtype
         )
-        # Codec token IDs: [max_tokens, N]
+        # Only groups 1..N-1 (N-1 columns)
         self._cp_all_codecs = torch.empty(
-            max_num_tokens, N, dtype=torch.long
+            max_num_tokens, N - 1, dtype=torch.long
         )
 
     def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Look up group-0 codec embeddings (used by the outer model for
-        input embedding on the first PP rank)."""
+        """Look up group-0 codec embeddings."""
         return self.codec_embedding(input_ids)
 
     def get_group_embeddings(self) -> nn.ModuleList:
@@ -999,46 +961,17 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass through the code predictor transformer.
-
-        The input must always be the **full** pre-allocated buffer
-        ``_cp_inputs_embeds[:seq_len]`` with shape
-        ``[seq_len, 1 + num_code_groups, talker_hidden_size]``.
-        Unfilled positions should be zero; the native SDPA uses causal
-        masking (``is_causal=True``) so they cannot contaminate filled
-        positions.
-
-        Passing a fixed-shape tensor on every call ensures a single
-        compiled graph under PIECEWISE and a single CUDA-graph capture.
-
-        Args:
-            inputs_embeds: [batch_size, max_cp_len, talker_hidden_size]
-                Always the full code-predictor sequence length.
-
-        Returns:
-            hidden_states: [batch_size, max_cp_len, cp_hidden_size]
-        """
-        # Project embeddings to code predictor hidden size
+        """Forward pass through the code predictor transformer."""
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
-
-        # No attention_mask → SDPA uses is_causal=True (lower-triangular)
         hidden_states = self.model(inputs_embeds)
         return hidden_states
 
-    def compute_logits(
+    def _compute_inner_logits(
         self,
         hidden_states: torch.Tensor,
         generation_step: int,
     ) -> torch.Tensor:
-        """Compute logits for a specific code group (1..N-1).
-        
-        Args:
-            hidden_states: [batch_size, seq_len, hidden_size]
-            generation_step: Which code group to predict (0 to num_code_groups-2)
-            
-        Returns:
-            logits: [batch_size, seq_len, vocab_size]
-        """
+        """Compute logits for a specific inner code group (1..N-1)."""
         if generation_step >= len(self.lm_head):
             raise ValueError(
                 f"generation_step {generation_step} exceeds number of "
@@ -1046,113 +979,59 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             )
         return self.lm_head[generation_step](hidden_states)
 
-    def generate_codes(
+    def generate_groups_1_15(
         self,
-        talker_hidden: torch.Tensor,
-        do_sample: bool = True,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
-        repetition_penalty: float = 1.0,
-        prev_group0_tokens: Optional[torch.Tensor] = None,
+        prev_hidden: torch.Tensor,
+        group0_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Generate **all** codec groups given the talker hidden states.
-
-        First predicts group-0 from ``talker_hidden`` using ``codec_head``
-        (with suppress-mask and sampling), then autoregressively generates
-        groups 1..N-1 via the code-predictor transformer.
-
-        Uses **persistent scratch buffers** that were pre-allocated in the
-        constructor to ``max_num_tokens``.  Every call to the compiled
-        ``forward()`` receives the **full** ``_cp_inputs_embeds`` buffer
-        (fixed shape ``[S, 1+N, H]``), ensuring a single compiled graph
-        under PIECEWISE and a single CUDA-graph capture.  Unfilled
-        positions are zero; causal masking in SDPA prevents them from
-        affecting filled positions.  The correct output position is
-        extracted *after* the compiled forward returns.
+        """Generate codec groups 1..N-1 given previous hidden state and group0.
 
         Args:
-            talker_hidden: [seq_len, hidden_size] - hidden states from talker
-            do_sample: Whether to sample or use argmax
-            temperature: Sampling temperature
-            top_k: Top-k sampling
-            top_p: Top-p (nucleus) sampling
-            repetition_penalty: Penalty for repeated tokens
-            prev_group0_tokens: [seq_len, window] - recent group-0 token
-                history for cross-step repetition penalty (optional)
+            prev_hidden: [seq_len, hidden_size] backbone output from previous step
+            group0_tokens: [seq_len] group-0 tokens (from vLLM sampling)
 
         Returns:
-            all_codecs: [seq_len, num_code_groups] - all codec tokens
+            codes_1_15: [seq_len, num_code_groups - 1]
         """
-        seq_len = talker_hidden.shape[0]
-        N = self.num_code_groups  # typically 16
+        seq_len = prev_hidden.shape[0]
+        N = self.num_code_groups
 
-        # ── Slice persistent buffers to the actual seq_len ──────────────
-        # Under CUDA graph, seq_len is constant so these are always the
-        # same views (same memory address, same shape).
-        inputs_embeds = self._cp_inputs_embeds[:seq_len]       # [S, 1+N, H]
-        all_codecs = self._cp_all_codecs[:seq_len]             # [S, N]
+        inputs_embeds = self._cp_inputs_embeds[:seq_len]
+        all_codecs = self._cp_all_codecs[:seq_len]
 
-        # Zero the input buffer so unfilled positions are clean (no NaN).
-        # The running-sum buffer also needs zeroing.
         inputs_embeds.zero_()
 
-        # Fill position 0 with the talker context
-        inputs_embeds[:, 0, :] = talker_hidden
+        # Position 0: previous backbone hidden state
+        inputs_embeds[:, 0, :] = prev_hidden
 
-        # ── Predict group-0 codec using the talker's hidden states ──────
-        logits = self.logits_processor(self.codec_head, talker_hidden)
-        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
+        # Position 1: group-0 codec embedding
+        inputs_embeds[:, 1, :] = self.codec_embedding(group0_tokens)
 
-        first_codec = _sample_from_logits(
-            logits,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            previous_tokens=prev_group0_tokens,
-        )
-
-        all_codecs[:, 0] = first_codec
-        first_embed = self.codec_embedding(first_codec)  # [seq_len, hidden]
-        inputs_embeds[:, 1, :] = first_embed
-
-        # ── Generate groups 1 through N-1 ───────────────────────────────
         for step in range(N - 1):
-            # Always pass the FULL buffer (fixed shape for compiled fwd).
-            # Positions 0..current_len-1 are filled; the rest are zero.
-            # Causal masking ensures filled positions' outputs are correct.
-            hidden_states = self(inputs_embeds)  # [S, 1+N, cp_hidden]
+            hidden_states = self(inputs_embeds)
 
-            # Extract logits from the last FILLED position
-            current_len = step + 2  # talker ctx + groups 0..step
-            logits = self.compute_logits(
+            current_len = step + 2
+            logits = self._compute_inner_logits(
                 hidden_states[:, current_len - 1, :], step
-            )  # [seq_len, vocab]
+            )
 
-            # Repetition penalty context: only prior inner-group tokens
-            # (skip group 0 — it uses a different, larger vocab)
-            if repetition_penalty != 1.0 and step > 0:
-                current_context = all_codecs[:, 1: step + 1]
+            if self.repetition_penalty != 1.0 and step > 0:
+                current_context = all_codecs[:, :step]
             else:
                 current_context = None
 
             next_token = _sample_from_logits(
-                logits, do_sample, temperature, top_k, top_p,
-                repetition_penalty, current_context,
+                logits,
+                do_sample=self.do_sample,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                previous_tokens=current_context,
             )
-            all_codecs[:, step + 1] = next_token
+            all_codecs[:, step] = next_token
 
-            # Embed the predicted token and accumulate
-            next_embed = self.get_group_embeddings()[step](
-                next_token
-            )  # [seq_len, hidden]
-
-            # Write embedding into buffer for the next iteration
-            # (every position is written, including the last -- the
-            # forward still reads it via causal masking even though we
-            # don't need another forward after the last step).
+            next_embed = self.get_group_embeddings()[step](next_token)
             inputs_embeds[:, current_len, :] = next_embed
 
         return all_codecs
@@ -1162,16 +1041,25 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
 @support_torch_compile
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
     """Qwen3TTS Talker for conditional generation.
-    
-    Top-level model that orchestrates text-to-codec generation.  The
-    ``code_predictor`` sub-module is compiled via ``@support_torch_compile``
-    (it uses native PyTorch SDPA and benefits from compilation/CUDA-graph
-    capture).  The transformer backbone (``model``) is *not* compiled
-    because it relies on vLLM's paged ``Attention`` which is already
-    optimised and whose custom-op fake kernels can produce stride
-    mismatches under ``torch.compile`` for certain GQA configurations.
+
+    Per-step flow:
+
+    1. **Code predictor** (conditional): given the previous step's backbone
+       hidden state (``prev_hidden``, custom input) and the group-0 token
+       (``input_ids``, sampled by vLLM at the previous step), predict codec
+       groups 1..N-1.  Skipped when ``prev_hidden`` is all-zero (prefill).
+    2. **Embedding**: text_projection(text_embed) + codec_embed(group0)
+       + sum of groups-1..N-1 embeddings from the code predictor.
+    3. **Backbone**: transformer with vLLM paged attention and KV cache.
+    4. **Logits**: ``compute_logits()`` projects backbone output through
+       ``codec_head`` and applies ``suppress_mask``.  vLLM's standard
+       sampler then samples the next group-0 token.
+
+    Custom I/O:
+      Inputs:  ``text_ids`` (int64), ``prev_hidden`` (float, dim=hidden_size)
+      Outputs: ``codes`` (int64, dim=N-1), ``hidden`` (float, dim=hidden_size)
     """
-    
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1191,40 +1079,23 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        
+
         hf_config = vllm_config.model_config.hf_config
-        tts_config = _get_tts_config(hf_config)
         config = _get_talker_config(hf_config)
         quant_config = vllm_config.quant_config
-        
+
         self.config = config
-        self.tts_config = tts_config
         self.quant_config = quant_config
-        
-        # Sampling parameters from config (shared for talker and code predictor)
-        if tts_config is not None:
-            self.do_sample = getattr(tts_config, "do_sample", True)
-            self.temperature = getattr(tts_config, "temperature", 1.0)
-            self.top_k = getattr(tts_config, "top_k", 50)
-            self.top_p = getattr(tts_config, "top_p", 1.0)
-            self.repetition_penalty = getattr(tts_config, "repetition_penalty", 1.0)
-        else:
-            self.do_sample = True
-            self.temperature = 1.0
-            self.top_k = 50
-            self.top_p = 1.0
-            self.repetition_penalty = 1.0
-        
+        self.vllm_config = vllm_config
+
         # Transformer backbone (not compiled – uses vLLM paged Attention)
         with set_model_tag("talker"):
             self.model = Qwen3TTSTalkerModel(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "model"),
             )
-        
-        # Text projection MLP: maps text embeddings from text_hidden_size
-        # to talker hidden_size.  Weights loaded from the checkpoint;
-        # used at runtime to compute input embeddings from text tokens.
+
+        # Text projection MLP
         self.text_projection = Qwen3TTSTalkerResizeMLP(
             input_size=config.text_hidden_size,
             intermediate_size=config.text_hidden_size,
@@ -1234,72 +1105,46 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "text_projection"),
         )
 
-        # Compiled code predictor (native PyTorch SDPA, benefits from
-        # torch.compile + CUDA-graph capture).  Owns codec_head,
-        # suppress_mask, codec_embedding, and the code-predictor
-        # transformer.
+        # Compiled code predictor (groups 1..N-1 only)
         with set_model_tag("code_predictor"):
             self.code_predictor = Qwen3TTSTalkerCodePredictor(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "code_predictor"),
             )
-        
+
+        # Group-0 prediction head + suppress mask (used by compute_logits
+        # so vLLM's standard sampler can sample group-0).
+        if get_pp_group().is_last_rank:
+            self.codec_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "codec_head"),
+            )
+        else:
+            self.codec_head = PPMissingLayer()
+
+        self.suppress_mask = nn.Parameter(
+            torch.zeros(config.vocab_size, dtype=torch.bool),
+            requires_grad=False,
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
 
-        # Persistent buffers for outputs and intermediate results.
-        # Fixed memory addresses are required for CUDA graph replay.
-        max_num_tokens = (
-            vllm_config.scheduler_config.max_num_batched_tokens
-        )
-        codes_num = self.code_predictor.num_code_groups
+        # Persistent buffers
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        codes_num = self.code_predictor.num_code_groups - 1  # groups 1..N-1
         dtype = vllm_config.model_config.dtype
-        self._out_codes = torch.empty(
+        self._out_codes = torch.zeros(
             max_num_tokens, codes_num, dtype=torch.long
         )
-        self._combined_embeddings = torch.empty(
-            max_num_tokens, config.hidden_size, dtype=dtype
-        )
-
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Get group-0 codec embeddings for input ids."""
         return self.code_predictor.get_group0_embeddings(input_ids)
-
-    def _get_logits_indices(self) -> tuple[Optional[torch.Tensor], int, int]:
-        """Extract logits_indices from the forward context.
-
-        Returns the indices of positions that need sampling (last token
-        per request), or ``None`` during profile / dummy runs where
-        attention metadata is not yet available.
-        """
-        ctx = get_forward_context()
-        attn_metadata = ctx.attn_metadata
-
-        if attn_metadata is None:
-            # Profile / dummy run — no real batch to sample from.
-            return None, 0, 0
-
-        # In v1 attn_metadata is dict[layer_name, per_layer_metadata].
-        # All layers share the same query_start_loc; grab any one.
-        if isinstance(attn_metadata, dict):
-            any_layer_meta = next(iter(attn_metadata.values()))
-        else:
-            any_layer_meta = attn_metadata
-
-        query_start_loc = any_layer_meta.query_start_loc
-        indices = query_start_loc[1:] - 1
-
-        num_requests = indices.shape[0]
-        if self.vllm_config.compilation_config.use_cudagraph:
-            padded_num_requests = self.vllm_config.pad_for_cudagraph(num_requests)
-        else:
-            padded_num_requests = num_requests
-        if num_requests != padded_num_requests:
-            # need to pad indices so we run on known cuda kernel size
-            indices = torch.nn.functional.pad(indices, (0, padded_num_requests - num_requests))
-        return indices, num_requests, padded_num_requests
 
     def forward(
         self,
@@ -1308,136 +1153,91 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
-        acoustic_ids: Optional[torch.Tensor] = None,
-        prev_group0_tokens: Optional[torch.Tensor] = None,
-    ) -> Union[IntermediateTensors, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Forward pass through the talker model.
-        
-        Runs the compiled transformer backbone, then delegates all codec
-        prediction (group 0 through group N-1) to the code predictor.
-        
-        Args:
-            input_ids: Input token IDs
-            positions: Position IDs for rotary embeddings
-            intermediate_tensors: For pipeline parallelism
-            inputs_embeds: Pre-computed input embeddings
-            text_ids: Text token IDs
-            acoustic_ids: 0th acoustic token IDs
-            prev_group0_tokens: Previous group 0 tokens
-            
-        Returns:
-            For non-last PP rank: IntermediateTensors for pipeline parallelism
-            For last PP rank: tuple of (hidden_states, codes)
-        """
+        prev_hidden: Optional[torch.Tensor] = None,
+    ) -> Union[IntermediateTensors,
+               tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Forward pass: code predictor -> embedding -> backbone.
 
-        # Compute combined embeddings from text and acoustic token IDs.
-        # text_projection maps text_hidden_size → hidden_size; the group-0
-        # codec embedding is the same hidden_size.  Inactive acoustic
-        # positions use acoustic_zero_token_id whose embedding was zeroed
-        # during checkpoint conversion, so no explicit masking is needed.
-        #
-        # acoustic_ids shape: [seq_len, num_code_groups]
-        #   Column 0 → group-0 codec embedding (talker vocab)
-        #   Columns 1..N-1 → code-predictor codec embeddings
-        # The sum of all group embeddings replicates the original HF
-        # embedding logic where all codebook embeddings are summed.
+        Simplified for single-request eager mode:
+        - Prefill (seq_len > 1): skip code predictor, embed = text + codec
+        - Decode (seq_len == 1): run code predictor, embed = text + codec + groups
+
+        Args:
+            input_ids: Group-0 codec tokens.
+            positions: Position IDs for rotary embeddings.
+            intermediate_tensors: For pipeline parallelism.
+            inputs_embeds: Pre-computed input embeddings (unused).
+            text_ids: Text token IDs (custom input).
+            prev_hidden: Backbone hidden state from the previous step
+                (custom input; all-zero during prefill).
+
+        Returns:
+            Non-last PP rank: IntermediateTensors.
+            Last PP rank: ``(hidden_states, codes_1_15, hidden_states)``.
+        """
         if get_pp_group().is_first_rank:
+            seq_len = input_ids.shape[0]
+
             text_embed = self.text_projection(
                 self.model.get_text_embeddings(text_ids)
             )
-            codec_embed = self.get_input_embeddings(acoustic_ids[:, 0])
-            group_embeddings = self.code_predictor.get_group_embeddings()
-            for i in range(len(group_embeddings)):
-                codec_embed = codec_embed + group_embeddings[i](
-                    acoustic_ids[:, i + 1]
+            codec_embed = self.get_input_embeddings(input_ids)
+
+            if seq_len > 1:
+                # Prefill: no code predictor
+                codes_1_15 = self._out_codes[:seq_len]
+                codes_1_15.zero_()
+                combined_embeddings = text_embed + codec_embed
+            else:
+                # Decode: run code predictor for groups 1..N-1
+                codes_1_15 = self.code_predictor.generate_groups_1_15(
+                    prev_hidden=prev_hidden,
+                    group0_tokens=input_ids,
                 )
-            seq_len = text_embed.shape[0]
-            combined_embeddings = self._combined_embeddings[:seq_len]
-            torch.add(text_embed, codec_embed, out=combined_embeddings)
+                group_embeddings = self.code_predictor.get_group_embeddings()
+                for i in range(len(group_embeddings)):
+                    codec_embed = codec_embed + group_embeddings[i](
+                        codes_1_15[:, i]
+                    )
+                combined_embeddings = text_embed + codec_embed
         else:
             combined_embeddings = None
+            codes_1_15 = None
 
-        # Forward through the compiled transformer backbone
         hidden_states = self.model(
-            input_ids, 
-            positions, 
-            intermediate_tensors, 
+            input_ids,
+            positions,
+            intermediate_tensors,
             inputs_embeds,
             combined_embeddings,
         )
-        
-        # Intermediate PP ranks return tensors for next rank
+
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
-        
 
-        logits_indices, num_requests, padded_num_requests = self._get_logits_indices()
-        num_tokens = hidden_states.shape[0]
-        if logits_indices is None or logits_indices.shape[0] == num_tokens:
-            # either dummy run or decode-only, run code predictor without slicing
-            all_codecs = self.code_predictor.generate_codes(
-                talker_hidden=hidden_states,
-                do_sample=self.do_sample,
-                temperature=self.temperature,
-                top_k=self.top_k,
-                top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty,
-                prev_group0_tokens=prev_group0_tokens,
-            )
-            return hidden_states, all_codecs
-        else:
-            # run code predictor only for tokens that are to be decoded
-            selected_states = hidden_states[logits_indices].contiguous()
-            selected_prev_g0 = (prev_group0_tokens[logits_indices]
-                                if prev_group0_tokens is not None else None)
-            ctx = get_forward_context()
-            old_batch_descriptor = ctx.batch_descriptor
-            old_mode = ctx.cudagraph_runtime_mode
-            ctx.batch_descriptor = BatchDescriptor(
-                num_tokens=padded_num_requests,
-                uniform_decode=False,
-            )
-            ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-            try:
-                codes = self.code_predictor.generate_codes(
-                    talker_hidden=selected_states,
-                    do_sample=self.do_sample,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
-                    top_p=self.top_p,
-                    repetition_penalty=self.repetition_penalty,
-                    prev_group0_tokens=selected_prev_g0,
-                )
-            finally:
-                ctx.batch_descriptor = old_batch_descriptor
-                ctx.cudagraph_runtime_mode = old_mode
-            # scatter results into buffer
-            self._out_codes[logits_indices[:num_requests]] = codes[:num_requests]
-            return hidden_states, self._out_codes[:num_tokens]
-        
-        
+        return hidden_states, codes_1_15, hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Return hidden_states for compatibility.
-        
-        Note: Actual logits computation and sampling happens inside forward().
-        This method exists for compatibility with vLLM's model runner interface.
-        """
-        return hidden_states
+        """Compute group-0 logits for vLLM sampling.
 
-    # Weight-name prefixes that moved during the refactoring.
-    # Maps old (HF / pre-conversion) prefix → new (vLLM model) prefix.
-    # Applied after stripping the "talker." wrapper prefix.
+        Projects backbone hidden states through ``codec_head``, applies the
+        ``suppress_mask`` to block reserved token IDs, and returns logits
+        of shape ``[batch, vocab_size]``.
+        """
+        logits = self.logits_processor(self.codec_head, hidden_states)
+        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
+        return logits
+
+    # Weight-name remapping applied after stripping the "talker." prefix.
+    # Handles both original HF names and previously-converted checkpoint
+    # names where codec_head / suppress_mask lived under code_predictor.
     _weight_remap_prefixes: list[tuple[str, str]] = [
-        # codec_embedding moved from model → code_predictor
         ("model.codec_embedding.", "code_predictor.codec_embedding."),
-        # codec_head moved from root → code_predictor
-        ("codec_head.", "code_predictor.codec_head."),
-        # suppress_mask moved from root → code_predictor
-        ("suppress_mask", "code_predictor.suppress_mask"),
+        ("code_predictor.codec_head.", "codec_head."),
+        ("code_predictor.suppress_mask", "suppress_mask"),
     ]
 
     @staticmethod
@@ -1448,39 +1248,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         language: Union[str, int, None],
         config: dict,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build ``text_ids`` and ``acoustic_ids`` for the prefill stage.
-
-        Pure-function, thread-safe helper that assembles the token sequences
-        the talker model expects as prefill input.  Can be called from any
-        thread without holding model state.
-
-        Prefill layout::
-
-            A. Role prefix        (3)     role token IDs      | zero_token
-            B+C. Ctrl + speaker   (N-1)   tts_pad / tts_bos   | codec ctrl tokens
-            D. Synth text + EOS   (T+1)   content token IDs   | codec_pad
-            E. Final BOS          (1)     tts_pad              | codec_bos
-
-        Args:
-            tokenizer: HuggingFace tokenizer for the model.
-            text: Text to synthesize.
-            speaker: Speaker name (``str``, looked up in
-                ``config["talker_config"]["spk_id"]``) or raw speaker
-                codec token ID (``int``).
-            language: Language name (``str``, looked up in
-                ``config["talker_config"]["codec_language_id"]``), raw
-                codec token ID (``int``), or ``None`` to omit language
-                (uses the nothink control path).
-            config: The **full** config dict from the converted checkpoint's
-                ``config.json`` (as produced by
-                ``convert_qwen3tts_checkpoint.py``).
+        """Build ``text_ids`` and ``group0_ids`` for the prefill stage.
 
         Returns:
-            text_ids:     ``[L]`` int64 – text token IDs.
-            acoustic_ids: ``[L, num_code_groups]`` int64 – acoustic token IDs.
-                Column 0 holds group-0 control/codec tokens; columns
-                1..N-1 are filled with ``acoustic_zero_token_id`` (whose
-                embedding is zeroed in the converted checkpoint).
+            text_ids:    ``[L]`` int64 – text token IDs.
+            group0_ids:  ``[L]`` int64 – group-0 codec control / token IDs
+                (used as ``prompt_token_ids`` for vLLM).
         """
         tc = config["talker_config"]
 
@@ -1494,9 +1267,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         codec_think_bos = tc["codec_think_bos_id"]
         codec_think_eos = tc["codec_think_eos_id"]
         zero_token = tc["acoustic_zero_token_id"]
-        num_code_groups = tc.get("num_code_groups", 16)
 
-        # Resolve speaker name → codec token ID
         if isinstance(speaker, str):
             spk_map = tc.get("spk_id", {})
             if speaker not in spk_map:
@@ -1508,7 +1279,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         else:
             speaker_id = int(speaker)
 
-        # Resolve language name → codec token ID
         if isinstance(language, str):
             lang_map = tc.get("codec_language_id", {})
             if language not in lang_map:
@@ -1566,81 +1336,57 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         g0_list.append(codec_bos)
 
         text_ids = torch.tensor(text_list, dtype=torch.long)
+        group0_ids = torch.tensor(g0_list, dtype=torch.long)
 
-        # Build [L, num_code_groups] acoustic_ids: group 0 gets control
-        # tokens, groups 1..N-1 get zero_token (zeroed embedding).
-        seq_len = len(g0_list)
-        acoustic_ids = torch.full(
-            (seq_len, num_code_groups), zero_token, dtype=torch.long
-        )
-        acoustic_ids[:, 0] = torch.tensor(g0_list, dtype=torch.long)
-
-        return text_ids, acoustic_ids
+        return text_ids, group0_ids
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
-        
-        # Mark deterministically-initialized params as already loaded so the
-        # strict weight-loading check doesn't complain about them missing
-        # from the checkpoint.
+
         for pname in params_dict:
             if "rotary_emb.inv_freq" in pname:
                 loaded_params.add(pname)
-        
+
         for name, loaded_weight in weights:
-            # The HF checkpoint stores weights under
-            # Qwen3TTSForConditionalGeneration which wraps the talker as
-            # ``self.talker = Qwen3TTSTalkerForConditionalGeneration(...)``.
-            # Strip the "talker." prefix so names align with this model.
             if name.startswith("talker."):
                 name = name[len("talker."):]
-            
-            # Skip weights that don't belong to the talker (e.g.
-            # speaker_encoder weights).
+
             if name.startswith("speaker_encoder."):
                 continue
-            
+
             if "rotary_emb.inv_freq" in name:
                 continue
-            
-            # Remap old (HF / pre-conversion) weight names to the new
-            # locations.  Converted checkpoints already use the new names
-            # so these replacements are no-ops for them.
+
             for old_pfx, new_pfx in self._weight_remap_prefixes:
                 if name.startswith(old_pfx):
                     name = new_pfx + name[len(old_pfx):]
                     break
-            
-            # Handle stacked parameters (for vLLM parallel layers in the
-            # talker backbone).  The code predictor uses native nn.Linear
-            # layers, so the stacked name won't exist in params_dict --
-            # we must NOT mutate `name` so the fallback path can still
-            # load the weight directly.
+
             stacked_loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                
-                # Skip loading extra bias for GPTQ models
+
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
-                
+
                 if mapped_name not in params_dict:
                     continue
-                    
+
                 param = params_dict[mapped_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
@@ -1648,21 +1394,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 loaded_params.add(mapped_name)
                 stacked_loaded = True
                 break
-            
+
             if stacked_loaded:
                 continue
-            
-            # Direct parameter loading (native layers and non-stacked params)
-            # Skip loading extra bias for GPTQ models
+
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            
+
             if name not in params_dict:
                 continue
-                
+
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader = getattr(
+                param, "weight_loader", default_weight_loader
+            )
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        
+
         return loaded_params

@@ -56,6 +56,7 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine.shm_tensor_channel import (
+    SAMPLED_TOKEN_IDS_SPEC,
     SharedMemoryTensorChannel,
     TensorSpec,
     decode_step_tensor_specs,
@@ -292,6 +293,7 @@ class EngineCore:
             output_specs = decode_step_tensor_specs(
                 mc.custom_output_specs or [], mc.dtype,
             )
+            output_specs.append(SAMPLED_TOKEN_IDS_SPEC)
             ch = SharedMemoryTensorChannel(
                 name=f"vllm_shm_{request.request_id}",
                 request_id=request.request_id,
@@ -944,6 +946,8 @@ class EngineCoreProc(EngineCore):
                                 and out.new_custom_outputs
                                 and ch.can_write_outputs(
                                     out.new_custom_outputs)):
+                            ch.write_sampled_token_ids(
+                                out.new_token_ids)
                             ch.write_outputs(out.new_custom_outputs)
                             ch.signal_output_ready()
                         else:

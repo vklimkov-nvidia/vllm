@@ -34,6 +34,7 @@ from vllm.utils import Device, as_list, cancel_task_threadsafe, cdiv, deprecate_
 from vllm.v1.engine import EngineCoreRequest, EngineCoreAppendRequest
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.shm_tensor_channel import (
+    SAMPLED_TOKEN_IDS_SPEC,
     SharedMemoryTensorChannel,
     decode_step_tensor_specs,
 )
@@ -365,6 +366,7 @@ class AsyncLLM(EngineClient):
         output_specs = decode_step_tensor_specs(
             mc.custom_output_specs or [], mc.dtype,
         )
+        output_specs.append(SAMPLED_TOKEN_IDS_SPEC)
         channel_name = f"vllm_shm_{request_id}"
         ch = SharedMemoryTensorChannel(
             name=channel_name,
