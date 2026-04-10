@@ -1,46 +1,34 @@
-"""Benchmark script for Qwen3 TTS model on vLLM.
+"""Benchmark script for Qwen3 TTS model on vLLM (SHM decode).
+
+Reads texts from a file (one utterance per line, tab-separated with text in the
+second column), tokenises them into real prefill inputs, and runs concurrent
+SHM-decode inference through the vLLM engine.
 
 Usage:
     python benchmarks/benchmark_qwen3_tts.py \
-        --model dummy_qwen3_tts_model \
-        --concurrency 16 \
-        --num-requests 512 \
-        --input-len 128 \
-        --output-len 256
+        --model /path/to/qwen3_tts_checkpoint \
+        --text-file texts.txt \
+        --num-requests 100 \
+        --concurrency 8
 
-    # With shared-memory decode channel:
-    python benchmarks/benchmark_qwen3_tts.py \
-        --model dummy_qwen3_tts_model \
-        --concurrency 16 \
-        --use-shm
-
-    # With torch profiler (output dir via VLLM_TORCH_PROFILER_DIR):
-    #   VLLM_TORCH_PROFILER_DIR=/path/to/traces python benchmark_qwen3_tts.py --profile
-    python benchmarks/benchmark_qwen3_tts.py \
-        --model dummy_qwen3_tts_model \
-        --profile
-
-Scheduling note (why you see 1+3 or 2+2 prefills instead of 4):
-    add_request messages were already in the queue when the engine woke.
-    With 4 concurrent workers each calling add_request, that number is a race
-    between the client event loop and the engine's receiver (ZMQ/shm), so you
-    often see 1 or 2 prefills in the first step, then 3 or 2 in the next, and
-    then prefill+decode mixed as the first request(s) move to decode while
-    the rest are still prefill. Use --burst-first-batch to add the first
-    concurrency requests from a single task so they are all enqueued before
-    the first step (deterministic batch prefill).
+    # With torch profiler:
+    VLLM_TORCH_PROFILER_DIR=/tmp/traces python benchmarks/benchmark_qwen3_tts.py \
+        --model /path/to/checkpoint --text-file texts.txt --profile
 """
 
 import os
+
 os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 
 import argparse
 import asyncio
 import concurrent.futures
+import json
 import logging
 import random
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -48,105 +36,60 @@ import torch
 
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
-try:
-    from vllm import SamplingParams
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
-except ImportError:
-    print("Error: Failed to import vllm.")
-    print("Please install vllm: pip install vllm")
-    exit(1)
+from transformers import AutoTokenizer
+
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.model_executor.models.qwen3_tts import (
+    Qwen3TTSTalkerForConditionalGeneration,
+)
 
 
-async def run_request(
-    engine: AsyncLLM,
-    sampling_params: SamplingParams,
-    input_num_tokens: int,
-    output_steps: int,
-    hidden_size: int,
-    metrics: Dict[str, Any],
-    request_id: str,
-):
-    """
-    Sends a single Qwen3 TTS request to the vLLM engine and records metrics.
+def _build_request_inputs(
+    tokenizer,
+    config: dict,
+    text: str,
+    speaker: str,
+    language: str,
+) -> dict:
+    """Build vLLM engine inputs from a text string (mirrors demo_qwen3_tts.py)."""
+    tc = config["talker_config"]
+    codec_eos_token_id = tc["codec_eos_token_id"]
+    tts_pad_token_id = config["tts_pad_token_id"]
+    rep_window = config.get("repetition_window", 256)
 
-    The model uses combined_embeddings as custom input.  Each autoregressive
-    step produces codec tokens (16 groups) plus next_input_embeddings which
-    are fed back via append_request.
-    """
-
-    # Random prefill embeddings – shape [input_num_tokens, hidden_size]
-    prefill_emb = torch.randn(
-        input_num_tokens, hidden_size, dtype=torch.bfloat16
+    text_ids, acoustic_ids = (
+        Qwen3TTSTalkerForConditionalGeneration.build_prefill_tokens(
+            tokenizer=tokenizer,
+            text=text,
+            speaker=speaker,
+            language=language,
+            config=config,
+        )
     )
 
+    prompt_len = text_ids.shape[0]
+
     inputs = {
-        "prompt_token_ids": [0] * input_num_tokens,
+        "prompt_token_ids": [0] * prompt_len,
         "custom_inputs": {
-            "combined_embeddings": prefill_emb,
+            "text_ids": text_ids,
+            "acoustic_ids": acoustic_ids,
+            "prev_group0_tokens": torch.full(
+                (prompt_len, rep_window),
+                codec_eos_token_id + 1,
+                dtype=torch.long,
+            ),
         },
     }
-
-    request_start_time = time.perf_counter()
-    last_token_time = None
-    step_idx = 0
-
-    try:
-        queue = await engine.add_request(request_id, inputs, sampling_params)
-
-        while True:
-            output = await queue.get()
-            now = time.perf_counter()
-
-            # Track first 6 steps separately
-            if step_idx < 6:
-                token_latency = (
-                    now - last_token_time
-                    if last_token_time
-                    else now - request_start_time
-                )
-                metrics["first_tokens"][step_idx].append(token_latency)
-            elif last_token_time is not None:
-                itl = now - last_token_time
-                metrics["inter_token_latencies"].append(itl)
-
-            last_token_time = now
-            step_idx += 1
-
-            # Fixed number of decode steps
-            if step_idx >= output_steps:
-                await engine.abort(request_id)
-                break
-
-            if output.finished:
-                break
-
-            # Feed next decode step embeddings
-            next_input = output.outputs[0].custom_outputs["next_input_embeddings"]
-            new_custom_inputs = {
-                "combined_embeddings": next_input[-1:, :],
-            }
-            await engine.append_request(
-                request_id=request_id, custom_inputs=new_custom_inputs
-            )
-
-        request_end_time = time.perf_counter()
-        request_latency = request_end_time - request_start_time
-
-        metrics["request_latencies"].append(request_latency)
-        metrics["completed_sequences"] += 1
-        metrics["total_tokens"] += step_idx
-
-    except Exception as e:
-        print(f"Request {request_id} failed: {e}")
-        import traceback
-        traceback.print_exc()
-        metrics["failed_sequences"] += 1
+    return inputs
 
 
 def _decode_loop_sync(
     engine: AsyncLLM,
-    output_steps: int,
+    config: dict,
+    max_decode_steps: int,
     metrics: Dict[str, Any],
     request_id: str,
     prefill_custom_outputs: Dict[str, Any],
@@ -156,23 +99,49 @@ def _decode_loop_sync(
     """Run the entire decode loop in a plain OS thread (no asyncio).
 
     After prefill completes on the event loop, this function takes over.
-    Each step is: prepare input from previous output -> shm decode_step
-    (futex write+wait) -> record metrics.  No event-loop round-trips
-    means zero queuing delay between concurrent requests.
+    Each step: prepare input from previous output -> shm decode_step ->
+    record metrics.
     """
-    next_input = prefill_custom_outputs["next_input_embeddings"]
+    tc = config["talker_config"]
+    codec_eos_token_id = tc["codec_eos_token_id"]
+    tts_pad_token_id = config["tts_pad_token_id"]
+    rep_window = config.get("repetition_window", 256)
+
+    first_token = prefill_custom_outputs["codes"][-1:]  # [1, 16]
+    prev_g0 = torch.full(
+        (1, rep_window), codec_eos_token_id + 1, dtype=torch.long
+    )
+    g0_tok = first_token[0, 0].item()
+    prev_g0[0, 0] = g0_tok
+    g0_write_pos = 1
+
+    decode_text_id = torch.tensor([tts_pad_token_id], dtype=torch.long)
+    decode_acoustic_id = first_token.clone()
+
     last_token_time = prefill_token_time
     token_idx = 1
 
     try:
-        for _ in range(output_steps - 1):
-            custom_inputs = {"combined_embeddings": next_input[-1:, :]}
+        for step in range(max_decode_steps - 1):
             custom_outputs = engine.decode_step_shm(
-                request_id, custom_inputs=custom_inputs,
+                request_id,
+                custom_inputs={
+                    "text_ids": decode_text_id,
+                    "acoustic_ids": decode_acoustic_id,
+                    "prev_group0_tokens": prev_g0,
+                },
             )
             now = time.perf_counter()
 
-            next_input = custom_outputs["next_input_embeddings"]
+            next_tokens = custom_outputs["codes"][-1:].clone()
+            g0_tok = next_tokens[0, 0].item()
+
+            if g0_tok == codec_eos_token_id:
+                break
+
+            decode_acoustic_id = next_tokens
+            prev_g0[0, g0_write_pos % rep_window] = g0_tok
+            g0_write_pos += 1
 
             if token_idx < 6:
                 metrics["first_tokens"][token_idx].append(
@@ -200,31 +169,16 @@ def _decode_loop_sync(
         metrics["failed_sequences"] += 1
 
 
-async def run_request_shm(
+async def run_request(
     engine: AsyncLLM,
     sampling_params: SamplingParams,
-    input_num_tokens: int,
-    output_steps: int,
-    hidden_size: int,
+    config: dict,
+    max_decode_steps: int,
     metrics: Dict[str, Any],
     request_id: str,
+    inputs: dict,
 ):
-    """
-    SHM mode: prefill via ZMQ (add_request on event loop), then the
-    entire decode loop runs in a dedicated OS thread — no event-loop
-    round-trips between steps.
-    """
-    prefill_emb = torch.randn(
-        input_num_tokens, hidden_size, dtype=torch.bfloat16
-    )
-
-    inputs = {
-        "prompt_token_ids": [0] * input_num_tokens,
-        "custom_inputs": {
-            "combined_embeddings": prefill_emb,
-        },
-    }
-
+    """Prefill via ZMQ, then decode loop in a dedicated OS thread."""
     request_start_time = time.perf_counter()
 
     try:
@@ -239,10 +193,11 @@ async def run_request_shm(
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            _shm_thread_pool,
+            _thread_pool,
             _decode_loop_sync,
             engine,
-            output_steps,
+            config,
+            max_decode_steps,
             metrics,
             request_id,
             custom_out,
@@ -259,24 +214,19 @@ async def run_request_shm(
         metrics["failed_sequences"] += 1
 
 
-def calculate_and_print_metrics(
+def print_metrics(
     metrics: Dict[str, Any], total_time: float, args: argparse.Namespace
 ):
-    """
-    Calculates and prints the final benchmark statistics.
-    """
     total_sequences = metrics["completed_sequences"]
     if total_sequences == 0:
         print("Error: No sequences completed.")
         return
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"Benchmark Results  (concurrency={args.concurrency}, "
-          f"requests={args.num_requests}, "
-          f"in={args.input_len}, out={args.output_len})")
-    print(f"{'='*60}")
+          f"requests={args.num_requests})")
+    print(f"{'='*70}")
 
-    # First 6 tokens (0-5) – mean latency for each position
     print("\n--- First 6 Tokens (mean latency in ms) ---")
     for i in range(6):
         if metrics["first_tokens"][i]:
@@ -284,20 +234,23 @@ def calculate_and_print_metrics(
             p95_ms = np.percentile(metrics["first_tokens"][i], 95) * 1000
             print(f"  Token {i}: {avg_ms:.2f} ms (P95: {p95_ms:.2f} ms)")
 
-    # Rest of tokens (6+) ITL
     if metrics["inter_token_latencies"]:
         avg_itl_ms = np.mean(metrics["inter_token_latencies"]) * 1000
-        p95_itl_ms = np.percentile(metrics["inter_token_latencies"], 95) * 1000
+        p95_itl_ms = np.percentile(
+            metrics["inter_token_latencies"], 95
+        ) * 1000
         print(f"\n--- Tokens 6+ ITL ---")
         print(f"  Average: {avg_itl_ms:.2f} ms (P95: {p95_itl_ms:.2f} ms)")
 
-    # Average total time per request
-    avg_request_time = np.mean(metrics["request_latencies"])
-    p95_request_time = np.percentile(metrics["request_latencies"], 95)
+    latencies = sorted(metrics["request_latencies"])
     print(f"\n--- Request Latency ---")
-    print(f"  Average: {avg_request_time:.2f} s (P95: {p95_request_time:.2f} s)")
+    print(f"  min:    {latencies[0]:.3f} s")
+    print(f"  median: {latencies[len(latencies) // 2]:.3f} s")
+    print(f"  mean:   {np.mean(latencies):.3f} s")
+    print(f"  p90:    {latencies[int(len(latencies) * 0.9)]:.3f} s")
+    print(f"  p95:    {np.percentile(latencies, 95):.3f} s")
+    print(f"  max:    {latencies[-1]:.3f} s")
 
-    # Throughput
     total_tokens = metrics["total_tokens"]
     print(f"\n--- Throughput ---")
     print(f"  Total time: {total_time:.2f} s")
@@ -306,69 +259,47 @@ def calculate_and_print_metrics(
     print(f"  Total decode steps: {total_tokens}")
     print(f"  Throughput: {total_tokens / total_time:.2f} steps/s")
     print(f"  Sequence throughput: {total_sequences / total_time:.2f} seq/s")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}\n")
 
 
-_shm_thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
-_JITTER_PCT = 20
-
-def _jittered_len(base: int) -> int:
-    """Return *base* perturbed by uniform +/- _JITTER_PCT %, min 1."""
-    factor = 1.0 + random.uniform(-_JITTER_PCT, _JITTER_PCT) / 100.0
-    return max(1, int(round(base * factor)))
+_thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
 
 
 async def worker(
     worker_id: int,
     engine: AsyncLLM,
     sampling_params: SamplingParams,
-    input_num_tokens: int,
-    output_steps: int,
-    hidden_size: int,
+    config: dict,
+    tokenizer,
+    texts: list[str],
+    max_decode_steps: int,
     metrics: Dict[str, Any],
-    use_shm: bool = False,
-    len_jitter: bool = False,
-    randomize_delay: bool = False,
+    speaker: str,
+    language: str,
 ):
-    """
-    A persistent worker that continuously sends requests until
-    the global request counter reaches zero.
-    """
+    """Persistent worker that picks texts from the queue until exhausted."""
     while True:
         async with metrics["lock"]:
             if metrics["requests_to_run"] <= 0:
                 break
             metrics["requests_to_run"] -= 1
 
-        if randomize_delay:
-            tokens = (_JITTER_PCT / 100) * output_steps
-            sec = tokens / 12.5
-            await asyncio.sleep(random.uniform(0, sec))
+        text = random.choice(texts)
+        request_id = f"bench-w{worker_id}-{uuid.uuid4()}"
 
-        req_input_len = _jittered_len(input_num_tokens) if len_jitter else input_num_tokens
-        req_output_len = _jittered_len(output_steps) if len_jitter else output_steps
+        inputs = _build_request_inputs(
+            tokenizer, config, text, speaker, language,
+        )
 
-        request_id = f"benchmark-w{worker_id}-{uuid.uuid4()}"
-        if use_shm:
-            await run_request_shm(
-                engine,
-                sampling_params,
-                req_input_len,
-                req_output_len,
-                hidden_size,
-                metrics,
-                request_id,
-            )
-        else:
-            await run_request(
-                engine,
-                sampling_params,
-                req_input_len,
-                req_output_len,
-                hidden_size,
-                metrics,
-                request_id,
-            )
+        await run_request(
+            engine,
+            sampling_params,
+            config,
+            max_decode_steps,
+            metrics,
+            request_id,
+            inputs,
+        )
 
 
 def init_metrics(num_requests: int):
@@ -386,156 +317,121 @@ def init_metrics(num_requests: int):
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="vLLM Qwen3 TTS Benchmarking Script"
+        description="vLLM Qwen3 TTS Benchmark (SHM decode)"
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        default="dummy_qwen3_tts_model",
-        help="Model name or path (default: dummy_qwen3_tts_model)",
+        "--model", type=str, required=True,
+        help="Path to the Qwen3-TTS model checkpoint",
     )
     parser.add_argument(
-        "-c",
-        "--concurrency",
-        type=int,
-        default=16,
-        help="Number of concurrent workers",
+        "--text-file", type=str, required=True,
+        help="Path to text file (one utterance per line, "
+             "tab-separated with text in 2nd column)",
     )
     parser.add_argument(
-        "-m",
-        "--num-requests",
-        type=int,
-        default=512,
-        help="Total number of requests to send",
+        "-c", "--concurrency", type=int, default=16,
+        help="Number of concurrent workers (default: 16)",
     )
     parser.add_argument(
-        "-i",
-        "--input-len",
-        type=int,
-        default=128,
-        help="Prefix / prompt length (number of input tokens)",
+        "-m", "--num-requests", type=int, default=100,
+        help="Total number of requests to send (default: 100)",
     )
     parser.add_argument(
-        "-o",
-        "--output-len",
-        type=int,
-        default=256,
-        help="Number of decode steps to run per request",
+        "--max-decode-steps", type=int, default=2000,
+        help="Max decode steps per request before forced stop (default: 2000)",
     )
     parser.add_argument(
-        "--max-model-len",
-        type=int,
-        default=512,
-        help="Maximum model length (context size)",
+        "--max-model-len", type=int, default=2048,
+        help="Maximum model context length (default: 2048)",
     )
     parser.add_argument(
-        "--gpu-mem",
-        type=float,
-        default=0.7,
-        help="GPU memory utilization (0.0 to 1.0)",
+        "--gpu-mem", type=float, default=0.7,
+        help="GPU memory utilization 0.0-1.0 (default: 0.7)",
     )
     parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=2048,
-        help="Hidden size for the combined_embeddings input (must match model config)",
-    )
-    parser.add_argument(
-        "--enforce-eager",
-        action="store_true",
+        "--enforce-eager", action="store_true",
         help="Disable CUDA graph capture and run in eager mode",
     )
     parser.add_argument(
-        "--use-shm",
-        action="store_true",
-        help="Use shared-memory decode channel instead of ZMQ for "
-             "decode-step I/O (requires custom_output_specs in model config)",
+        "--input-coalesce-timeout-ms", type=float, default=0,
+        help="Wait up to this many ms for custom inputs before forward pass",
     )
     parser.add_argument(
-        "--input-coalesce-timeout-ms",
-        type=float,
-        default=0,
-        help="Wait up to this many ms for all requests to receive custom "
-             "inputs before running a forward pass (0 to disable)",
-    )
-    parser.add_argument(
-        "--no-warmup",
-        action="store_true",
+        "--no-warmup", action="store_true",
         help="Skip warmup run",
     )
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Call engine.start_profile() before and engine.stop_profile() after "
-             "the benchmark run. Trace output dir: VLLM_TORCH_PROFILER_DIR.",
+        "--profile", action="store_true",
+        help="Enable torch profiler (set VLLM_TORCH_PROFILER_DIR for output)",
     )
     parser.add_argument(
-        "--randomize-len",
-        action="store_true",
-        help="Randomize input/output lengths per request by +/- 15%%",
+        "--speaker", type=str, default="aiden",
+        help="Speaker name (default: aiden)",
     )
     parser.add_argument(
-        "--randomize-delay",
-        action="store_true",
-        help="Add a random delay between requests per worker.  Delay is "
-             "uniform(0, T) where T = (_JITTER_PCT/100)*output_len / 12.5 s.",
+        "--language", type=str, default="english",
+        help="Language (default: english)",
     )
 
     args = parser.parse_args()
+    model_path = Path(args.model)
 
-    global _shm_thread_pool
-    _shm_thread_pool = concurrent.futures.ThreadPoolExecutor(
+    # ── Load texts ────────────────────────────────────────────────────────
+    with open(args.text_file) as f:
+        texts = [line.split("\t", 1)[1].strip() for line in f if line.strip()]
+
+    if not texts:
+        print(f"ERROR: no non-empty lines found in {args.text_file}")
+        return
+
+    print(f"Loaded {len(texts)} texts from {args.text_file}")
+
+    # ── Load config & tokenizer ───────────────────────────────────────────
+    with open(model_path / "config.json") as f:
+        config = json.load(f)
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path.absolute()))
+
+    # ── Thread pool ───────────────────────────────────────────────────────
+    global _thread_pool
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=args.concurrency,
         thread_name_prefix="shm-decode",
     )
 
-    mode = "SHM" if args.use_shm else "ZMQ"
-    jitter_str = f", jitter=±{_JITTER_PCT}%" if args.randomize_len else ""
-    delay_str = ", randomize-delay" if args.randomize_delay else ""
     print(
-        f"Benchmark ({mode}): concurrency={args.concurrency}, "
+        f"Benchmark (SHM): concurrency={args.concurrency}, "
         f"requests={args.num_requests}, "
-        f"in={args.input_len}, out={args.output_len}{jitter_str}{delay_str}"
+        f"max_decode_steps={args.max_decode_steps}"
         + (" [profiling enabled]" if args.profile else "")
     )
 
-    jitter_headroom = (1.0 + _JITTER_PCT / 100.0) if args.randomize_len else 1.0
-    max_input = int(args.input_len * jitter_headroom) + 1
-    max_output = int(args.output_len * jitter_headroom) + 1
-    max_model_len = max(args.max_model_len, max_input + max_output)
-    #max_num_batched_tokens = args.concurrency * 32
-
+    # ── Engine ────────────────────────────────────────────────────────────
     engine_args = AsyncEngineArgs(
-        model=args.model,
+        model=str(model_path.absolute()),
         dtype="bfloat16",
-        max_model_len=max_model_len,
-        #max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_mem,
         skip_tokenizer_init=True,
-        load_format="dummy",
         disable_log_stats=True,
         enable_prefix_caching=False,
         trust_remote_code=True,
         enforce_eager=args.enforce_eager,
-        compilation_config={"cudagraph_mode": "PIECEWISE"},
-        shm_decode=args.use_shm,
+        shm_decode=True,
         input_coalesce_timeout_ms=args.input_coalesce_timeout_ms,
-        #enable_chunked_prefill=True,
     )
 
     print("Initializing engine...")
     engine = AsyncLLM.from_engine_args(engine_args)
 
     sampling_params = SamplingParams(
-        max_tokens=max_model_len,
-        skip_sampling=True,
+        max_tokens=args.max_model_len,
+        skip_sampling=False,
     )
 
-    # --- Warmup + Benchmark ---
+    # ── Warmup + Benchmark ────────────────────────────────────────────────
     warmup_num = 0 if args.no_warmup else 3 * args.concurrency
-    for run, num_requests in enumerate(
-        [warmup_num, args.num_requests]
-    ):
+    for run, num_requests in enumerate([warmup_num, args.num_requests]):
         if num_requests == 0:
             continue
         metrics = init_metrics(num_requests)
@@ -554,13 +450,13 @@ async def main():
                         worker_id=i,
                         engine=engine,
                         sampling_params=sampling_params,
-                        input_num_tokens=args.input_len,
-                        output_steps=args.output_len,
-                        hidden_size=args.hidden_size,
+                        config=config,
+                        tokenizer=tokenizer,
+                        texts=texts,
+                        max_decode_steps=args.max_decode_steps,
                         metrics=metrics,
-                        use_shm=args.use_shm,
-                        len_jitter=args.randomize_len,
-                        randomize_delay=args.randomize_delay,
+                        speaker=args.speaker,
+                        language=args.language,
                     )
                 )
                 for i in range(args.concurrency)
@@ -578,7 +474,7 @@ async def main():
               f"{metrics['failed_sequences']} failed)")
 
         if run > 0:
-            calculate_and_print_metrics(metrics, total_time, args)
+            print_metrics(metrics, total_time, args)
 
 
 if __name__ == "__main__":
@@ -586,4 +482,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBenchmark interrupted.")
-

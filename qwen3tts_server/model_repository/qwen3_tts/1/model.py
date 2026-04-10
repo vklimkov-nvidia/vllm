@@ -51,6 +51,7 @@ class TritonPythonModel:
         self.max_tokens = int(_get_param(params, "max_tokens", "2048"))
         self.codec_chunk_size = int(_get_param(params, "codec_chunk_size", "128"))
         self.codec_left_context = int(_get_param(params, "codec_left_context", "25"))
+        self.first_chunk_frames = int(_get_param(params, "first_chunk_frames", "2"))
         self.max_request_timeout_s = float(_get_param(params, "max_request_timeout_s", "60"))
         self._samples_per_frame = int(24000 / 12.5)
 
@@ -107,8 +108,8 @@ class TritonPythonModel:
             skip_tokenizer_init=True,
             enable_prefix_caching=False,
             trust_remote_code=True,
-            input_coalesce_timeout_ms=60,
-            compilation_config={"cudagraph_mode": "PIECEWISE"},
+            input_coalesce_timeout_ms=30,
+            #compilation_config={"cudagraph_mode": "PIECEWISE"},
             shm_decode=True,
         )
 
@@ -297,7 +298,7 @@ class TritonPythonModel:
             decode_step_times = []
             timed_out = False
 
-            for step in range(self.max_tokens - 1):
+            for step in range(self.max_tokens - prompt_len - 1):
                 if state["error"] is not None:
                     break
                 if time.perf_counter() > request_deadline:
@@ -331,7 +332,11 @@ class TritonPythonModel:
                 g0_write_pos += 1
 
                 new_frames = len(generated_codecs) - sent_frames
-                if new_frames >= self.codec_chunk_size - self.codec_left_context:
+                if sent_frames == 0:
+                    threshold = self.first_chunk_frames
+                else:
+                    threshold = self.codec_chunk_size - self.codec_left_context
+                if new_frames >= threshold:
                     ctx = min(sent_frames, self.codec_left_context)
                     codec_q.put((
                         torch.cat(generated_codecs[sent_frames - ctx:sent_frames + new_frames], dim=0),

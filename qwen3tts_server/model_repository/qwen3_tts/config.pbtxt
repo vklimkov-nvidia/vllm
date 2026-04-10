@@ -40,10 +40,6 @@ parameters {
   value: { string_value: "/workspace/server/models/qwen3tts_vllm_model" }
 }
 parameters {
-  key: "prefill_assembler_path"
-  value: { string_value: "/workspace/server/models/encoder.jit" }
-}
-parameters {
   key: "default_speaker"
   value: { string_value: "aiden" }
 }
@@ -54,6 +50,10 @@ parameters {
 parameters {
   key: "codec_chunk_size"
   value: { string_value: "35" }
+}
+parameters {
+  key: "first_chunk_frames"
+  value: { string_value: "2" }
 }
 parameters {
   key: "codec_left_context"
