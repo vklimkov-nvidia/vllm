@@ -149,6 +149,11 @@ class Qwen3TTSConfig(PretrainedConfig):
                 "rope_theta": 1000000.0,
                 "rope_scaling": None,
                 "use_cache": True,
+                "do_sample": True,
+                "temperature": 0.9,
+                "top_k": 50,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
             },
         }
     

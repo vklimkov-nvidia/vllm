@@ -29,30 +29,27 @@ from safetensors.torch import load_file, save_file
 def _adjust_config(config: dict) -> None:
     """Apply vLLM-specific adjustments to the config dict (in place)."""
 
-    # 1. Add custom_input_specs for vLLM prompt-embed support
-    repetition_window = 256
-    codes_num = 16
-    if "custom_input_specs" not in config:
-        print("  Adding custom_input_specs...")
-        if "talker_config" not in config or "hidden_size" not in config["talker_config"]:
-            raise ValueError(
-                "Cannot determine talker hidden_size from config.json. "
-                "Ensure talker_config.hidden_size is present."
-            )
-        dim = config["talker_config"]["hidden_size"]
-        print(f"  Talker hidden_size (from config): {dim}")
-        config["custom_input_specs"] = [
-            {"name": "text_ids", "dtype": "int64"},
-            {"name": "acoustic_ids", "dim": codes_num, "dtype": "int64"},
-            {"name": "prev_group0_tokens", "dim": repetition_window, "dtype": "int64"}
-        ]
+    if "talker_config" not in config or "hidden_size" not in config["talker_config"]:
+        raise ValueError(
+            "Cannot determine talker hidden_size from config.json. "
+            "Ensure talker_config.hidden_size is present."
+        )
+    hidden_size = config["talker_config"]["hidden_size"]
+    num_code_groups = config["talker_config"].get("num_code_groups", 16)
 
-    # 2. Add custom_outputs
-    if "custom_output_specs" not in config:
-        print("  Adding custom_outputs...")
-        config["custom_output_specs"] = [
-            {"name": "codes", "dim": codes_num, "dtype": "int64"}
-        ]
+    # 1. Custom input specs: text_ids + prev_hidden
+    print("  Setting custom_input_specs...")
+    config["custom_input_specs"] = [
+        {"name": "text_ids", "dtype": "int64"},
+        {"name": "prev_hidden", "dim": hidden_size, "dtype": "bfloat16"},
+    ]
+
+    # 2. Custom output specs: codes (groups 1..N-1) + hidden
+    print("  Setting custom_output_specs...")
+    config["custom_output_specs"] = [
+        {"name": "codes", "dim": num_code_groups - 1, "dtype": "int64"},
+        {"name": "hidden", "dim": hidden_size, "dtype": "bfloat16"},
+    ]
 
     # 3. Fix rope_scaling in talker_config
     if "talker_config" in config:
@@ -63,18 +60,35 @@ def _adjust_config(config: dict) -> None:
                 print("  Adding mrope_interleaved=True to rope_scaling...")
                 rs["mrope_interleaved"] = True
 
-    # 4. Add sampling parameters (original hard defaults)
+    # 4. Add top-level sampling parameters (for group-0 via vLLM sampler)
     defaults = {
         "do_sample": True,
         "temperature": 0.9,
         "top_k": 50,
         "top_p": 1.0,
         "repetition_penalty": 1.1,
-        "repetition_window": repetition_window
     }
     for key, val in defaults.items():
         if key not in config:
             config[key] = val
+
+    # 5. Fix code_predictor_config sampling parameters.
+    #    The original checkpoint has HF GenerationConfig boilerplate
+    #    (do_sample=false, temperature=1.0) which doesn't reflect the
+    #    actual runtime defaults used by the original HF implementation
+    #    (subtalker_dosample=True, subtalker_temperature=0.9, etc.).
+    if "talker_config" in config:
+        cp_cfg = config["talker_config"].get("code_predictor_config", {})
+        cp_sampling_defaults = {
+            "do_sample": True,
+            "temperature": 0.9,
+            "top_k": 50,
+            "top_p": 1.0,
+            "repetition_penalty": 1.0,
+        }
+        for key, val in cp_sampling_defaults.items():
+            cp_cfg[key] = val
+        print("  Set code_predictor_config sampling parameters.")
 
 
 # ── Weight computation ───────────────────────────────────────────────
@@ -175,8 +189,6 @@ def _create_acoustic_zero_token(
 _WEIGHT_RENAME_PREFIXES: list[tuple[str, str]] = [
     # codec_embedding moved from talker.model → talker.code_predictor
     ("talker.model.codec_embedding.", "talker.code_predictor.codec_embedding."),
-    # codec_head moved from talker → talker.code_predictor
-    ("talker.codec_head.", "talker.code_predictor.codec_head."),
 ]
 
 
@@ -242,7 +254,7 @@ def convert(input_dir: str, output_dir: str) -> None:
     print(f"  suppress_mask: shape={suppress_mask.shape}, "
             f"suppressed={suppress_mask.sum().item()} tokens")
 
-    weights["talker.code_predictor.suppress_mask"] = suppress_mask
+    weights["talker.suppress_mask"] = suppress_mask
 
     _create_acoustic_zero_token(weights, config)
 

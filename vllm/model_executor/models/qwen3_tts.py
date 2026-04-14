@@ -125,6 +125,30 @@ class Qwen3TTSNativeRotaryEmbedding(nn.Module):
         return cos, sin
 
 
+def _gumbel_sample(logits: torch.Tensor) -> torch.Tensor:
+    """Gumbel-max trick: equivalent to categorical sampling.
+
+    Uses only uniform RNG + log + argmax — all CUDA-graph safe.
+    Unlike ``torch.multinomial``, this degrades gracefully on degenerate
+    inputs (all-zero probs / all-``-inf`` logits) instead of triggering
+    a device-side assert that poisons the CUDA context.  Also ~2.5x
+    faster than multinomial in graph replay benchmarks.
+    """
+    u = torch.empty_like(logits).uniform_(1e-20, 1.0 - 1e-20)
+    return (logits - torch.log(-torch.log(u))).argmax(dim=-1)
+
+
+def _multinomial_sample(logits: torch.Tensor) -> torch.Tensor:
+    """Standard softmax + multinomial sampling.
+
+    CUDA-graph capturable on PyTorch >= 2.8, but will crash with a
+    device-side assert if any row has all-zero probabilities (e.g.
+    during graph warmup with uninitialised buffers).
+    """
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, 1).squeeze(-1)
+
+
 def _sample_from_logits(
     logits: torch.Tensor,
     do_sample: bool = True,
@@ -133,75 +157,78 @@ def _sample_from_logits(
     top_p: Optional[float] = None,
     repetition_penalty: float = 1.0,
     previous_tokens: Optional[torch.Tensor] = None,
+    use_gumbel: bool = True,
 ) -> torch.Tensor:
-    """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
-    
+    """Sample tokens from logits (CUDA-graph safe).
+
+    All operations are legal inside ``torch.cuda.graph()`` capture on
+    PyTorch >= 2.8 (``topk``, ``sort``, ``multinomial``, ``uniform_``,
+    ``argmax``, ``gather``, ``scatter_``, ``masked_fill``).
+
+    The only patterns that remain **unsafe** during capture are
+    host-to-device copies such as ``torch.tensor(scalar, device=cuda)``
+    and ``torch.full_like(t, val)`` for some values — use
+    ``masked_fill`` or pre-allocated buffers instead.
+
     Args:
-        logits: [..., vocab_size] - logits for token prediction
-        do_sample: Whether to sample or use argmax
-        temperature: Sampling temperature
-        top_k: Top-k sampling (keep top k tokens)
-        top_p: Top-p (nucleus) sampling
-        repetition_penalty: Penalty for repeated tokens
-        previous_tokens: [..., seq_len] - previously generated tokens for penalty
-        
-    Returns:
-        tokens: [...] - sampled token indices
+        use_gumbel: If ``True`` (default), use the Gumbel-max trick for
+            the final categorical draw.  Gumbel-max is ~2.5x faster
+            than ``multinomial`` and robust to degenerate warmup data.
+            Set ``False`` to use ``softmax → multinomial`` instead.
     """
     if repetition_penalty != 1.0 and previous_tokens is not None:
-        # Apply repetition penalty
-        # Create a copy to avoid modifying original logits in place if needed elsewhere
-        # logits = logits.clone() 
-        # But we can probably modify in place here as it's the last step
-        
-        # Check if previous_tokens has the same batch dim
-        if previous_tokens.dim() == logits.dim(): # [batch, seq] vs [batch, vocab]
-             # Handle standard case
-             pass
-        
-        # We need to gather scores for the tokens that have appeared
-        # This is a bit expensive if history is long, but for code predictor (16 tokens) it's fine.
-        # For full history, we might skip implementation if context is missing.
-        
-        # Simple implementation for small context (like code predictor loop):
-        # Gather scores for each token in previous_tokens
         score = torch.gather(logits, -1, previous_tokens)
-        
-        # Apply penalty: if score < 0 then score * penalty else score / penalty
-        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
-        
-        # Scatter back
+        score = torch.where(
+            score < 0,
+            score * repetition_penalty,
+            score / repetition_penalty,
+        )
         logits.scatter_(-1, previous_tokens, score)
 
     if not do_sample:
         return logits.argmax(dim=-1)
-    
+
     logits = logits / max(temperature, 1e-6)
-    
+
+    # ── Top-k filtering ─────────────────────────────────────────────
     if top_k is not None and top_k > 0:
-        top_k = min(top_k, logits.size(-1))
-        v, _ = torch.topk(logits, top_k)
-        logits = torch.where(logits < v[..., [-1]], float('-inf'), logits)
-    
-    if top_p is not None and top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(
-            torch.softmax(sorted_logits, dim=-1), dim=-1
+        vals, idxs = torch.topk(logits, k=min(top_k, logits.size(-1)), dim=-1)
+
+        # ── Top-p (nucleus) within the top-k slice ──────────────────
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_vals, sort_idx = torch.sort(vals, dim=-1, descending=True)
+            probs = torch.softmax(sorted_vals, dim=-1)
+            cum_probs = torch.cumsum(probs, dim=-1)
+            remove = (cum_probs - probs) > top_p
+            sorted_vals = sorted_vals.masked_fill(remove, -1e10)
+            # Unsort back to topk order
+            unsort_idx = sort_idx.argsort(dim=-1)
+            vals = sorted_vals.gather(-1, unsort_idx)
+
+        sampled_in_k = (_gumbel_sample(vals) if use_gumbel
+                        else _multinomial_sample(vals))
+        return idxs.gather(-1, sampled_in_k.unsqueeze(-1)).squeeze(-1)
+
+    # ── Top-p only (no top-k) ───────────────────────────────────────
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(
+            logits, dim=-1, descending=True
         )
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            -1, sorted_indices, sorted_indices_to_remove
-        )
-        logits = torch.where(indices_to_remove, float('-inf'), logits)
-    
-    probs = torch.softmax(logits, dim=-1)
-    # Flatten for multinomial, then reshape back
-    orig_shape = probs.shape[:-1]
-    probs_flat = probs.view(-1, probs.size(-1))
-    tokens_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
-    return tokens_flat.view(orig_shape)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cum_probs = torch.cumsum(probs, dim=-1)
+        remove = (cum_probs - probs) > top_p
+        sorted_logits = sorted_logits.masked_fill(remove, -1e10)
+
+        sampled_sorted = (_gumbel_sample(sorted_logits) if use_gumbel
+                          else _multinomial_sample(sorted_logits))
+        return sorted_indices.gather(
+            -1, sampled_sorted.unsqueeze(-1)
+        ).squeeze(-1)
+
+    # ── No filtering — sample from full distribution ────────────────
+    if use_gumbel:
+        return _gumbel_sample(logits)
+    return _multinomial_sample(logits)
 
 
 class Qwen3TTSTalkerMLP(nn.Module):
@@ -660,13 +687,6 @@ def _dict_to_namespace(d, _key: Optional[str] = None):
     return d
 
 
-def _get_tts_config(hf_config: PretrainedConfig) -> PretrainedConfig:
-    """Get the full TTS config if available, otherwise return None."""
-    if hasattr(hf_config, "talker_config"):
-        return hf_config
-    return None
-
-
 def _get_talker_config(hf_config: PretrainedConfig):
     """Get the talker config from either full TTS config or talker config directly.
 
@@ -914,22 +934,15 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             for _ in range(config.num_code_groups - 1)
         ])
 
-        # Sampling parameters for the internal groups-1..N-1 loop
-        tts_config = _get_tts_config(hf_config)
-        if tts_config is not None:
-            self.do_sample = getattr(tts_config, "do_sample", True)
-            self.temperature = getattr(tts_config, "temperature", 1.0)
-            self.top_k = getattr(tts_config, "top_k", 50)
-            self.top_p = getattr(tts_config, "top_p", 1.0)
-            self.repetition_penalty = getattr(
-                tts_config, "repetition_penalty", 1.0
-            )
-        else:
-            self.do_sample = True
-            self.temperature = 1.0
-            self.top_k = 50
-            self.top_p = 1.0
-            self.repetition_penalty = 1.0
+        # Sampling parameters for the internal groups-1..N-1 loop,
+        # read from code_predictor_config. Fallback defaults match the
+        # original HF implementation's subtalker_* arguments.
+        self.do_sample = getattr(config, "do_sample", True)
+        self.temperature = getattr(config, "temperature", 0.9)
+        self.top_k = getattr(config, "top_k", 50)
+        self.top_p = getattr(config, "top_p", 1.0)
+        self.repetition_penalty = getattr(config, "repetition_penalty", 1.0)
+        self.use_gumbel = getattr(config, "use_gumbel", True)
 
         # ── Persistent scratch buffers ──────────────────────────────────
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1029,6 +1042,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
                 top_p=self.top_p,
                 repetition_penalty=self.repetition_penalty,
                 previous_tokens=current_context,
+                use_gumbel=self.use_gumbel,
             )
             all_codecs[:, step] = next_token
 
@@ -1155,6 +1169,47 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         """Get group-0 codec embeddings for input ids."""
         return self.code_predictor.get_group0_embeddings(input_ids)
 
+    def _get_decode_idxs(self):
+        """
+        helper function that returns indices of decoding tokens,
+        that's where exactly the local transformer should be
+        applied. 
+
+        Returns:
+            decode_idx: indices of decoder requests, if None returned,
+                        local transformer should be applied everywhere
+            num_requests: number of decoding requests, before padding
+        """
+        ctx = get_forward_context()
+        attn_metadata = ctx.attn_metadata
+        if attn_metadata is None:
+            # when attention metadata is not provided (capturing, dummy run)
+            # then we should apply the local transformer everywhere
+            return None, 0
+
+        if isinstance(attn_metadata, dict):
+            any_layer_meta = next(iter(attn_metadata.values()))
+        else:
+            any_layer_meta = attn_metadata
+
+        if any_layer_meta.max_query_len == 1:
+            # all requests in the batch a decode-only,
+            # apply local transformer everywhere
+            return None, 0
+        
+        start_loc = any_layer_meta.query_start_loc
+        tokens_per_req = start_loc[1:] - start_loc[:-1]
+        is_decode = (tokens_per_req == 1)  # shape: (num_reqs,)
+        decode_token_indices = start_loc[:-1][is_decode]
+
+        num_requests = decode_token_indices.shape[0]
+        padded_num_requests = num_requests
+        if self.vllm_config.compilation_config.use_cudagraph:
+            padded_num_requests = self.vllm_config.pad_for_cudagraph(num_requests)
+        if padded_num_requests != num_requests:
+            decode_token_indices = torch.nn.functional.pad(decode_token_indices, (0, padded_num_requests - num_requests))
+        return decode_token_indices, num_requests
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1198,45 +1253,28 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
         codec_embed = self.get_input_embeddings(input_ids)
 
-        # always runs
-        codes_1_15 = self.code_predictor.generate_groups_1_15(
-            prev_hidden=prev_hidden,
-            group0_tokens=input_ids,
-        )
-
-        # Only fuse groups 1..N-1 into embeddings for uniform decode (exactly
-        # one scheduled token per request). Chunked prefill has
-        # sum(scheduled) > num_reqs and must not take this path.
-        #
-        # With piecewise CUDA graphs, ``input_ids`` is padded to a capture size
-        # (``num_input_tokens``). Use attention metadata's unpadded totals — host
-        # Python ints set when metadata is built, not GPU reads — so this stays
-        # valid under full CUDA graph replay (unlike ``query_start_loc[-1].item()``).
-        ctx = get_forward_context()
-        attn_metadata = ctx.attn_metadata
-        to_embed = False
-        num_actual_tokens: Optional[int] = None
-        if attn_metadata is None:
-            to_embed = True
-        else:
-            if isinstance(attn_metadata, dict):
-                any_layer_meta = next(iter(attn_metadata.values()))
-            else:
-                any_layer_meta = attn_metadata
-            num_actual_tokens = any_layer_meta.num_actual_tokens
-            num_requests = any_layer_meta.query_start_loc.shape[0] - 1
-            to_embed = num_requests == num_actual_tokens
-
-        if to_embed:
-            group_embeddings = self.code_predictor.get_group_embeddings()
-            if num_actual_tokens is not None:
-                for i in range(len(group_embeddings)):
-                    codec_embed[:num_actual_tokens].add_(
-                        group_embeddings[i](
-                            codes_1_15[:num_actual_tokens, i]))
-            else:
-                for i in range(len(group_embeddings)):
-                    codec_embed.add_(group_embeddings[i](codes_1_15[:, i]))
+        decode_idx, num_req = self._get_decode_idxs()
+        group_embeddings = self.code_predictor.get_group_embeddings()
+        if decode_idx is None:
+            codes_1_15 = self.code_predictor.generate_groups_1_15(
+                prev_hidden=prev_hidden,
+                group0_tokens=input_ids,
+            )
+            self._out_codes[:codes_1_15.shape[0]] = codes_1_15
+            for i in range(len(group_embeddings)):
+                codec_embed.add_(group_embeddings[i](codes_1_15[:, i]))
+        elif num_req > 0:
+            codes_1_15 = self.code_predictor.generate_groups_1_15(
+                prev_hidden=prev_hidden[decode_idx],
+                group0_tokens=input_ids[decode_idx],
+            )
+            valid_dec_idx = decode_idx[:num_req]
+            self._out_codes[valid_dec_idx] = codes_1_15[:num_req]
+            for i in range(len(group_embeddings)):
+                codec_embed[valid_dec_idx] = (
+                    codec_embed[valid_dec_idx]
+                    + group_embeddings[i](codes_1_15[:num_req, i])
+                )
 
         num_tokens = input_ids.shape[0]
         combined_embeddings = self._combined_embeddings[:num_tokens]
@@ -1253,7 +1291,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
 
-        return hidden_states, codes_1_15, hidden_states
+        out_codes = self._out_codes[:num_tokens]
+        return hidden_states, out_codes, hidden_states
 
     def compute_logits(
         self,

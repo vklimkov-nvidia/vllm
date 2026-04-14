@@ -2,7 +2,7 @@
 Triton Python Model for Qwen3-TTS CustomVoice streaming inference.
 
 Pipeline:
-  1. Tokenize text into text_ids + acoustic_ids via build_prefill_tokens
+  1. Tokenize text into text_ids + group0_ids via build_prefill_tokens
   2. Run vLLM prefill + decode loop; stream codec chunks to codec_decoder via BLS
   3. Client concatenates received audio chunks @ 24 kHz
 """
@@ -78,10 +78,10 @@ class TritonPythonModel:
         self.codec_eos_token_id = int(tc.get("codec_eos_token_id", 2150))
         self.tts_pad_token_id = int(cfg.get("tts_pad_token_id"))
         self.num_code_groups = int(tc.get("num_code_groups", 16))
+        self.hidden_size = int(tc.get("hidden_size", 2048))
         self.codec_language_mapping: Optional[Dict[str, int]] = tc.get("codec_language_id")
         self.spk_id_mapping: Dict[str, int] = tc.get("spk_id", {})
         self.spk_is_dialect: Dict[str, object] = tc.get("spk_is_dialect", {})
-        self._rep_penalty_window = cfg.get("repetition_window", 256)
 
         self.default_speaker = _get_param(params, "default_speaker", "aiden").lower()
         if self.default_speaker not in self.spk_id_mapping:
@@ -122,9 +122,13 @@ class TritonPythonModel:
             self._start_output_handler(), self._loop
         ).result(timeout=10)
 
+        cfg = self._model_config_dict
         self.sampling_params = SamplingParams(
             max_tokens=self.max_tokens,
-            skip_sampling=False,
+            temperature=cfg.get("temperature", 0.9),
+            top_k=cfg.get("top_k", 50),
+            top_p=cfg.get("top_p", 1.0),
+            repetition_penalty=cfg.get("repetition_penalty", 1.0),
         )
         self._thread_pool = __import__("concurrent").futures.ThreadPoolExecutor(
             max_workers=int(_get_param(params, "max_concurrency", "8")),
@@ -134,11 +138,7 @@ class TritonPythonModel:
         self.engine._run_output_handler()
 
     def _resolve_language(self, language: str, speaker: str) -> Optional[str]:
-        """Resolve language string for build_prefill_tokens.
-
-        Returns a language name from codec_language_id, or None to omit
-        language (nothink control path).
-        """
+        """Resolve language string for build_prefill_tokens."""
         key = language.strip().lower()
         if key == "auto":
             dialect = self.spk_is_dialect.get(speaker)
@@ -239,7 +239,7 @@ class TritonPythonModel:
         request_deadline = t_start + self.max_request_timeout_s
 
         resolved_lang = self._resolve_language(language, speaker)
-        text_ids, acoustic_ids = Qwen3TTSTalkerForConditionalGeneration.build_prefill_tokens(
+        text_ids, group0_ids = Qwen3TTSTalkerForConditionalGeneration.build_prefill_tokens(
             tokenizer=self.tokenizer,
             text=text,
             speaker=speaker,
@@ -251,7 +251,6 @@ class TritonPythonModel:
         request_id = str(uuid.uuid4())
         rid = request_id[:8]
         prompt_len = text_ids.shape[0]
-        _W = self._rep_penalty_window
 
         codec_q: queue.Queue = queue.Queue()
         codec_thread = None
@@ -263,12 +262,11 @@ class TritonPythonModel:
         try:
             output_queue = asyncio.run_coroutine_threadsafe(
                 self.engine.add_request(request_id, {
-                    "prompt_token_ids": [0] * prompt_len,
+                    "prompt_token_ids": group0_ids.tolist(),
                     "custom_inputs": {
                         "text_ids": text_ids,
-                        "acoustic_ids": acoustic_ids,
-                        "prev_group0_tokens": torch.full(
-                            (prompt_len, _W), self.codec_eos_token_id + 1, dtype=torch.long),
+                        "prev_hidden": torch.zeros(
+                            prompt_len, self.hidden_size, dtype=torch.bfloat16),
                     },
                 }, self.sampling_params),
                 self._loop,
@@ -280,21 +278,18 @@ class TritonPythonModel:
             t_vllm_prefill = time.perf_counter()
 
             custom_out = prefill_output.outputs[0].custom_outputs
-            first_token = custom_out["codes"][-1:]  # [1, num_code_groups]
-            generated_codecs = [first_token]
 
-            prev_g0 = torch.full((1, _W), self.codec_eos_token_id + 1, dtype=torch.long)
-            prev_g0[0, 0] = first_token[0, 0].item()
-            g0_write_pos = 1
+            prev_hidden = custom_out["hidden"][-1:].clone()
+            prev_group0 = prefill_output.outputs[0].token_ids[-1]
             sent_frames = 0
 
             decode_text_id = torch.tensor([self.tts_pad_token_id], dtype=torch.long)
-            decode_acoustic_id = first_token.clone()  # [1, num_code_groups]
 
             codec_thread = threading.Thread(
                 target=self._codec_worker, args=(codec_q, response_sender, state), daemon=True)
             codec_thread.start()
 
+            generated_codecs = []
             decode_step_times = []
             timed_out = False
 
@@ -311,8 +306,7 @@ class TritonPythonModel:
                         request_id,
                         custom_inputs={
                             "text_ids": decode_text_id,
-                            "acoustic_ids": decode_acoustic_id,
-                            "prev_group0_tokens": prev_g0,
+                            "prev_hidden": prev_hidden,
                         },
                         timeout=60,
                     )
@@ -321,15 +315,24 @@ class TritonPythonModel:
                     break
                 decode_step_times.append(time.perf_counter() - t_step)
 
-                next_tokens = outputs["codes"][-1:].clone()  # [1, num_code_groups]
-                g0_tok = next_tokens[0, 0].item()
+                codes_1_15 = outputs["codes"][-1:].clone()  # [1, 15]
+                prev_hidden = outputs["hidden"][-1:].clone()  # [1, hidden_size]
+
+                # Assemble complete codec frame: [group0, codes_1_15]
+                frame = torch.cat([
+                    torch.tensor([[prev_group0]], dtype=torch.long),
+                    codes_1_15,
+                ], dim=-1)  # [1, 16]
+                generated_codecs.append(frame)
+
+                sampled_token = outputs.get("sampled_token_ids")
+                g0_tok = int(sampled_token[-1])
+            
+
                 if g0_tok == self.codec_eos_token_id:
                     break
 
-                generated_codecs.append(next_tokens)
-                decode_acoustic_id = next_tokens
-                prev_g0[0, g0_write_pos % _W] = g0_tok
-                g0_write_pos += 1
+                prev_group0 = g0_tok
 
                 new_frames = len(generated_codecs) - sent_frames
                 if sent_frames == 0:
@@ -343,7 +346,7 @@ class TritonPythonModel:
                         ctx, False))
                     sent_frames += new_frames
             else:
-                timed_out = timed_out  # max_tokens exhausted (no EOS)
+                timed_out = timed_out
 
             t_decode_end = time.perf_counter()
 
