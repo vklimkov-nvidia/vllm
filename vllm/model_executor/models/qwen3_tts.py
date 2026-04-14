@@ -27,8 +27,9 @@ from transformers import PretrainedConfig
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.compilation.backends import set_model_tag
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -1134,12 +1135,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
-        # Persistent buffers
+        # Persistent buffers — addresses must be stable across CUDA graph
+        # replays.  The piecewise CUDAGraphWrapper does NOT copy inputs on
+        # replay; it expects the same ``data_ptr()`` that was recorded during
+        # capture.  Any tensor created transiently in ``forward()`` (like
+        # ``text_embed + codec_embed``) would have a new address each call,
+        # causing the replayed graph to read stale memory.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         codes_num = self.code_predictor.num_code_groups - 1  # groups 1..N-1
         dtype = vllm_config.model_config.dtype
         self._out_codes = torch.zeros(
             max_num_tokens, codes_num, dtype=torch.long
+        )
+        self._combined_embeddings = torch.zeros(
+            max_num_tokens, config.hidden_size, dtype=dtype
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1158,12 +1167,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
                tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Forward pass: code predictor -> embedding -> backbone.
 
-        Simplified for single-request eager mode:
-        - Prefill (seq_len > 1): skip code predictor, embed = text + codec
-        - Decode (seq_len == 1): run code predictor, embed = text + codec + groups
+        Handles three regimes transparently:
+
+        * **Profile / dummy run** (``attn_metadata is None``): the code-
+          predictor path runs on every token so it is captured in the
+          compiled CUDA graph.
+        * **Decode-only batch**: every token is a decode token — the
+          compiled / CUDA-graphed path replays directly.
+        * **Mixed prefill + decode**: only decode-token positions are
+          extracted and fed through the code predictor (eager); group
+          embeddings are scattered back into ``codec_embed`` at those
+          positions.
 
         Args:
-            input_ids: Group-0 codec tokens.
+            input_ids: Group-0 codec tokens  ``[num_tokens]``.
             positions: Position IDs for rotary embeddings.
             intermediate_tensors: For pipeline parallelism.
             inputs_embeds: Pre-computed input embeddings (unused).
@@ -1175,34 +1192,55 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             Non-last PP rank: IntermediateTensors.
             Last PP rank: ``(hidden_states, codes_1_15, hidden_states)``.
         """
-        if get_pp_group().is_first_rank:
-            seq_len = input_ids.shape[0]
 
-            text_embed = self.text_projection(
-                self.model.get_text_embeddings(text_ids)
-            )
-            codec_embed = self.get_input_embeddings(input_ids)
+        text_embed = self.text_projection(
+            self.model.get_text_embeddings(text_ids)
+        )
+        codec_embed = self.get_input_embeddings(input_ids)
 
-            if seq_len > 1:
-                # Prefill: no code predictor
-                codes_1_15 = self._out_codes[:seq_len]
-                codes_1_15.zero_()
-                combined_embeddings = text_embed + codec_embed
-            else:
-                # Decode: run code predictor for groups 1..N-1
-                codes_1_15 = self.code_predictor.generate_groups_1_15(
-                    prev_hidden=prev_hidden,
-                    group0_tokens=input_ids,
-                )
-                group_embeddings = self.code_predictor.get_group_embeddings()
-                for i in range(len(group_embeddings)):
-                    codec_embed = codec_embed + group_embeddings[i](
-                        codes_1_15[:, i]
-                    )
-                combined_embeddings = text_embed + codec_embed
+        # always runs
+        codes_1_15 = self.code_predictor.generate_groups_1_15(
+            prev_hidden=prev_hidden,
+            group0_tokens=input_ids,
+        )
+
+        # Only fuse groups 1..N-1 into embeddings for uniform decode (exactly
+        # one scheduled token per request). Chunked prefill has
+        # sum(scheduled) > num_reqs and must not take this path.
+        #
+        # With piecewise CUDA graphs, ``input_ids`` is padded to a capture size
+        # (``num_input_tokens``). Use attention metadata's unpadded totals — host
+        # Python ints set when metadata is built, not GPU reads — so this stays
+        # valid under full CUDA graph replay (unlike ``query_start_loc[-1].item()``).
+        ctx = get_forward_context()
+        attn_metadata = ctx.attn_metadata
+        to_embed = False
+        num_actual_tokens: Optional[int] = None
+        if attn_metadata is None:
+            to_embed = True
         else:
-            combined_embeddings = None
-            codes_1_15 = None
+            if isinstance(attn_metadata, dict):
+                any_layer_meta = next(iter(attn_metadata.values()))
+            else:
+                any_layer_meta = attn_metadata
+            num_actual_tokens = any_layer_meta.num_actual_tokens
+            num_requests = any_layer_meta.query_start_loc.shape[0] - 1
+            to_embed = num_requests == num_actual_tokens
+
+        if to_embed:
+            group_embeddings = self.code_predictor.get_group_embeddings()
+            if num_actual_tokens is not None:
+                for i in range(len(group_embeddings)):
+                    codec_embed[:num_actual_tokens].add_(
+                        group_embeddings[i](
+                            codes_1_15[:num_actual_tokens, i]))
+            else:
+                for i in range(len(group_embeddings)):
+                    codec_embed.add_(group_embeddings[i](codes_1_15[:, i]))
+
+        num_tokens = input_ids.shape[0]
+        combined_embeddings = self._combined_embeddings[:num_tokens]
+        torch.add(text_embed, codec_embed, out=combined_embeddings)
 
         hidden_states = self.model(
             input_ids,
