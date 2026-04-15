@@ -53,13 +53,11 @@ def _build_request_inputs(
     speaker: str,
     language: str,
 ) -> dict:
-    """Build vLLM engine inputs from a text string (mirrors demo_qwen3_tts.py)."""
+    """Build vLLM engine inputs from a text string."""
     tc = config["talker_config"]
-    codec_eos_token_id = tc["codec_eos_token_id"]
-    tts_pad_token_id = config["tts_pad_token_id"]
-    rep_window = config.get("repetition_window", 256)
+    hidden_size = tc["hidden_size"]
 
-    text_ids, acoustic_ids = (
+    text_ids, group0_ids = (
         Qwen3TTSTalkerForConditionalGeneration.build_prefill_tokens(
             tokenizer=tokenizer,
             text=text,
@@ -72,14 +70,11 @@ def _build_request_inputs(
     prompt_len = text_ids.shape[0]
 
     inputs = {
-        "prompt_token_ids": [0] * prompt_len,
+        "prompt_token_ids": group0_ids.tolist(),
         "custom_inputs": {
             "text_ids": text_ids,
-            "acoustic_ids": acoustic_ids,
-            "prev_group0_tokens": torch.full(
-                (prompt_len, rep_window),
-                codec_eos_token_id + 1,
-                dtype=torch.long,
+            "prev_hidden": torch.zeros(
+                prompt_len, hidden_size, dtype=torch.bfloat16
             ),
         },
     }
@@ -96,27 +91,14 @@ def _decode_loop_sync(
     prefill_token_time: float,
     request_start_time: float,
 ):
-    """Run the entire decode loop in a plain OS thread (no asyncio).
-
-    After prefill completes on the event loop, this function takes over.
-    Each step: prepare input from previous output -> shm decode_step ->
-    record metrics.
-    """
+    """Run the entire decode loop in a plain OS thread (no asyncio)."""
     tc = config["talker_config"]
     codec_eos_token_id = tc["codec_eos_token_id"]
     tts_pad_token_id = config["tts_pad_token_id"]
-    rep_window = config.get("repetition_window", 256)
 
-    first_token = prefill_custom_outputs["codes"][-1:]  # [1, 16]
-    prev_g0 = torch.full(
-        (1, rep_window), codec_eos_token_id + 1, dtype=torch.long
-    )
-    g0_tok = first_token[0, 0].item()
-    prev_g0[0, 0] = g0_tok
-    g0_write_pos = 1
+    prev_hidden = prefill_custom_outputs["hidden"][-1:].clone()
 
     decode_text_id = torch.tensor([tts_pad_token_id], dtype=torch.long)
-    decode_acoustic_id = first_token.clone()
 
     last_token_time = prefill_token_time
     token_idx = 1
@@ -127,21 +109,18 @@ def _decode_loop_sync(
                 request_id,
                 custom_inputs={
                     "text_ids": decode_text_id,
-                    "acoustic_ids": decode_acoustic_id,
-                    "prev_group0_tokens": prev_g0,
+                    "prev_hidden": prev_hidden,
                 },
             )
             now = time.perf_counter()
 
-            next_tokens = custom_outputs["codes"][-1:].clone()
-            g0_tok = next_tokens[0, 0].item()
+            prev_hidden = custom_outputs["hidden"][-1:].clone()
+
+            sampled_token = custom_outputs.get("sampled_token_ids")
+            g0_tok = int(sampled_token[-1])
 
             if g0_tok == codec_eos_token_id:
                 break
-
-            decode_acoustic_id = next_tokens
-            prev_g0[0, g0_write_pos % rep_window] = g0_tok
-            g0_write_pos += 1
 
             if token_idx < 6:
                 metrics["first_tokens"][token_idx].append(
@@ -426,7 +405,10 @@ async def main():
 
     sampling_params = SamplingParams(
         max_tokens=args.max_model_len,
-        skip_sampling=False,
+        temperature=config.get("temperature", 0.9),
+        top_k=config.get("top_k", 50),
+        top_p=config.get("top_p", 1.0),
+        repetition_penalty=config.get("repetition_penalty", 1.0),
     )
 
     # ── Warmup + Benchmark ────────────────────────────────────────────────
