@@ -1022,6 +1022,9 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         inputs_embeds[:, 1, :] = self.codec_embedding(group0_tokens)
 
         for step in range(N - 1):
+            # some how it is more efficient to re-run same graph for
+            # bx16xdim input instead of capturing 15 graphs for different
+            # input lengths
             hidden_states = self(inputs_embeds)
 
             current_len = step + 2
@@ -1267,7 +1270,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             ctx = get_forward_context()
             orig_batch_descriptor = ctx.batch_descriptor
             ctx.batch_descriptor = BatchDescriptor(
-                num_tokens=num_req,
+                # padded number of requests
+                num_tokens=decode_idx.shape[0],
                 uniform_decode=False,
             )
             codes_1_15 = self.code_predictor.generate_groups_1_15(
