@@ -1010,7 +1010,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         seq_len = prev_hidden.shape[0]
         N = self.num_code_groups
 
-        inputs_embeds = self._cp_inputs_embeds[:seq_len]
+        inputs_embeds = self._cp_inputs_embeds[:seq_len]  # Batch x Books x Dim
         all_codecs = self._cp_all_codecs[:seq_len]
 
         inputs_embeds.zero_()
@@ -1247,7 +1247,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             Non-last PP rank: IntermediateTensors.
             Last PP rank: ``(hidden_states, codes_1_15, hidden_states)``.
         """
-
         text_embed = self.text_projection(
             self.model.get_text_embeddings(text_ids)
         )
@@ -1264,10 +1263,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             for i in range(len(group_embeddings)):
                 codec_embed.add_(group_embeddings[i](codes_1_15[:, i]))
         elif num_req > 0:
+            # need to overwrite the batch batch descriptor since we are slicing the inputs
+            ctx = get_forward_context()
+            orig_batch_descriptor = ctx.batch_descriptor
+            ctx.batch_descriptor = BatchDescriptor(
+                num_tokens=num_req,
+                uniform_decode=False,
+            )
             codes_1_15 = self.code_predictor.generate_groups_1_15(
                 prev_hidden=prev_hidden[decode_idx],
                 group0_tokens=input_ids[decode_idx],
             )
+            # restore original batch descriptor
+            ctx.batch_descriptor = orig_batch_descriptor
             valid_dec_idx = decode_idx[:num_req]
             self._out_codes[valid_dec_idx] = codes_1_15[:num_req]
             for i in range(len(group_embeddings)):
