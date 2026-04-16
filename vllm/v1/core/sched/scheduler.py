@@ -498,8 +498,14 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
-                    else:
+                    elif self.running:
                         preempted_req = self.running.pop()
+                    elif self.waiting_input:
+                        req_id = next(iter(self.waiting_input))
+                        self.waiting_input.remove(req_id)
+                        preempted_req = self.requests[req_id]
+                    else:
+                        preempted_req = request
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)

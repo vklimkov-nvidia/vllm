@@ -400,7 +400,7 @@ class EngineCore:
                 self._poll_shm_channels()
                 if not self.scheduler.waiting_input:
                     break
-                for req_id in self.scheduler.waiting_input:
+                for req_id in list(self.scheduler.waiting_input):
                     ch = self._shm_channels.get(req_id)
                     if ch is not None and not ch.check_input_ready():
                         ch.wait_input_ready(
