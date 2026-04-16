@@ -18,7 +18,7 @@ Usage:
 
 import os
 
-os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
 
 import argparse
 import asyncio
@@ -398,6 +398,7 @@ async def main():
         enforce_eager=args.enforce_eager,
         shm_decode=True,
         input_coalesce_timeout_ms=args.input_coalesce_timeout_ms,
+        attention_backend="TRITON_ATTN",
     )
 
     print("Initializing engine...")

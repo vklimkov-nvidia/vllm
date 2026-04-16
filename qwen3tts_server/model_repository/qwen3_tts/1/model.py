@@ -7,10 +7,10 @@ Pipeline:
   3. Client concatenates received audio chunks @ 24 kHz
 """
 
+import os
 import asyncio
 import json
 import logging
-import os
 import queue
 import threading
 import time
@@ -92,7 +92,7 @@ class TritonPythonModel:
                 raise ValueError("No spk_id entries in model config.")
 
     def _init_vllm_engine(self, params: dict, model_dir: Path):
-        os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+        os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 
         from vllm import SamplingParams
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -111,6 +111,7 @@ class TritonPythonModel:
             input_coalesce_timeout_ms=30,
             #compilation_config={"cudagraph_mode": "PIECEWISE"},
             shm_decode=True,
+            attention_backend="TRITON_ATTN",
         )
 
         self._loop = asyncio.new_event_loop()

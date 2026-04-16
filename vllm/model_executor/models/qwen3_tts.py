@@ -17,6 +17,7 @@
 # limitations under the License.
 """Inference-only Qwen3TTS Talker model compatible with HuggingFace weights."""
 
+import bisect
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Optional, Union
@@ -25,7 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention import Attention
+from vllm.model_executor.layers.attention import Attention
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -417,12 +418,11 @@ class Qwen3TTSTalkerAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        rope_parameters: dict,
         head_dim: Optional[int] = None,
         max_position: int = 32768,
         rms_norm_eps: float = 1e-6,
         qkv_bias: bool = False,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict] = None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -446,8 +446,6 @@ class Qwen3TTSTalkerAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -466,19 +464,13 @@ class Qwen3TTSTalkerAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         
-        # QK normalization (like Qwen3)
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-        # Rotary embeddings with MRoPE support
-        is_mrope = rope_scaling is not None and "mrope_section" in rope_scaling
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=True,
+            rope_parameters=rope_parameters,
         )
         
         self.attn = Attention(
@@ -606,19 +598,23 @@ class Qwen3TTSTalkerDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         
-        rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = getattr(config, "rope_theta", 1000000.0)
+        if rope_scaling is not None:
+            rope_parameters = dict(rope_scaling)
+            rope_parameters["rope_theta"] = rope_theta
+        else:
+            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
         
         self.self_attn = Qwen3TTSTalkerAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            rope_parameters=rope_parameters,
             head_dim=getattr(config, "head_dim", None),
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -1172,6 +1168,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         """Get group-0 codec embeddings for input ids."""
         return self.code_predictor.get_group0_embeddings(input_ids)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.get_input_embeddings(input_ids)
+
     def _get_decode_idxs(self):
         """
         helper function that returns indices of decoding tokens,
@@ -1207,8 +1206,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
 
         num_requests = decode_token_indices.shape[0]
         padded_num_requests = num_requests
-        if self.vllm_config.compilation_config.use_cudagraph:
-            padded_num_requests = self.vllm_config.pad_for_cudagraph(num_requests)
+        if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+            idx = bisect.bisect_left(sizes, num_requests)
+            if idx < len(sizes):
+                padded_num_requests = sizes[idx]
         if padded_num_requests != num_requests:
             decode_token_indices = torch.nn.functional.pad(decode_token_indices, (0, padded_num_requests - num_requests))
         return decode_token_indices, num_requests
