@@ -1,0 +1,8 @@
+pipecat-ai[webrtc,silero]
+pipecat-ai-small-webrtc-prebuilt
+vllm
+soundfile
+numpy
+fastapi
+uvicorn
+tritonclient[grpc]
