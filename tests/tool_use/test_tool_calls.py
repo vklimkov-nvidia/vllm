@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from typing import Optional
 
 import openai
 import pytest
@@ -11,6 +10,7 @@ from .utils import (
     MESSAGES_ASKING_FOR_TOOLS,
     MESSAGES_WITH_TOOL_RESPONSE,
     SEARCH_TOOL,
+    SEED,
     WEATHER_TOOL,
 )
 
@@ -28,6 +28,7 @@ async def test_tool_call_and_choice(client: openai.AsyncOpenAI):
         model=model_name,
         tools=[WEATHER_TOOL, SEARCH_TOOL],
         logprobs=False,
+        seed=SEED,
     )
 
     choice = chat_completion.choices[0]
@@ -58,10 +59,10 @@ async def test_tool_call_and_choice(client: openai.AsyncOpenAI):
 
     assert stop_reason == "tool_calls"
 
-    function_name: Optional[str] = None
+    function_name: str | None = None
     function_args_str: str = ""
-    tool_call_id: Optional[str] = None
-    role_name: Optional[str] = None
+    tool_call_id: str | None = None
+    role_name: str | None = None
     finish_reason_count: int = 0
 
     # make the same request, streaming
@@ -72,6 +73,7 @@ async def test_tool_call_and_choice(client: openai.AsyncOpenAI):
         max_completion_tokens=100,
         tools=[WEATHER_TOOL, SEARCH_TOOL],
         logprobs=False,
+        seed=SEED,
         stream=True,
     )
 
@@ -155,6 +157,7 @@ async def test_tool_call_with_results(client: openai.AsyncOpenAI):
         model=model_name,
         tools=[WEATHER_TOOL, SEARCH_TOOL],
         logprobs=False,
+        seed=SEED,
     )
 
     choice = chat_completion.choices[0]
@@ -172,6 +175,7 @@ async def test_tool_call_with_results(client: openai.AsyncOpenAI):
         model=model_name,
         tools=[WEATHER_TOOL, SEARCH_TOOL],
         logprobs=False,
+        seed=SEED,
         stream=True,
     )
 

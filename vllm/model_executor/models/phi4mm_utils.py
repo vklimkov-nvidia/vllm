@@ -6,7 +6,6 @@
 # but implemented by the Phi-Speech team
 #!/usr/bin/env python3
 import math
-from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -37,10 +36,13 @@ def get_activation(name: str = "relu") -> torch.nn.Module:
     if name == "gelu":
         return nn.GELU()
     if name == "swish":
-        return Swish()
+        return nn.SiLU()
     if name == "sigmoid":
-        return torch.nn.Sigmoid()
-    return nn.Identity()
+        return nn.Sigmoid()
+    if name == "identity":
+        return nn.Identity()
+
+    raise NotImplementedError(name)
 
 
 def adaptive_enc_mask(
@@ -94,44 +96,14 @@ def adaptive_enc_mask(
     return mask_left & mask_right
 
 
-class Swish(nn.Module):
-    """Implement Swish activation module.
-    From https://arxiv.org/pdf/2005.03191.pdf
-
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.act_fn = nn.Sigmoid()
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Apply Swish function
-
-        Args:
-            x: torch.Tensor
-                Input.
-        """
-        return x * self.act_fn(x)
-
-
 class GLU(nn.Module):
     """Implement Gated Linear Unit (GLU) module"""
 
     def __init__(self, dim: int = -1, act_name: str = "sigmoid") -> None:
         super().__init__()
-        self.dim = dim
-        self.act_name = act_name.lower()
 
-        if self.act_name == "relu":
-            self.act_fn = nn.ReLU(inplace=True)
-        elif self.act_name == "gelu":
-            self.act_fn = nn.GELU()
-        elif self.act_name == "swish":
-            self.act_fn = Swish()
-        elif self.act_name == "sigmoid":
-            self.act_fn = nn.Sigmoid()
-        else:
-            self.act_fn = nn.Identity()
+        self.dim = dim
+        self.act_fn = get_activation(act_name)
 
     def forward(self, x: Tensor) -> Tensor:
         """GLU forward
@@ -205,16 +177,7 @@ class GLUPointWiseConv(nn.Module):
                 padding=(kernel_size - 1) // 2,
             )
 
-        if glu_type == "sigmoid":
-            self.glu_act = nn.Sigmoid()
-        elif glu_type == "relu":
-            self.glu_act = nn.ReLU()
-        elif glu_type == "gelu":
-            self.glu_act = nn.GELU()
-        elif glu_type == "swish":
-            self.glu_act = Swish()
-        else:
-            raise ValueError(f"Unsupported activation type {self.glu_act}")
+        self.glu_act = get_activation(glu_type)
 
         if bias_in_glu:
             self.b1 = nn.Parameter(torch.zeros(1, output_dim, 1))
@@ -254,8 +217,8 @@ class GLUPointWiseConv(nn.Module):
         return x
 
 
-class DepthWiseSeperableConv1d(nn.Module):
-    """DepthWiseSeperableConv1d module used in Convnet module
+class DepthWiseSeparableConv1d(nn.Module):
+    """DepthWiseSeparableConv1d module used in ConvNet module
     for the conformer, for more details see:
     https://arxiv.org/pdf/2005.08100v1.pdf
 
@@ -427,7 +390,7 @@ class ConvModule(nn.Module):
         else:
             padding = (kernel_size - 1) // 2
 
-        self.dw_sep_conv_1d = DepthWiseSeperableConv1d(
+        self.dw_sep_conv_1d = DepthWiseSeparableConv1d(
             input_dim,
             depthwise_seperable_out_channel,
             kernel_size,
@@ -917,7 +880,7 @@ class CausalConv1D(nn.Conv1d):
         out_channels: int,
         kernel_size: int,
         stride: int = 1,
-        padding: Union[str, int] = 0,
+        padding: str | int = 0,
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
@@ -962,8 +925,8 @@ class CausalConv1D(nn.Conv1d):
         )
 
     def update_cache(
-        self, x: Tensor, cache: Optional[Tensor] = None
-    ) -> tuple[Tensor, Optional[Tensor]]:
+        self, x: Tensor, cache: Tensor | None = None
+    ) -> tuple[Tensor, Tensor | None]:
         if cache is None:
             new_x = F.pad(x, pad=(self._left_padding, self._right_padding))
             next_cache = cache
@@ -978,8 +941,8 @@ class CausalConv1D(nn.Conv1d):
         return new_x, next_cache
 
     def forward(
-        self, x: Tensor, cache: Optional[Tensor] = None
-    ) -> Union[Tensor, tuple[Tensor, Optional[Tensor]]]:
+        self, x: Tensor, cache: Tensor | None = None
+    ) -> Tensor | tuple[Tensor, Tensor | None]:
         x, cache = self.update_cache(x, cache=cache)
         x = super().forward(x)
         if cache is None:
@@ -1002,7 +965,7 @@ class CausalConv2D(nn.Conv2d):
         out_channels: int,
         kernel_size: int,
         stride: int = 1,
-        padding: Union[str, int] = 0,
+        padding: str | int = 0,
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
@@ -1346,16 +1309,15 @@ class NemoConvSubsampling(torch.nn.Module):
             raise ValueError(f"Not valid sub-sampling: {subsampling}!")
 
         if subsampling in ["dw_striding", "striding"]:
-            in_length = torch.tensor(feat_in, dtype=torch.float)
-            out_length = calc_length(
-                lengths=in_length,
+            out_length = calc_length_int(
+                lengths=feat_in,
                 all_paddings=self._left_padding + self._right_padding,
                 kernel_size=self._kernel_size,
                 stride=self._stride,
                 ceil_mode=self._ceil_mode,
                 repeat_num=self._sampling_num,
             )
-            self.out = torch.nn.Linear(conv_channels * int(out_length), feat_out)
+            self.out = torch.nn.Linear(conv_channels * out_length, feat_out)
             self.conv2d_subsampling = True
         elif subsampling in ["striding_conv1d", "dw_striding_conv1d"]:
             self.out = None
@@ -1371,9 +1333,7 @@ class NemoConvSubsampling(torch.nn.Module):
     def get_streaming_cache_size(self) -> list[int]:
         return [0, self.subsampling_factor + 1]
 
-    def forward(
-        self, x: Tensor, mask: Optional[Tensor]
-    ) -> tuple[Tensor, Optional[Tensor]]:
+    def forward(self, x: Tensor, mask: Tensor | None) -> tuple[Tensor, Tensor | None]:
         """
         Forward method for NeMo subsampling.
 
@@ -1582,22 +1542,27 @@ class NemoConvSubsampling(torch.nn.Module):
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
 
 
-def calc_length(
-    lengths: Tensor,
+def calc_length_int(
+    lengths: int,
     all_paddings: int,
     kernel_size: int,
     stride: int,
     ceil_mode: bool,
     repeat_num: int = 1,
-) -> Tensor:
-    """Calculates the output length of a Tensor passed through a convolution or
-    max pooling layer"""
+) -> int:
+    """Integer-only variant of calc_length for meta-safe shape computation.
+
+    Computes the output length of a 1D convolution / pooling stack using
+    the same formula as calc_length, but operates purely on Python numbers
+    so it can be safely used during meta tensor initialization.
+    """
     add_pad: float = all_paddings - kernel_size
     one: float = 1.0
-    for i in range(repeat_num):
-        lengths = torch.div(lengths.to(dtype=torch.float) + add_pad, stride) + one
-        lengths = torch.ceil(lengths) if ceil_mode else torch.floor(lengths)
-    return lengths.to(dtype=torch.int)
+    length_f: float = float(lengths)
+    for _ in range(repeat_num):
+        length_f = (length_f + add_pad) / stride + one
+        length_f = math.ceil(length_f) if ceil_mode else math.floor(length_f)
+    return int(length_f)
 
 
 ####  multihead attention starts here
@@ -1615,10 +1580,10 @@ class AttModule(nn.Module):
     def forward(
         self,
         x: Tensor,
-        memory: Optional[Tensor] = None,
-        pos_emb: Optional[Tensor] = None,
-        att_mask: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+        memory: Tensor | None = None,
+        pos_emb: Tensor | None = None,
+        att_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """AttModule forward
 
         Args:
@@ -1640,7 +1605,7 @@ class AttBlock(BlockBase, AttModule):
 
 def masked_softmax(
     scores: Tensor,
-    mask: Optional[Tensor],
+    mask: Tensor | None,
 ) -> Tensor:
     if mask is not None:
         mask = mask.unsqueeze(1).eq(0)  # (batch, 1, time1, time2)
@@ -1720,7 +1685,7 @@ class MultiHeadedAttention(nn.Module):
         self.linear_v = nn.Linear(n_value, attention_inner_dim // group_size)
         self.linear_out = nn.Linear(attention_inner_dim // group_size, n_value)
 
-        self.attn = torch.jit.Attribute(None, Optional[Tensor])
+        self.attn = torch.jit.Attribute(None, Tensor | None)
         self.dropout = nn.Dropout(p=dropout_rate)
         self.dropout_rate = dropout_rate
         self.use_pt_scaled_dot_product_attention = use_pt_scaled_dot_product_attention
@@ -1741,10 +1706,10 @@ class MultiHeadedAttention(nn.Module):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        pos_k: Optional[Tensor],
-        pos_v: Optional[Tensor],
-        mask: Optional[Tensor],
-        relative_attention_bias: Optional[Tensor] = None,
+        pos_k: Tensor | None,
+        pos_v: Tensor | None,
+        mask: Tensor | None,
+        relative_attention_bias: Tensor | None = None,
     ) -> Tensor:
         """Compute 'Scaled Dot Product Attention'.
 

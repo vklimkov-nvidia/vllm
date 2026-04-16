@@ -2,31 +2,50 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import ClassVar, Optional, Union
+from typing import ClassVar
 
 import torch
 
-import vllm.envs as envs
-from vllm.attention.backends.abstract import AttentionLayer
-from vllm.attention.ops.rocm_aiter_mla import aiter_mla_decode_fwd
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.mla.common import (
+from vllm.config.cache import CacheDType
+from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
-from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionLayer,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 
-def is_aiter_mla_enabled() -> bool:
-    return envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MLA
-
-
 class AiterMLABackend(MLACommonBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ]
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return []
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [1]
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_AITER_MLA"
@@ -36,10 +55,6 @@ class AiterMLABackend(MLACommonBackend):
         return AiterMLAImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AiterMLAMetadata"]:
-        return AiterMLAMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
@@ -47,26 +62,35 @@ class AiterMLABackend(MLACommonBackend):
 @dataclass
 class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     # The indptr of the paged kv cache, shape: [batch_size + 1]
-    paged_kv_indptr: Optional[torch.Tensor] = None
+    paged_kv_indptr: torch.Tensor | None = None
     # The page indices of the paged kv cache
-    paged_kv_indices: Optional[torch.Tensor] = None
+    paged_kv_indices: torch.Tensor | None = None
     # The number of entries in the last page of each request in
     # the paged kv cache, shape: [batch_size]
-    paged_kv_last_page_len: Optional[torch.Tensor] = None
+    paged_kv_last_page_len: torch.Tensor | None = None
     # The query indptr, shape : [num_decode + 1]
-    qo_indptr: Optional[torch.Tensor] = None
+    qo_indptr: torch.Tensor | None = None
+    # The dtype of MLA out tensor
+    attn_out_dtype: torch.dtype = torch.bfloat16
+    # The max query output length: int
+    max_qo_len: int | None = None
 
 
+@dataclass
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
-    pass
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
 
 
 class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # TODO(luka, lucas): audit this as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
-    cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
 
     def __init__(
         self,
@@ -78,14 +102,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, AiterMLAMetadata
         )
-        assert self.kv_cache_spec.block_size == 1, (
-            "AITER MLAonly supports block size 1."
-        )
 
         self.compilation_config = vllm_config.compilation_config
-        max_num_pages_per_req = cdiv(
-            vllm_config.model_config.max_model_len, self.kv_cache_spec.block_size
-        )
+        self.decode_attn_out_dtype = vllm_config.model_config.dtype
+        # kernel block size is always 1.
+        max_num_pages_per_req = vllm_config.model_config.max_model_len
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
@@ -93,79 +114,157 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # TODO: we can disambiguate between decode and mixed-prefill decode here
         # so we can only use the persistent buffer if a cudagraph is actually
         # being used.
+
+        # paged_kv_last_page_len is always 1s (kernel block size is always 1),
+        # so we create it once and reuse slices in both eager and cudagraph modes.
+        self.paged_kv_last_page_len = torch.ones(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+
+        # Persistent buffer for paged_kv_indices to avoid blocking boolean mask
+        # indexing (block_table_tensor[mask]) which has data-dependent output size.
+        self.paged_kv_indices = torch.zeros(
+            max_num_pages, dtype=torch.int32, device=device
+        )
+
+        from aiter import dtypes, get_mla_metadata_info_v1
+
+        self._num_attention_heads = vllm_config.model_config.get_num_attention_heads(
+            vllm_config.parallel_config
+        )
+        q_dtype = self.decode_attn_out_dtype
+        kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+            kv_cache_dtype_str = "fp8"
+        else:
+            kv_cache_dtype_str = "bf16"
+        kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_reqs,
+            1,
+            self._num_attention_heads,
+            q_dtype,
+            kv_dtype,
+            is_sparse=False,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
+        )
+
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indptr = torch.zeros(
                 max_num_reqs + 1, dtype=torch.int32, device=device
             )
-            self.paged_kv_indices = torch.zeros(
-                max_num_pages, dtype=torch.int32, device=device
-            )
-            self.paged_kv_last_page_len = torch.zeros(
-                max_num_reqs, dtype=torch.int32, device=device
-            )
 
-            self.qo_indptr = torch.arange(
-                0, max_num_reqs + 1, dtype=torch.int32, device=device
+            self.qo_indptr = torch.zeros(
+                max_num_reqs + 1, dtype=torch.int32, device=device
             )
 
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
+        dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> AiterMLADecodeMetadata:
-        page_size = self.kv_cache_spec.block_size
-        block_table_bounds = (seq_lens_device + page_size - 1) // page_size
+        # kernel block size is always 1, although the kv block size is not 1.
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
-        mask = torch.arange(
-            block_table_tensor.size(1), dtype=block_table_tensor.dtype, device=device
-        ).unsqueeze(0) < block_table_bounds.unsqueeze(1)
-        paged_kv_indices = block_table_tensor[mask]
-
-        paged_kv_last_page_len = seq_lens_device % page_size
-        paged_kv_last_page_len = torch.where(
-            paged_kv_last_page_len == 0, page_size, paged_kv_last_page_len
-        )
+        # kernel block size is always 1, so each page has exactly 1 token.
+        # last_page_len is always 1 - just slice the pre-initialized buffer.
+        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
         paged_kv_indptr = torch.cat(
             [
-                torch.zeros(1, dtype=block_table_bounds.dtype, device=device),
-                block_table_bounds.cumsum(dim=0, dtype=torch.int32),
+                torch.zeros(1, dtype=seq_lens_device.dtype, device=device),
+                seq_lens_device.cumsum(dim=0, dtype=torch.int32),
             ]
         )
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item()
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            num_actual_pages = paged_kv_indices.size(0)
+            self.paged_kv_indices.fill_(-1)
+        _copy_page_indices_kernel[(num_reqs,)](
+            self.paged_kv_indices,
+            block_table_tensor,
+            block_table_tensor.stride(0),
+            paged_kv_indptr,
+            BLOCK_SIZE=1024,
+        )
+        paged_kv_indices = self.paged_kv_indices
 
-            self.paged_kv_indices[:num_actual_pages].copy_(
-                paged_kv_indices, non_blocking=True
-            )
-            self.paged_kv_indices[num_actual_pages:].fill_(-1)
-            paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
-
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.paged_kv_indptr[: 1 + num_reqs].copy_(
                 paged_kv_indptr, non_blocking=True
             )
             self.paged_kv_indptr[1 + num_reqs :].fill_(paged_kv_indptr[-1])
             paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-            self.paged_kv_last_page_len[:num_reqs].copy_(
-                paged_kv_last_page_len, non_blocking=True
-            )
-            self.paged_kv_last_page_len[num_reqs:].fill_(1)
-            paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
+            # paged_kv_last_page_len already uses the pre-initialized buffer slice
+            # (set above), so no copy needed - buffer is always 1s.
 
+            self.qo_indptr[: 1 + num_reqs].copy_(
+                query_start_loc_device, non_blocking=True
+            )
+            self.qo_indptr[1 + num_reqs :] = query_start_loc_device[-1]
             qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
         else:
             qo_indptr = torch.arange(
                 0, num_reqs + 1, step=1, dtype=torch.int32, device=device
             )
+
+        from aiter import get_mla_metadata_v1
+
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self._num_attention_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=max_qo_len,
+            uni_seqlen_qo=max_qo_len,
+            fast_mode=True,
+        )
 
         attn_metadata = AiterMLADecodeMetadata(
             block_table=block_table_tensor,
@@ -174,9 +273,58 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            max_qo_len=max_qo_len,
+            attn_out_dtype=self.decode_attn_out_dtype,
         )
 
         return attn_metadata
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> AiterMLAMetadata:
+        attn_metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build
+        )
+        attn_metadata.work_meta_data = self._mla_work_meta_data
+        attn_metadata.work_indptr = self._mla_work_indptr
+        attn_metadata.work_info_set = self._mla_work_info_set
+        attn_metadata.reduce_indptr = self._mla_reduce_indptr
+        attn_metadata.reduce_final_map = self._mla_reduce_final_map
+        attn_metadata.reduce_partial_map = self._mla_reduce_partial_map
+        return attn_metadata
+
+
+@triton.jit
+def _copy_page_indices_kernel(
+    page_indices,
+    block_table,
+    block_table_stride,
+    cu_num_blocks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy block table rows into a flat page_indices buffer using indptr.
+    Avoids blocking boolean mask indexing (tensor[mask]) which has
+    data-dependent output size and forces sync.
+    This is the same kernel as introduced in backends/flashinfer.py.
+    """
+    req_idx = tl.program_id(0)
+    row_ptr = block_table + req_idx * block_table_stride
+    start_idx = tl.load(cu_num_blocks + req_idx)
+    end_idx = tl.load(cu_num_blocks + req_idx + 1)
+    num_blocks = end_idx - start_idx
+
+    offset = tl.arange(0, BLOCK_SIZE)
+    for i in tl.range(0, num_blocks, BLOCK_SIZE):
+        block_ids = tl.load(row_ptr + i + offset, mask=i + offset < num_blocks)
+        tl.store(
+            page_indices + start_idx + i + offset,
+            block_ids,
+            mask=i + offset < num_blocks,
+        )
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
@@ -186,12 +334,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]],
-        sliding_window: Optional[int],
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
         kv_cache_dtype: str,
-        logits_soft_cap: Optional[float],
+        logits_soft_cap: float | None,
         attn_type: str,
-        kv_sharing_target_layer_name: Optional[str],
+        kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
         **mla_args,
     ) -> None:
@@ -208,11 +356,17 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             kv_sharing_target_layer_name,
             **mla_args,
         )
-        assert num_heads == 16 or num_heads == 128, (
-            f"Aiter MLA only supports 16 or 128 number of heads.\n"
+        _valid_heads = num_heads in (4, 8) or (
+            num_heads % 16 == 0 and 16 <= num_heads <= 128
+        )
+        assert _valid_heads, (
+            f"Aiter MLA supports num_heads of 4, 8, or multiples of 16 "
+            f"in [16, 128].\n"
             f"Provided {num_heads} number of heads.\n"
             "Try adjusting tensor_parallel_size value."
         )
+        self._needs_head_repeat = num_heads < 16
+        self._head_repeat_factor = 16 // num_heads if num_heads < 16 else 1
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
@@ -227,7 +381,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
-        output = self.flash_attn_varlen_func(
+        output = self.flash_attn_varlen_func(  # type: ignore[call-arg]
             q=q,
             k=k,
             v=v,
@@ -238,40 +392,60 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         return output
 
-    def _forward_decode(
+    def forward_mqa(
         self,
-        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
         layer: AttentionLayer,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+        assert attn_metadata.decode.max_qo_len is not None
 
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
+
+        if self._needs_head_repeat:
+            q = q.repeat_interleave(self._head_repeat_factor, dim=1)
+            kernel_num_heads = 16
+        else:
+            kernel_num_heads = self.num_heads
+
         o = torch.zeros(
-            B, self.num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B,
+            kernel_num_heads,
+            self.kv_lora_rank,
+            dtype=attn_metadata.decode.attn_out_dtype,
+            device=q.device,
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # max_seqlen_qo must be 1 except for MTP
-        # TODO: Find the best value for MTP
-        max_seqlen_qo = 1
-        aiter_mla_decode_fwd(
+        rocm_aiter_ops.mla_decode_fwd(
             q,
             kv_buffer,
             o,
             self.scale,
             attn_metadata.decode.qo_indptr,
-            max_seqlen_qo,
+            attn_metadata.decode.max_qo_len,
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
+            work_meta_data=attn_metadata.work_meta_data,
+            work_indptr=attn_metadata.work_indptr,
+            work_info_set=attn_metadata.work_info_set,
+            reduce_indptr=attn_metadata.reduce_indptr,
+            reduce_final_map=attn_metadata.reduce_final_map,
+            reduce_partial_map=attn_metadata.reduce_partial_map,
         )
+
+        if self._needs_head_repeat:
+            o = o[:, :: self._head_repeat_factor, :]
 
         return o, None

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 from vllm.config.lora import LoRAConfig
+from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from .base_linear import BaseLinearLayerWithLoRA
@@ -24,7 +24,7 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
 
     def forward(
         self, input_: torch.Tensor
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """Forward of ReplicatedLinearWithLoRA
 
         Args:
@@ -54,6 +54,18 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: Optional[PretrainedConfig],
+        model_config: PretrainedConfig | None = None,
     ) -> bool:
-        return type(source_layer) is ReplicatedLinear
+        return type(source_layer) is maybe_get_oot_by_class(ReplicatedLinear)
+
+    def slice_lora_a(
+        self, lora_a: torch.Tensor | list[torch.Tensor | None]
+    ) -> torch.Tensor | list[torch.Tensor | None]:
+        """Slice lora a if splitting for tensor parallelism."""
+        return lora_a
+
+    def slice_lora_b(
+        self, lora_b: torch.Tensor | list[torch.Tensor | None]
+    ) -> torch.Tensor | list[torch.Tensor | None]:
+        """Slice lora b if splitting with tensor parallelism."""
+        return lora_b

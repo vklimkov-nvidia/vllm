@@ -2,35 +2,76 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
 
 from vllm.distributed.utils import pickle
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 
 from .base_device_communicator import DeviceCommunicatorBase
+
+logger = init_logger(__name__)
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
         cpu_group: ProcessGroup,
-        device: Optional[torch.device] = None,
-        device_group: Optional[ProcessGroup] = None,
+        device: torch.device | None = None,
+        device_group: ProcessGroup | None = None,
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
         self.dist_module = torch.distributed
 
         if (
-            (current_platform.get_cpu_architecture() == CpuArchEnum.X86)
+            (
+                current_platform.get_cpu_architecture() == CpuArchEnum.X86
+                or current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+            )
             and hasattr(torch.ops._C, "init_shm_manager")
             and (unique_name.startswith("tp") or unique_name.startswith("pp"))
+            and self._all_group_ranks_share_shm_group_name()
         ):
             self.dist_module = _CPUSHMDistributed(self)
+        elif unique_name.startswith("tp") or unique_name.startswith("pp"):
+            logger.info(
+                "CPU SHM communicator disabled for group %s: ranks do not share "
+                "the same SHM group name, falling back to torch.distributed.",
+                unique_name,
+            )
+
+        if self.use_all2all:
+            if self.all2all_backend != "naive":  # type: ignore[has-type]
+                logger.warning(
+                    "`%s` all2all manager is not supported on CPU. "
+                    "Falling back to `naive` all2all manager for CPU.",
+                    self.all2all_backend,  # type: ignore[has-type]
+                )
+                self.all2all_backend = "naive"
+            if self.all2all_backend == "naive":
+                from .all2all import NaiveAll2AllManager
+
+                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
+                logger.info("Using naive all2all manager.")
+
+    def _all_group_ranks_share_shm_group_name(self) -> bool:
+        """
+        CPUSHM requires all ranks in this group to agree on one SHM group name.
+        This is a lightweight consistency check for VLLM_DIST_IDENT/name inputs.
+        """
+        local_name = _CPUSHMDistributed.make_group_name(self)
+        names: list[str] = [""] * self.world_size
+        torch.distributed.all_gather_object(
+            names,
+            local_name,
+            group=self.device_group,
+        )
+        return len(set(names)) == 1
 
     def all_reduce(self, input_):
         self.dist_module.all_reduce(input_, group=self.device_group)
@@ -38,7 +79,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """
         NOTE: We assume that the input tensor is on the same device across
         all the ranks.
@@ -99,7 +140,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
     def send_tensor_dict(
         self,
-        tensor_dict: dict[str, Union[torch.Tensor, Any]],
+        tensor_dict: dict[str, torch.Tensor | Any],
         dst: int,
     ) -> None:
         return self.dist_module.send_tensor_dict(tensor_dict, dst)
@@ -107,28 +148,104 @@ class CpuCommunicator(DeviceCommunicatorBase):
     def recv_tensor_dict(
         self,
         src: int,
-    ) -> dict[str, Union[torch.Tensor, Any]]:
+    ) -> dict[str, torch.Tensor | Any]:
         return self.dist_module.recv_tensor_dict(src)
+
+    def dispatch_router_logits(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        """
+        Dispatch the hidden states and router logits to the appropriate device.
+        This is a no-op in the base class.
+        """
+
+        assert self.all2all_manager is not None
+        return self.all2all_manager.dispatch_router_logits(
+            hidden_states,
+            router_logits,
+            is_sequence_parallel,
+            extra_tensors,
+        )
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        """
+        Dispatch the hidden states and topk weights/ids to the appropriate device.
+        This is a no-op in the base class.
+        """
+        assert self.all2all_manager is not None
+        return self.all2all_manager.dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel,
+            extra_tensors=extra_tensors,
+        )
+
+    def combine(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        """
+        Combine the hidden states and router logits from the appropriate device.
+        This is a no-op in the base class.
+        """
+        assert self.all2all_manager is not None
+        return self.all2all_manager.combine(
+            hidden_states,
+            is_sequence_parallel,
+        )
 
 
 class _CPUSHMDistributed:
     def __init__(self, communicator: CpuCommunicator):
-        instance_identifier = os.environ["VLLM_DIST_IDENT"]
-        unique_name = communicator.unique_name
-        instance_identifier = f"{instance_identifier}-{unique_name}"
         self.communicator = communicator
 
-        group_ranks = [str(rank) for rank in self.communicator.ranks]
-        shm_group_identifier = f"[{'-'.join(group_ranks)}]"
-        self.group_name = f"{instance_identifier}-{shm_group_identifier}-cpushm"
+        self.group_name = self.make_group_name(communicator)
 
         self.handle = self._init_cpu_shm()
 
+    @staticmethod
+    def make_group_name(communicator: CpuCommunicator) -> str:
+        instance_identifier = os.environ["VLLM_DIST_IDENT"]
+        unique_name = communicator.unique_name
+        instance_identifier = f"{instance_identifier}-{unique_name}"
+        group_ranks = [str(rank) for rank in communicator.ranks]
+        shm_group_identifier = f"[{'-'.join(group_ranks)}]"
+        return f"{instance_identifier}-{shm_group_identifier}-cpushm"
+
     def _init_cpu_shm(self) -> int:
+        thread_num_tensor = torch.tensor(
+            [torch.get_num_threads()],
+            dtype=torch.int64,
+        )
+        torch.distributed.all_reduce(
+            thread_num_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.communicator.device_group,
+        )
+        thread_num = thread_num_tensor.item()
+
         handle = torch.ops._C.init_shm_manager(
             self.group_name,
             self.communicator.world_size,
             self.communicator.rank,
+            thread_num,
         )
         torch.distributed.barrier(self.communicator.device_group)
         torch.ops._C.join_shm_manager(
@@ -140,16 +257,16 @@ class _CPUSHMDistributed:
         return handle
 
     def all_reduce(
-        self, input: torch.Tensor, group: Optional[ProcessGroup] = None
+        self, input: torch.Tensor, group: ProcessGroup | None = None
     ) -> None:
         torch.ops._C.shm_allreduce(self.handle, input)
 
     def gather(
         self,
         input: torch.Tensor,
-        gather_list: Optional[list[torch.Tensor]],
+        gather_list: list[torch.Tensor] | None,
         dst: int = -1,
-        group: Optional[ProcessGroup] = None,
+        group: ProcessGroup | None = None,
     ) -> None:
         # Note: different from the torch gather, here we use local dst rank.
         torch.ops._C.shm_gather(
@@ -163,13 +280,13 @@ class _CPUSHMDistributed:
         self,
         output: torch.Tensor,
         input: torch.Tensor,
-        group: Optional[ProcessGroup] = None,
+        group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
 
     def send_tensor_dict(
         self,
-        tensor_dict: dict[str, Union[torch.Tensor, Any]],
+        tensor_dict: dict[str, torch.Tensor | Any],
         dst: int,
     ) -> None:
         key_list = list(tensor_dict.keys())
@@ -191,7 +308,7 @@ class _CPUSHMDistributed:
     def recv_tensor_dict(
         self,
         src: int,
-    ) -> dict[str, Union[torch.Tensor, Any]]:
+    ) -> dict[str, torch.Tensor | Any]:
         tensor_list = torch.ops._C.shm_recv_tensor_list(self.handle, src)
 
         value_list: list[torch.Tensor] = tensor_list[:-1]

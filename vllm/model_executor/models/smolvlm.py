@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
 
 from transformers import SmolVLMProcessor
 
@@ -17,11 +16,7 @@ class SmolVLMProcessingInfo(Idefics3ProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> SmolVLMProcessor:
         return self.ctx.get_hf_processor(SmolVLMProcessor, **kwargs)
 
-    def _get_image_token(
-        self, processor: Optional[SmolVLMProcessor]
-    ) -> tuple[str, str]:
-        if processor is None:
-            processor = self.get_hf_processor()
+    def _get_image_token(self, processor: SmolVLMProcessor) -> tuple[str, str, str]:
         image_token = processor.image_token
         fake_image_token = processor.fake_image_token
         global_image_token = processor.global_image_token

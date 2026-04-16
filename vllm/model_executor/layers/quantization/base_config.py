@@ -3,7 +3,7 @@
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -17,6 +17,11 @@ else:
 
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
+
+    # Whether this method creates weights on meta device for online quantization.
+    # When True, weights are created on meta device and quantized layer-wise
+    # in process_weights_after_loading, reducing peak memory during loading.
+    uses_meta_device: bool = False
 
     @abstractmethod
     def create_weights(
@@ -105,7 +110,7 @@ class QuantizationConfig(ABC):
     @classmethod
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant
-    ) -> Optional[QuantizationMethods]:
+    ) -> QuantizationMethods | None:
         """
         Detects if this quantization method can support a given checkpoint
         format by overriding the user specified quantization method --
@@ -135,7 +140,7 @@ class QuantizationConfig(ABC):
     @abstractmethod
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
+    ) -> QuantizeMethodBase | None:
         """Get the quantize method to use for the quantized layer.
 
         Args:
@@ -147,7 +152,7 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
-    def get_cache_scale(self, name: str) -> Optional[str]:
+    def get_cache_scale(self, name: str) -> str | None:
         return None
 
     def apply_vllm_mapper(  # noqa: B027
@@ -168,3 +173,19 @@ class QuantizationConfig(ABC):
         Interface to update values after config initialization.
         """
         pass
+
+    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
+        """
+        Determine if mxfp4 quantization will be used for this config.
+
+        This allows hidden_size rounding to happen before moe_config creation
+        without needing to instantiate quant_method first.
+
+        Args:
+            prefix: The layer prefix/name in the model
+            layer: The layer module
+
+        Returns:
+            True if this config uses MXFP4 quantization, False otherwise
+        """
+        return False

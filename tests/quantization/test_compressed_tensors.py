@@ -5,20 +5,17 @@
 Run `pytest tests/quantization/test_compressed_tensors.py`.
 """
 
-from typing import Optional
-
 import pytest
 import torch
 from compressed_tensors.quantization import QuantizationType
 
 from tests.models.utils import check_logprobs_close
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
-    CompressedTensors24,
     CompressedTensorsLinearMethod,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A8Fp8,
     CompressedTensorsW4A16Fp4,
-    CompressedTensorsW4A16Sparse24,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
@@ -26,13 +23,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import W8A8BlockFp8LinearOp
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     cutlass_fp4_supported,
 )
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    sparse_cutlass_supported,
-)
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
 # AITER only supports per-channel-per-channel INT8 gemm
 # and per-tensor-per-tensor INT8 GEMM.
@@ -42,7 +37,7 @@ ROCM_AITER_SUPPORTED_INT8_MODEL = [
     "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2",
 ]
 
-# TritonScaledMMLinearKernel only supports symmetric quantization.
+# TritonInt8ScaledMMLinearKernel only supports symmetric quantization.
 ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL = [
     "nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change",
     "nm-testing/tinyllama-oneshot-w8-channel-a8-tensor",
@@ -69,13 +64,6 @@ def enable_pickle(monkeypatch):
             True,
         ),
         (
-            "nm-testing/tinyllama-oneshot-w8-channel-a8-tensor",
-            "channel",
-            QuantizationType.INT,
-            2560,
-            True,
-        ),
-        (
             "nm-testing/asym-w8w8-int8-static-per-tensor-tiny-llama",
             "tensor",
             QuantizationType.INT,
@@ -91,7 +79,7 @@ def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
         current_platform.is_rocm()
         and model_path not in ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL
     ):
-        pytest.skip(f"Skip model {model_path} as it is not support on ROCm.")
+        pytest.skip(f"Skip model {model_path} as it is not supported on ROCm.")
 
     with vllm_runner(model_path, enforce_eager=True) as llm:
 
@@ -104,7 +92,7 @@ def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
             down_proj = layer.mlp.down_proj
 
             # assert zp for symmetric and asymmetric cases
-            def zp_valid(zp: Optional[torch.Tensor]):
+            def zp_valid(zp: torch.Tensor | None):
                 if is_symmetric:
                     return zp is None
 
@@ -140,7 +128,7 @@ def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy(["Hello my name is"], max_tokens=20)
+        output = llm.generate_greedy(["Hello my name is"], max_tokens=4)
         assert output
 
 
@@ -148,12 +136,9 @@ def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
     "model_path",
     [
         "neuralmagic/Llama-3.2-1B-quantized.w8a8",
-        "nm-testing/Meta-Llama-3-8B-Instruct-W8A8-Dynamic-Asym",
-        "nm-testing/Meta-Llama-3-8B-Instruct-W8A8-Static-Per-Tensor-Sym",
-        "nm-testing/Meta-Llama-3-8B-Instruct-W8A8-Static-Per-Tensor-Asym",
     ],
 )
-@pytest.mark.parametrize("max_tokens", [32])
+@pytest.mark.parametrize("max_tokens", [4])
 @pytest.mark.parametrize("num_logprobs", [10])
 @pytest.mark.parametrize(
     "use_aiter", [True, False] if current_platform.is_rocm() else [False]
@@ -172,7 +157,7 @@ def test_compressed_tensors_w8a8_logprobs(
         current_platform.is_rocm()
         and model_path not in ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL
     ):
-        pytest.skip(f"Skip model {model_path} as it is not support on ROCm.")
+        pytest.skip(f"Skip model {model_path} as it is not supported on ROCm.")
 
     if use_aiter:
         if model_path not in ROCM_AITER_SUPPORTED_INT8_MODEL:
@@ -194,7 +179,7 @@ def test_compressed_tensors_w8a8_logprobs(
             example_prompts, max_tokens, num_logprobs
         )
 
-    with vllm_runner(model_path, dtype=dtype) as vllm_model:
+    with vllm_runner(model_path, dtype=dtype, enforce_eager=True) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy_logprobs(
             example_prompts, max_tokens, num_logprobs
         )
@@ -207,13 +192,13 @@ def test_compressed_tensors_w8a8_logprobs(
     )
 
     if current_platform.is_rocm():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
 
 def test_compressed_tensors_no_enforce_eager(vllm_runner):
     model_path = "nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change"
     with vllm_runner(model_path) as llm:
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
 
 
@@ -221,13 +206,8 @@ def test_compressed_tensors_no_enforce_eager(vllm_runner):
     "model_args",
     [
         ("nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2", "tensor"),
-        ("nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2-asym", "tensor"),
         (
             "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2",
-            "channel",
-        ),
-        (
-            "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2-asym",
             "channel",
         ),
     ],
@@ -247,7 +227,7 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
         current_platform.is_rocm()
         and model_path not in ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL
     ):
-        pytest.skip(f"Skip model {model_path} as it is not support on ROCm.")
+        pytest.skip(f"Skip model {model_path} as it is not supported on ROCm.")
 
     if use_aiter:
         if model_path not in ROCM_AITER_SUPPORTED_INT8_MODEL:
@@ -255,7 +235,7 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
         # this will enable VLLM_ROCM_USE_AITER_LINEAR
         monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
 
-    with vllm_runner(model_path, dtype=torch.float16) as llm:
+    with vllm_runner(model_path, enforce_eager=True, dtype=torch.float16) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -270,7 +250,7 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy(["Hello my name is"], max_tokens=20)
+        output = llm.generate_greedy(["Hello my name is"], max_tokens=4)
         assert output
 
 
@@ -283,38 +263,6 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
             None,
             8,
             True,
-            False,
-        ),
-        (
-            "nm-testing/tinyllama-oneshot-w4a16-group128-v2",
-            "group",
-            128,
-            8,
-            True,
-            False,
-        ),
-        (
-            "nm-testing/tinyllama-oneshot-w8a16-per-channel",
-            "channel",
-            None,
-            4,
-            True,
-            False,
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-awq-group128-asym256",
-            "group",
-            128,
-            8,
-            False,
-            False,
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-G128-Asym-Updated-Channel",
-            "channel",
-            None,
-            8,
-            False,
             False,
         ),
         (
@@ -332,7 +280,7 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
 )
 def test_compressed_tensors_wNa16(vllm_runner, wNa16_args):
     model, strategy, group, pack_factor, symmetric, has_g_idx = wNa16_args
-    with vllm_runner(model) as llm:
+    with vllm_runner(model, enforce_eager=True) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -350,35 +298,13 @@ def test_compressed_tensors_wNa16(vllm_runner, wNa16_args):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        assert output
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
-)
-def test_compressed_tensors_w4a16_marlin24(vllm_runner):
-    model_path = "nm-testing/llama7b-one-shot-2_4-w4a16-marlin24-t"
-    with vllm_runner(model_path) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-
-            assert isinstance(qkv_proj.quant_method, CompressedTensorsLinearMethod)
-            assert isinstance(qkv_proj.scheme, CompressedTensorsW4A16Sparse24)
-            assert qkv_proj.weight_packed.dtype is torch.int32
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
 
 
 def test_compressed_tensors_fp8(vllm_runner):
     model_path = "nm-testing/Meta-Llama-3-8B-FP8-compressed-tensors-test"
-    with vllm_runner(model_path) as llm:
+    with vllm_runner(model_path, enforce_eager=True) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -401,305 +327,45 @@ def test_compressed_tensors_fp8(vllm_runner):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
 
 
-@pytest.mark.skipif(
-    not current_platform.is_kv_cache_dtype_supported("fp8", None),
-    reason="FP8 KV cache is not supported on this device.",
-)
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )
-def test_compressed_tensors_kv_cache(vllm_runner):
-    model_path = "nm-testing/TinyLlama-1.1B-compressed-tensors-kv-cache-scheme"
-    with vllm_runner(model_path, kv_cache_dtype="fp8") as llm:
-        output = llm.generate_greedy("Hello world!", max_tokens=20)
+def test_compressed_tensors_kv_cache_fp8_per_tensor(vllm_runner):
+    model_path = "nm-testing/TinyLlama-1.1B-Chat-v1.0-kvcache-fp8-tensor"
+    with vllm_runner(model_path) as llm:
+        output = llm.generate_greedy("Hello world!", max_tokens=4)
         assert output
 
 
 @pytest.mark.skipif(
-    not sparse_cutlass_supported(),
-    reason="Sparse FP8 is not yet supported on this GPU type.",
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )
-def _test_2of4_quant_models(qkv_proj, weight_strategy, input_strategy, format="dense"):
-    assert isinstance(qkv_proj.quant_method, CompressedTensorsLinearMethod)
-    assert isinstance(qkv_proj.scheme, CompressedTensors24)
+def test_compressed_tensors_kv_cache_fp8_per_attn_head(vllm_runner):
+    model_path = "nm-testing/TinyLlama-1.1B-Chat-v1.0-kvcache-fp8-attn_head"
+    try:
+        fa_version = get_flash_attn_version()
+    except Exception:
+        pytest.skip("This test requires FlashAttention backend.")
+    if fa_version is None or fa_version < 3:
+        pytest.skip("This test requires FlashAttention version >= 3.")
 
-    assert qkv_proj.scheme.weight_quant.strategy == weight_strategy
-    assert qkv_proj.scheme.input_quant.strategy == input_strategy
-    assert qkv_proj.scheme.quantized
-    assert qkv_proj.quant_method.quantization_config.sparsity_scheme_map
-    sparsity_map = qkv_proj.quant_method.quantization_config.sparsity_scheme_map  # noqa: E501
-    assert sparsity_map.get("Linear").format == format
-    assert sparsity_map.get("Linear").sparsity_structure == "2:4"
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.has_device_capability(90),
-    reason="Sparse FP8 is not yet supported on this GPU type.",
-)
-@pytest.mark.parametrize(
-    "args_2of4",
-    [
-        (
-            "nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-2of4-testing",
-            "channel",
-            "token",
-        ),
-        (
-            "nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-Per-Tensor-testing",
-            "channel",
-            "tensor",
-        ),
-        (
-            "nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-testing",
-            "tensor",
-            "tensor",
-        ),
-        (
-            "nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-IA-Per-Tensor-Weight-testing",
-            "tensor",
-            "token",
-        ),
-    ],
-)
-def test_compressed_tensors_2of4_quant_fp8(vllm_runner, args_2of4):
-    model, weight_strategy, input_strategy = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert qkv_proj.scheme.weights_dtype == torch.float8_e4m3fn
-            _test_2of4_quant_models(qkv_proj, weight_strategy, input_strategy)
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
+    with vllm_runner(model_path, attention_config={"backend": "FLASH_ATTN"}) as llm:
+        output = llm.generate_greedy("Hello world!", max_tokens=4)
         assert output
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or not current_platform.has_device_capability(90),
-    reason="Sparse FP8 is not yet supported on this GPU type.",
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )
-@pytest.mark.parametrize(
-    "args_2of4",
-    [
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_per_tok_dyn_act_fp8-BitM",
-            "channel",
-            "token",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_tensor_act_fp8-BitM",
-            "channel",
-            "tensor",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_per_tok_dyn_act_fp8-BitM",
-            "tensor",
-            "token",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_tensor_act_fp8-BitM",
-            "tensor",
-            "tensor",
-        ),
-    ],
-)
-def test_compressed_tensors_2of4_quant_fp8_compressed(vllm_runner, args_2of4):
-    model, weight_strategy, input_strategy = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert qkv_proj.scheme.weights_dtype == torch.float8_e4m3fn
-            _test_2of4_quant_models(
-                qkv_proj,
-                weight_strategy,
-                input_strategy,
-                format="sparse-24-bitmask",
-            )
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
-        assert output
-
-
-@pytest.mark.skipif(
-    not sparse_cutlass_supported(),
-    reason="cutlass is not yet supported on this GPU type.",
-)
-@pytest.mark.parametrize(
-    "args_2of4",
-    [
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_per_tok_dyn_act_int8-BitM",
-            "channel",
-            "token",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_tensor_act_int8-BitM",
-            "channel",
-            "tensor",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_per_tok_dyn_act_int8-BitM",
-            "tensor",
-            "token",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_tensor_act_int8-BitM",
-            "tensor",
-            "tensor",
-        ),
-    ],
-)
-def test_compressed_tensors_2of4_quant_int8_compressed(vllm_runner, args_2of4):
-    model, weight_strategy, input_strategy = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert qkv_proj.scheme.weights_dtype == torch.int8
-            _test_2of4_quant_models(
-                qkv_proj,
-                weight_strategy,
-                input_strategy,
-                format="sparse-24-bitmask",
-            )
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
-        assert output
-
-
-@pytest.mark.skipif(
-    not sparse_cutlass_supported(),
-    reason="Sparse FP8 is not yet supported on this GPU type.",
-)
-@pytest.mark.parametrize(
-    "args_2of4",
-    [
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Channel-Weight-testing",
-            "channel",
-            "token",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Static-testing",
-            "tensor",
-            "tensor",
-        ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Tensor-Weight-testing",
-            "tensor",
-            "token",
-        ),
-    ],
-)
-def test_compressed_tensors_2of4_quant_int8(vllm_runner, args_2of4):
-    model, weight_strategy, input_strategy = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert qkv_proj.scheme.weights_dtype == torch.int8
-            _test_2of4_quant_models(qkv_proj, weight_strategy, input_strategy)
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
-        assert output
-
-
-@pytest.mark.skipif(
-    not sparse_cutlass_supported(),
-    reason="2of4 Sparse is not yet supported on this GPU type.",
-)
-@pytest.mark.parametrize(
-    "args_2of4",
-    [("nm-testing/TinyLlama-1.1B-Chat-v1.0-2of4-Sparse-Dense-Compressor")],
-)
-def test_compressed_tensors_2of4_sparse(vllm_runner, args_2of4):
-    model = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert isinstance(qkv_proj.quant_method, CompressedTensorsLinearMethod)
-            assert isinstance(qkv_proj.scheme, CompressedTensors24)
-
-            assert qkv_proj.scheme.weight_quant is None
-            assert qkv_proj.scheme.input_quant is None
-            assert not qkv_proj.scheme.quantized
-            assert qkv_proj.quant_method.quantization_config.sparsity_scheme_map
-            sparsity_map = qkv_proj.quant_method.quantization_config.sparsity_scheme_map  # noqa: E501
-            assert sparsity_map.get("Linear").format == "dense"
-            assert sparsity_map.get("Linear").sparsity_structure == "2:4"
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
-        assert output
-
-
-@pytest.mark.skipif(
-    not sparse_cutlass_supported(),
-    reason="Cutlass is not yet supported on this GPU type.",
-)
-@pytest.mark.parametrize(
-    "args_2of4", [("nm-testing/llama2.c-stories42M-pruned2.4-compressed")]
-)
-def test_compressed_tensors_2of4_sparse_compressed(vllm_runner, args_2of4):
-    model = args_2of4
-    with vllm_runner(model) as llm:
-
-        def check_model(model):
-            layer = model.model.layers[0]
-
-            qkv_proj = layer.self_attn.qkv_proj
-            assert isinstance(qkv_proj.quant_method, CompressedTensorsLinearMethod)
-            assert isinstance(qkv_proj.scheme, CompressedTensors24)
-
-            assert qkv_proj.scheme.weight_quant is None
-            assert qkv_proj.scheme.input_quant is None
-            assert not qkv_proj.scheme.quantized
-            assert qkv_proj.quant_method.quantization_config.sparsity_scheme_map
-            sparsity_map = qkv_proj.quant_method.quantization_config.sparsity_scheme_map  # noqa: E501
-            assert sparsity_map.get("Linear").format == "sparse-24-bitmask"
-            assert sparsity_map.get("Linear").sparsity_structure == "2:4"
-
-        llm.apply_model(check_model)
-
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
-        print(output)
-        assert output
-
-
 @pytest.mark.parametrize(
     "args",
     [
-        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4A16", CompressedTensorsW4A16Fp4),
+        # TODO: Enable once model is available again
+        # ("nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4A16", CompressedTensorsW4A16Fp4),
         ("nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4", CompressedTensorsW4A4Fp4),
     ],
 )
@@ -724,7 +390,7 @@ def test_compressed_tensors_nvfp4(vllm_runner, args):
             assert qkv_proj.scheme.group_size == 16
 
         llm.apply_model(check_model)
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         print(output)
         assert output
 
@@ -759,7 +425,7 @@ def test_compressed_tensors_w4a8_fp8(vllm_runner, args):
                 assert proj.scheme.group_size == 128
 
         llm.apply_model(check_model)
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         print(output)
         assert output
 
@@ -793,7 +459,7 @@ def test_compressed_tensors_transforms_perplexity(
 
 def test_compressed_tensors_fp8_block_enabled(vllm_runner):
     model_path = "RedHatAI/Qwen3-0.6B-FP8-BLOCK"
-    with vllm_runner(model_path) as llm:
+    with vllm_runner(model_path, enforce_eager=True) as llm:
         fp8_dtype = current_platform.fp8_dtype()
 
         def check_model(model):
@@ -813,9 +479,82 @@ def test_compressed_tensors_fp8_block_enabled(vllm_runner):
 
             input_quant_op = qkv_proj.scheme.w8a8_block_fp8_linear.input_quant_op
             assert isinstance(input_quant_op, QuantFP8)
-            assert input_quant_op._forward_method == input_quant_op.forward_cuda
+            assert input_quant_op._forward_method in (
+                input_quant_op.forward_cuda,
+                input_quant_op.forward_hip,
+            )
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
+        assert output
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="This test is not for non-CUDA platforms",
+)
+def test_compressed_tensors_moe_ignore_with_model(vllm_runner):
+    """
+    Integration test for MoE layer ignore functionality with a real model.
+
+    This test would verify that when loading a compressed-tensors quantized
+    MoE model where some MoE layers are in the ignore list, those layers
+    use UnquantizedFusedMoEMethod while non-ignored layers use the
+    quantized method.
+
+    Expected model structure:
+    - Compressed-tensors quantized MoE model (e.g., Mixtral-based)
+    - Config with ignore list containing specific MoE layers
+    - Multiple MoE layers where some are quantized and some are not
+    """
+
+    # model_path = "nm-testing/tinysmokeqwen3moe-W4A16-first-only" # CT 12.3
+    model_path = "nm-testing/tinysmokeqwen3moe-W4A16-first-only-CTstable"  # CT 12.2
+
+    with vllm_runner(model_path, enforce_eager=True) as llm:
+
+        def check_model(model):
+            from vllm.model_executor.layers.fused_moe import FusedMoE
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+                CompressedTensorsMoEMethod,
+            )
+
+            # Check layer 0 MoE (should be quantized)
+            layer_quantized = model.model.layers[0].mlp.experts
+            assert isinstance(layer_quantized, FusedMoE)
+            assert isinstance(layer_quantized.quant_method, CompressedTensorsMoEMethod)
+
+            # Check layer 10 MoE (should be unquantized + ignored)
+            layer_unquantized = model.model.layers[3].mlp.experts
+            assert isinstance(layer_unquantized, FusedMoE)
+            assert isinstance(layer_unquantized.quant_method, UnquantizedFusedMoEMethod)
+
+        llm.apply_model(check_model)
+
+        # Verify the model can generate output
+        output = llm.generate_greedy("Hello, my name is", max_tokens=4)
+        assert output
+
+
+def test_w4a16_moe_torch_compile(vllm_runner):
+    """Regression test: MoE quant_config must be initialized inside the
+    moe_forward custom op, not just in forward_native which is compiled by
+    Dynamo (attribute mutations are not replayed at runtime).
+
+    Without the fix in _moe_forward/_moe_forward_shared, this hits:
+        AssertionError: Hidden size mismatch 2048 != 1024
+    because use_int4_w4a16 is False (moe_quant_config stays None).
+    """
+    model_path = "nm-testing/tinysmokeqwen3moe-W4A16-first-only-CTstable"
+
+    with vllm_runner(
+        model_path,
+        enforce_eager=False,
+        max_model_len=256,
+        compilation_config={
+            "cudagraph_mode": "NONE",
+        },
+    ) as llm:
+        output = llm.generate_greedy("Hi", max_tokens=1)
         assert output

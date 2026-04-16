@@ -8,12 +8,11 @@ the explicit/implicit prompt format on enc-dec LMMs for text generation.
 import os
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
 from typing import NamedTuple
 
 from vllm import LLM, EngineArgs, PromptType, SamplingParams
 from vllm.assets.audio import AudioAsset
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class ModelRequestData(NamedTuple):
@@ -77,7 +76,7 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=0,
         help="Set the seed when initializing `vllm.LLM`.",
     )
     return parser.parse_args()
@@ -91,13 +90,12 @@ def main(args):
     req_data = model_example_map[model]()
 
     # Disable other modalities to save memory
+    engine_args = req_data.engine_args
     default_limits = {"image": 0, "video": 0, "audio": 0}
-    req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
-        req_data.engine_args.limit_mm_per_prompt or {}
-    )
-
-    engine_args = asdict(req_data.engine_args) | {"seed": args.seed}
-    llm = LLM(**engine_args)
+    limit_mm_per_prompt = default_limits | (engine_args.limit_mm_per_prompt or {})
+    engine_args.limit_mm_per_prompt = limit_mm_per_prompt
+    engine_args.seed = args.seed
+    llm = LLM.from_engine_args(engine_args)
 
     prompts = req_data.prompts
 

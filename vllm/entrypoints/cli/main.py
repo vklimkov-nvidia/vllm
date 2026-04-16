@@ -5,29 +5,50 @@
 Note that all future modules must be lazily loaded within main
 to avoid certain eager import breakage."""
 
-from __future__ import annotations
-
 import importlib.metadata
+import sys
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def main():
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
+    import vllm.entrypoints.cli.launch
     import vllm.entrypoints.cli.openai
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-    from vllm.utils import FlexibleArgumentParser
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     CMD_MODULES = [
         vllm.entrypoints.cli.openai,
         vllm.entrypoints.cli.serve,
+        vllm.entrypoints.cli.launch,
         vllm.entrypoints.cli.benchmark.main,
         vllm.entrypoints.cli.collect_env,
         vllm.entrypoints.cli.run_batch,
     ]
 
     cli_env_setup()
+
+    # For 'vllm bench *': use CPU instead of UnspecifiedPlatform by default
+    if len(sys.argv) > 1 and sys.argv[1] == "bench":
+        logger.debug(
+            "Bench command detected, must ensure current platform is not "
+            "UnspecifiedPlatform to avoid device type inference error"
+        )
+        from vllm import platforms
+
+        if platforms.current_platform.is_unspecified():
+            from vllm.platforms.cpu import CpuPlatform
+
+            platforms.current_platform = CpuPlatform()
+            logger.info(
+                "Unspecified platform detected, switching to CPU Platform instead."
+            )
 
     parser = FlexibleArgumentParser(
         description="vLLM CLI",

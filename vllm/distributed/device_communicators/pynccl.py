@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional, Union
 
 # ===================== import region =====================
 import torch
@@ -20,7 +19,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
 )
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
-from vllm.utils import current_stream
+from vllm.utils.torch_utils import current_stream
 
 logger = init_logger(__name__)
 
@@ -31,7 +30,7 @@ def register_nccl_symmetric_ops(pynccl_comm):
     from vllm.distributed.device_communicators.pynccl_allocator import (
         nccl_symm_mem_context,
     )
-    from vllm.utils import direct_register_custom_op
+    from vllm.utils.torch_utils import direct_register_custom_op
 
     global _NCCL_SYMM_OPS_REGISTERED
     if _NCCL_SYMM_OPS_REGISTERED:
@@ -59,9 +58,9 @@ def register_nccl_symmetric_ops(pynccl_comm):
 class PyNcclCommunicator:
     def __init__(
         self,
-        group: Union[ProcessGroup, StatelessProcessGroup],
-        device: Union[int, str, torch.device],
-        library_path: Optional[str] = None,
+        group: ProcessGroup | StatelessProcessGroup,
+        device: int | str | torch.device,
+        library_path: str | None = None,
     ):
         """
         Args:
@@ -106,11 +105,12 @@ class PyNcclCommunicator:
         self.disabled = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
-        logger.info("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
-
         if self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
+            logger.info_once(
+                "vLLM is using nccl==%s", self.nccl.ncclGetVersion(), scope="local"
+            )
         else:
             # construct an empty unique id
             self.unique_id = ncclUniqueId()
@@ -133,9 +133,7 @@ class PyNcclCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
         # nccl communicator and stream will use this device
-        # `torch.cuda.device` is a context manager that changes the
-        # current cuda device to the specified one
-        with torch.cuda.device(device):
+        with torch.accelerator.device_index(device.index):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
             )
@@ -146,6 +144,13 @@ class PyNcclCommunicator:
             self.all_reduce(data)
             stream.synchronize()
             del data
+
+    def destroy(self):
+        if self.available and not self.disabled:
+            with torch.accelerator.device_index(self.device.index):
+                self.nccl.ncclCommDestroy(self.comm)
+            self.available = False
+            self.disabled = True
 
     def all_reduce(
         self,
@@ -312,10 +317,19 @@ class PyNcclCommunicator:
         )
         if stream is None:
             stream = current_stream()
+        if tensor.dtype in [
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+        ]:
+            nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
+        else:
+            nccl_dtype = ncclDataTypeEnum.from_torch(tensor.dtype)
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
-            ncclDataTypeEnum.from_torch(tensor.dtype),
+            nccl_dtype,
             dst,
             self.comm,
             cudaStream_t(stream.cuda_stream),
@@ -330,10 +344,19 @@ class PyNcclCommunicator:
         )
         if stream is None:
             stream = current_stream()
+        if tensor.dtype in [
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+        ]:
+            nccl_dtype = ncclDataTypeEnum.from_torch(torch.uint8)
+        else:
+            nccl_dtype = ncclDataTypeEnum.from_torch(tensor.dtype)
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
-            ncclDataTypeEnum.from_torch(tensor.dtype),
+            nccl_dtype,
             src,
             self.comm,
             cudaStream_t(stream.cuda_stream),
@@ -384,3 +407,17 @@ class PyNcclCommunicator:
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def batch_isend_irecv(self, p2p_ops: list, stream=None):
+        if self.disabled:
+            return
+        if stream is None:
+            stream = current_stream()
+        self.group_start()
+        for op in p2p_ops:
+            if op.op is torch.distributed.isend:
+                self.send(op.tensor, op.group_peer, stream)
+            elif op.op is torch.distributed.irecv:
+                self.recv(op.tensor, op.group_peer, stream)
+
+        self.group_end()

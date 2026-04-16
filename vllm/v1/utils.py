@@ -5,33 +5,31 @@ import contextlib
 import multiprocessing
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from multiprocessing import connection
 from multiprocessing.process import BaseProcess
+from multiprocessing.queues import Queue
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Generic,
-    Optional,
     TypeVar,
     Union,
     overload,
 )
 
 import torch
+import uvloop
 from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
-from vllm.utils import (
-    get_open_port,
-    get_open_zmq_ipc_path,
-    get_tcp_uri,
-    kill_process_tree,
-)
+from vllm.utils.network_utils import get_open_port, get_open_zmq_ipc_path, get_tcp_uri
+from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
+from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
     import numpy as np
@@ -66,7 +64,7 @@ class ConstantList(Generic[T], Sequence):
     def clear(self):
         raise TypeError("Cannot clear a constant list")
 
-    def index(self, item: T, start: int = 0, stop: Optional[int] = None) -> int:
+    def index(self, item: T, start: int = 0, stop: int | None = None) -> int:
         return self._x.index(item, start, stop if stop is not None else len(self._x))
 
     @overload
@@ -75,7 +73,7 @@ class ConstantList(Generic[T], Sequence):
     @overload
     def __getitem__(self, s: slice, /) -> list[T]: ...
 
-    def __getitem__(self, item: Union[int, slice]) -> Union[T, list[T]]:
+    def __getitem__(self, item: int | slice) -> T | list[T]:
         return self._x[item]
 
     @overload
@@ -84,7 +82,7 @@ class ConstantList(Generic[T], Sequence):
     @overload
     def __setitem__(self, s: slice, value: T, /): ...
 
-    def __setitem__(self, item: Union[int, slice], value: Union[T, list[T]]):
+    def __setitem__(self, item: int | slice, value: T | list[T]):
         raise TypeError("Cannot set item in a constant list")
 
     def __delitem__(self, item):
@@ -102,13 +100,16 @@ class ConstantList(Generic[T], Sequence):
     def __repr__(self):
         return f"ConstantList({self._x})"
 
+    def copy(self) -> list[T]:
+        return self._x.copy()
+
 
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
     def __init__(
         self,
-        *size: Union[int, torch.SymInt],
+        *size: int | torch.SymInt,
         dtype: torch.dtype,
         device: torch.device,
         pin_memory: bool,
@@ -128,12 +129,12 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
-    def copy_to_cpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
         if n is None:
@@ -166,19 +167,20 @@ class APIServerProcessManager:
 
     def __init__(
         self,
-        target_server_fn: Callable,
         listen_address: str,
         sock: Any,
         args: argparse.Namespace,
         num_servers: int,
         input_addresses: list[str],
         output_addresses: list[str],
-        stats_update_address: Optional[str] = None,
+        target_server_fn: Callable | None = None,
+        stats_update_address: str | None = None,
+        tensor_queue: Queue | None = None,
     ):
         """Initialize and start API server worker processes.
 
         Args:
-            target_server_fn: Function to call for each API server process
+            target_server_fn: Override function to call for each API server process
             listen_address: Address to listen for client connections
             sock: Socket for client connections
             args: Command line arguments
@@ -186,6 +188,7 @@ class APIServerProcessManager:
             input_addresses: Input addresses for each API server
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
+            tensor_queue: Optional tensor IPC queue for sharing MM tensors
         """
         self.listen_address = listen_address
         self.sock = sock
@@ -206,9 +209,11 @@ class APIServerProcessManager:
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
+            if tensor_queue is not None:
+                client_config["tensor_queue"] = tensor_queue
 
             proc = spawn_context.Process(
-                target=target_server_fn,
+                target=target_server_fn or run_api_server_worker_proc,
                 name=f"ApiServer_{i}",
                 args=(listen_address, sock, args, client_config),
             )
@@ -221,16 +226,36 @@ class APIServerProcessManager:
         # The extra processes are managed by their owners
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
 
-    def close(self) -> None:
-        self._finalizer()
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown API server processes with configurable timeout"""
+        if self._finalizer.detach() is not None:
+            shutdown(self.processes, timeout=timeout)
+
+
+def run_api_server_worker_proc(
+    listen_address, sock, args, client_config=None, **uvicorn_kwargs
+) -> None:
+    """Entrypoint for individual API server worker processes."""
+
+    from vllm.entrypoints.openai.api_server import run_server_worker
+
+    client_config = client_config or {}
+    server_index = client_config.get("client_index", 0)
+
+    # Set process title and add process-specific prefix to stdout and stderr.
+    set_process_title("APIServer", str(server_index))
+    decorate_logs()
+
+    uvloop.run(
+        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+    )
 
 
 def wait_for_completion_or_failure(
     api_server_manager: APIServerProcessManager,
-    engine_manager: Optional[
-        Union["CoreEngineProcManager", "CoreEngineActorManager"]
-    ] = None,
-    coordinator: Optional["DPCoordinator"] = None,
+    engine_manager: Union["CoreEngineProcManager", "CoreEngineActorManager"]
+    | None = None,
+    coordinator: "DPCoordinator | None" = None,
 ) -> None:
     """Wait for all processes to complete or detect if any fail.
 
@@ -290,25 +315,30 @@ def wait_for_completion_or_failure(
     except Exception as e:
         logger.exception("Exception occurred while running API servers: %s", str(e))
         raise
-    finally:
-        logger.info("Terminating remaining processes ...")
-        api_server_manager.close()
-        if coordinator:
-            coordinator.close()
-        if engine_manager:
-            engine_manager.close()
 
 
 # Note(rob): shutdown function cannot be a bound method,
 # else the gc cannot collect the object.
-def shutdown(procs: list[BaseProcess]):
+def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
+    """Shutdown processes with timeout.
+
+    Args:
+        procs: List of processes to shutdown
+        timeout: Maximum time in seconds to wait for graceful shutdown
+    """
+    if timeout is None:
+        timeout = 0.0
+
+    # Allow at least 5 seconds for remaining procs to terminate.
+    timeout = max(timeout, 5.0)
+
     # Shutdown the process.
     for proc in procs:
         if proc.is_alive():
             proc.terminate()
 
-    # Allow 5 seconds for remaining procs to terminate.
-    deadline = time.monotonic() + 5
+    # Allow time for remaining procs to terminate.
+    deadline = time.monotonic() + timeout
     for proc in procs:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -347,13 +377,17 @@ def report_usage_stats(
 
     parallel_config = vllm_config.parallel_config
 
+    # Prepare KV connector string if applicable
+    kv_connector = None
+    if vllm_config.kv_transfer_config is not None:
+        kv_connector = vllm_config.kv_transfer_config.kv_connector
+
     usage_message.report_usage(
         get_architecture_class_name(vllm_config.model_config),
         usage_context,
         extra_kvs={
             # Common configuration
             "dtype": str(vllm_config.model_config.dtype),
-            "tensor_parallel_size": parallel_config.tensor_parallel_size,
             "block_size": vllm_config.cache_config.block_size,
             "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
             "kv_cache_memory_bytes": vllm_config.cache_config.kv_cache_memory_bytes,
@@ -365,6 +399,15 @@ def report_usage_stats(
             "enable_prefix_caching": vllm_config.cache_config.enable_prefix_caching,
             "enforce_eager": vllm_config.model_config.enforce_eager,
             "disable_custom_all_reduce": parallel_config.disable_custom_all_reduce,
+            # Distributed parallelism settings
+            "tensor_parallel_size": parallel_config.tensor_parallel_size,
+            "data_parallel_size": parallel_config.data_parallel_size,
+            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
+            "enable_expert_parallel": parallel_config.enable_expert_parallel,
+            # All2All backend for MoE expert parallel
+            "all2all_backend": parallel_config.all2all_backend,
+            # KV connector used
+            "kv_connector": kv_connector,
         },
     )
 
@@ -389,3 +432,66 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
 
     _PROFILER_FUNC = func
     return func(name)
+
+
+def tensor_data(tensor: torch.Tensor) -> memoryview:
+    """Get the raw data of a tensor as a uint8 memoryview, useful for
+    serializing and hashing.
+
+    Args:
+        tensor: The input tensor.
+
+    Returns:
+        A memoryview of the tensor data as uint8.
+    """
+    return tensor.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+
+
+@dataclass
+class IterationDetails:
+    num_ctx_requests: int
+    num_ctx_tokens: int
+    num_generation_requests: int
+    num_generation_tokens: int
+
+    def __repr__(self) -> str:
+        return f"IterationDetails(num_ctx_requests={self.num_ctx_requests},\
+                 num_ctx_tokens={self.num_ctx_tokens}, \
+                 num_generation_requests={self.num_generation_requests}, \
+                 num_generation_tokens={self.num_generation_tokens})"
+
+
+def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
+    """
+    Compute the number of context/generation requests and tokens
+    for the current iteration's scheduler output. A requests is regarded
+    as a context request if its output tokens are still 0, an extended chunk
+    of chunked prefill falls into this category.
+
+    Args:
+        scheduler_output: The scheduler output for the current iteration.
+
+    Returns:
+        An IterationDetails object containing the number of
+        context/generation requests and tokens.
+    """
+    num_context_requests = 0
+    num_context_tokens = 0
+    num_generation_requests = 0
+    num_generation_tokens = 0
+    new_req_ids = {new_req.req_id for new_req in scheduler_output.scheduled_new_reqs}
+    for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+        if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id) or (
+            req_id in new_req_ids
+        ):
+            num_context_requests += 1
+            num_context_tokens += num_tokens
+        else:
+            num_generation_requests += 1
+            num_generation_tokens += num_tokens
+    return IterationDetails(
+        num_context_requests,
+        num_context_tokens,
+        num_generation_requests,
+        num_generation_tokens,
+    )

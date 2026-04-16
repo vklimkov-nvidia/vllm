@@ -4,8 +4,6 @@
 Tests for miscellaneous utilities
 """
 
-from typing import Optional
-
 import pytest
 import torch
 
@@ -17,7 +15,7 @@ def rotary_embedding_opcheck(
     rot,
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: Optional[torch.Tensor] = None,
+    key: torch.Tensor | None = None,
 ):
     cos_sin_cache = rot.cos_sin_cache.to(query.device, dtype=query.dtype)
 
@@ -38,6 +36,7 @@ def rotary_embedding_opcheck(
 @pytest.mark.parametrize("use_key", [True, False])
 @pytest.mark.parametrize("head_stride_is_contiguous", [True, False])
 def test_rotary_embedding_opcheck(
+    default_vllm_config,
     dist_init,
     device,
     max_position,
@@ -63,7 +62,7 @@ def test_rotary_embedding_opcheck(
     )
     key = torch.randn_like(query) if use_key else None
     query = query[..., :head_size]
-    key = key[..., :head_size] if use_key else None
+    key = key[..., :head_size] if key is not None else None
 
     rotary_embedding_opcheck(rot, positions, query, key)
 
@@ -74,5 +73,5 @@ def test_rotary_embedding_opcheck(
             rot,
             positions,
             query.flatten(start_dim=-2),
-            key.flatten(start_dim=-2) if use_key else None,
+            key.flatten(start_dim=-2) if key is not None else None,
         )

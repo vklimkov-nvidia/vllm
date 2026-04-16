@@ -4,19 +4,19 @@
 import multiprocessing as mp
 import os
 import tempfile
-from multiprocessing import Queue
-from typing import Optional
+from multiprocessing.queues import Queue
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import MemorySnapshot
+from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 
 # Global queue to track operation order across processes
-_QUEUE: Optional[Queue] = None
+_QUEUE: Queue | None = None
 
 
 def track_operation(operation: str, rank: int):
@@ -96,7 +96,12 @@ def worker_process(
             side_effect=make_operation_tracker("nccl_all_reduce", original_all_reduce),
         )
 
-        with init_patch, memory_patch, all_reduce_patch:
+        with (
+            init_patch,
+            memory_patch,
+            all_reduce_patch,
+            set_current_vllm_config(vllm_config),
+        ):
             # Initialize device (this is where we test the order)
             worker.init_device()
 
@@ -112,7 +117,8 @@ def worker_process(
 
 
 @pytest.mark.skipif(
-    torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for tensor parallelism"
+    torch.accelerator.device_count() < 2,
+    reason="Need at least 2 GPUs for tensor parallelism",
 )
 def test_init_distributed_is_called_before_memory_snapshot():
     """Test that distributed env is setup before memory snapshot.

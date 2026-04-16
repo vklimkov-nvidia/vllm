@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import torch
 
@@ -21,7 +20,7 @@ class CompressedTensorsScheme(ABC):
         """
         Get minimum device capability.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def create_weights(self, *args, **kwargs):
@@ -29,11 +28,11 @@ class CompressedTensorsScheme(ABC):
         Weight creation for the particular scheme. Inputs to this function
 
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def apply_weights(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ):
         """
         Run the forward pass for the particular scheme. This is where
@@ -45,7 +44,7 @@ class CompressedTensorsScheme(ABC):
         :param bias: bias parameter
 
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module):
@@ -53,4 +52,4 @@ class CompressedTensorsScheme(ABC):
         Called after weight loading is complete for any cleanup that
         needs to occur.
         """
-        raise NotImplementedError
+        raise NotImplementedError()

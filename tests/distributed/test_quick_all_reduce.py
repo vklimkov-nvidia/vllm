@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import multiprocessing
 import random
 
 import pytest
@@ -8,6 +9,7 @@ import ray
 import torch
 import torch.distributed as dist
 
+from vllm import _custom_ops as ops
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.platforms import current_platform
@@ -37,7 +39,7 @@ def graph_quickreduce(
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        torch.accelerator.set_device_index(device)
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
         ensure_model_parallel_initialized(tp_size, pp_size)
         group = get_tp_group().device_group
@@ -50,7 +52,7 @@ def graph_quickreduce(
         data = torch.zeros(1)
         data = data.to(device=device)
         torch.distributed.all_reduce(data, group=group)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         del data
 
         # we use the first group to communicate once
@@ -63,13 +65,11 @@ def graph_quickreduce(
         for sz in test_sizes:
             for dtype in [torch.float16, torch.bfloat16]:
                 with graph_capture(device=device) as graph_capture_context:
-                    inp1 = torch.randint(
-                        1, 23, (sz,), dtype=dtype, device=torch.cuda.current_device()
-                    )
-                    inp2 = torch.randint(
-                        -23, 1, (sz,), dtype=dtype, device=torch.cuda.current_device()
-                    )
-                    torch.cuda.synchronize()
+                    device_idx = torch.accelerator.current_device_index()
+                    inp1 = torch.randint(1, 23, (sz,), dtype=dtype, device=device_idx)
+                    inp2 = torch.randint(-23, 1, (sz,), dtype=dtype, device=device_idx)
+
+                    torch.accelerator.synchronize()
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=graph_capture_context.stream):
                         for _ in range(num_communication):
@@ -93,7 +93,7 @@ def eager_quickreduce(
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        torch.accelerator.set_device_index(device)
 
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
@@ -128,9 +128,93 @@ def test_custom_quick_allreduce(
     quant_mode,
 ):
     world_size = tp_size * pipeline_parallel_size
-    if world_size > torch.cuda.device_count():
+    if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
 
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", quant_mode)
 
     multi_process_parallel(monkeypatch, tp_size, pipeline_parallel_size, test_target)
+
+
+def qr_variable_input(rank, world_size):
+    """
+    When the tensor parallelism is set to 4 or 8, frequent changes
+    in the input shape can cause QuickReduce to hang (this issue
+    has been observed with the gpt_oss model).
+    """
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    qr_max_size = None  # MB
+    _ptr = ops.init_custom_qr(rank, world_size, qr_max_size)
+    ranks = []
+    for i in range(world_size):
+        ranks.append(i)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="tcp://127.0.0.1:29500",
+        rank=rank,
+        world_size=world_size,
+    )
+    cpu_group = torch.distributed.new_group(ranks, backend="nccl")
+
+    handle = ops.qr_get_handle(_ptr)
+    world_size = dist.get_world_size(group=cpu_group)
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=cpu_group)
+    ops.qr_open_handles(_ptr, handles)
+
+    num = 1
+    s1 = 1024
+    while num < 50000:  # 50000 is sufficient to identify issues.
+        dtype = torch.float16
+        device_idx = torch.accelerator.current_device_index()
+        if num % 2 == 0:
+            s2 = 1024
+            inp1 = torch.zeros((s1, s2), dtype=dtype, device=device_idx)
+        else:
+            s2 = 2048
+            inp1 = torch.ones((s1, s2), dtype=dtype, device=device_idx)
+        result = torch.empty_like(inp1)
+        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 NONE = 4
+        ops.qr_all_reduce(_ptr, inp1, result, 3, cast_bf2half=True)
+        try:
+            if inp1[0, 0] == 0:
+                assert torch.all(result == 0)
+            else:
+                assert torch.all(result == world_size)
+        except AssertionError:
+            print("Assertion failed! Allreduce results are incorrect.")
+            raise
+        num += 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="only test quick allreduce for rocm"
+)
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("pipeline_parallel_size", [1])
+def test_custom_quick_allreduce_variable_input(tp_size, pipeline_parallel_size):
+    world_size = tp_size * pipeline_parallel_size
+    if world_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+
+    multiprocessing.set_start_method("spawn", force=True)
+    # 60s is enough
+    timeout = 60
+    processes = []
+    for rank in range(tp_size):
+        p = multiprocessing.Process(target=qr_variable_input, args=(rank, tp_size))
+        p.start()
+        processes.append((rank, p))
+    for rank, p in processes:
+        p.join(timeout=timeout)
+        if p.is_alive():
+            for r, proc in processes:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join()
+            raise RuntimeError(f"QuickReduce hang detected after {timeout} seconds!")
+
+
+if __name__ == "__main__":
+    test_custom_quick_allreduce_variable_input(tp_size=4, pipeline_parallel_size=1)

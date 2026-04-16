@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from contextlib import ExitStack
-from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,13 +12,25 @@ from vllm import SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+)
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import PromptType
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
 from vllm.sampling_params import RequestOutputKind
-from vllm.utils import set_default_torch_num_threads
+from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.metrics.loggers import LoggingStatLogger
+from vllm.v1.metrics.loggers import (
+    AggregatedLoggingStatLogger,
+    LoggingStatLogger,
+    PerEngineStatLoggerAdapter,
+    PrometheusStatLogger,
+)
 
 if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.", allow_module_level=True)
@@ -53,8 +65,8 @@ async def generate(
     output_kind: RequestOutputKind,
     max_tokens: int,
     n: int = 1,
-    prompt_logprobs: Optional[int] = None,
-    cancel_after: Optional[int] = None,
+    prompt_logprobs: int | None = None,
+    cancel_after: int | None = None,
 ) -> tuple[int, str]:
     # Ensure generate doesn't complete too fast for cancellation test.
     await asyncio.sleep(0.2)
@@ -95,17 +107,11 @@ async def generate(
 )
 @pytest.mark.asyncio
 async def test_load(
-    monkeypatch: pytest.MonkeyPatch,
     output_kind: RequestOutputKind,
     engine_args: AsyncEngineArgs,
     prompt: PromptType,
 ):
-    # TODO(rickyx): Remove monkeypatch once we have a better way to test V1
-    # so that in the future when we switch, we don't have to change all the
-    # tests.
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(engine_args)
         after.callback(engine.shutdown)
@@ -149,14 +155,11 @@ async def test_load(
 )
 @pytest.mark.asyncio
 async def test_abort(
-    monkeypatch: pytest.MonkeyPatch,
     output_kind: RequestOutputKind,
     engine_args: AsyncEngineArgs,
     prompt: PromptType,
 ):
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(engine_args)
         after.callback(engine.shutdown)
@@ -222,13 +225,8 @@ async def test_abort(
     "output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
 )
 @pytest.mark.asyncio
-async def test_multi_abort(
-    monkeypatch: pytest.MonkeyPatch,
-    output_kind: RequestOutputKind,
-):
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+async def test_multi_abort(output_kind: RequestOutputKind):
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
         after.callback(engine.shutdown)
@@ -263,7 +261,7 @@ async def test_multi_abort(
 
         # Use multi-abort to abort multiple requests at once
         abort_request_ids = [request_ids[i] for i in REQUEST_IDS_TO_ABORT]
-        await engine.abort(abort_request_ids)
+        await engine.abort(abort_request_ids, internal=False)
 
         # Wait for all tasks to complete
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -304,14 +302,11 @@ async def test_multi_abort(
 )
 @pytest.mark.asyncio
 async def test_finished_flag(
-    monkeypatch: pytest.MonkeyPatch,
     n: int,
     engine_args: AsyncEngineArgs,
     prompt: PromptType,
 ):
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(engine_args)
         after.callback(engine.shutdown)
@@ -341,12 +336,10 @@ async def test_finished_flag(
 )
 @pytest.mark.asyncio
 async def test_mid_stream_cancellation(
-    monkeypatch: pytest.MonkeyPatch, engine_args: AsyncEngineArgs, prompt: PromptType
+    engine_args: AsyncEngineArgs, prompt: PromptType
 ):
     """Test that requests can be cancelled mid-stream."""
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(engine_args)
         after.callback(engine.shutdown)
@@ -404,6 +397,12 @@ class MockLoggingStatLogger(LoggingStatLogger):
         self.log = MagicMock()
 
 
+class MockAggregatedStatLogger(AggregatedLoggingStatLogger):
+    def __init__(self, vllm_config: VllmConfig, engine_indexes: list[int]):
+        super().__init__(vllm_config, engine_indexes)
+        self.log = MagicMock()
+
+
 @pytest.mark.asyncio
 async def test_customize_loggers(monkeypatch):
     """Test that we can customize the loggers.
@@ -411,9 +410,7 @@ async def test_customize_loggers(monkeypatch):
     be added to the default loggers.
     """
 
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(
                 TEXT_ENGINE_ARGS,
@@ -423,17 +420,47 @@ async def test_customize_loggers(monkeypatch):
 
         await engine.do_log_stats()
 
-        stat_loggers = engine.logger_manager.per_engine_logger_dict
-        assert len(stat_loggers) == 1
-        assert len(stat_loggers[0]) == 2  # LoggingStatLogger + MockLoggingStatLogger
-        stat_loggers[0][0].log.assert_called_once()
+        stat_loggers = engine.logger_manager.stat_loggers
+        assert (
+            len(stat_loggers) == 3
+        )  # MockLoggingStatLogger + LoggingStatLogger +  Promethus Logger
+        print(f"{stat_loggers=}")
+        stat_loggers[0].per_engine_stat_loggers[0].log.assert_called_once()
+        assert isinstance(stat_loggers[1], PerEngineStatLoggerAdapter)
+        assert isinstance(stat_loggers[1].per_engine_stat_loggers[0], LoggingStatLogger)
+        assert isinstance(stat_loggers[2], PrometheusStatLogger)
+
+
+@pytest.mark.asyncio
+async def test_customize_aggregated_loggers():
+    """Test that we can customize the aggregated loggers.
+    If a customized logger is provided at the init, it should
+    be added to the default loggers.
+    """
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(
+                TEXT_ENGINE_ARGS,
+                stat_loggers=[MockLoggingStatLogger, MockAggregatedStatLogger],
+            )
+        after.callback(engine.shutdown)
+
+        await engine.do_log_stats()
+
+        stat_loggers = engine.logger_manager.stat_loggers
+        assert len(stat_loggers) == 4
+        #  MockLoggingStatLogger + MockAggregatedStatLogger
+        # + LoggingStatLogger + PrometheusStatLogger
+        stat_loggers[0].per_engine_stat_loggers[0].log.assert_called_once()
+        stat_loggers[1].log.assert_called_once()
+        assert isinstance(stat_loggers[2], PerEngineStatLoggerAdapter)
+        assert isinstance(stat_loggers[2].per_engine_stat_loggers[0], LoggingStatLogger)
+        assert isinstance(stat_loggers[3], PrometheusStatLogger)
 
 
 @pytest.mark.asyncio(scope="module")
-async def test_dp_rank_argument(monkeypatch: pytest.MonkeyPatch):
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+async def test_dp_rank_argument():
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
         after.callback(engine.shutdown)
@@ -465,8 +492,74 @@ async def test_dp_rank_argument(monkeypatch: pytest.MonkeyPatch):
                 pass
 
 
+@pytest.mark.asyncio(scope="module")
+async def test_header_dp_rank_argument():
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        MODEL_NAME = "test-model"
+        BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
+
+        # Create models first
+        models = OpenAIServingModels(
+            engine_client=engine,
+            base_model_paths=BASE_MODEL_PATHS,
+        )
+
+        # Create render serving instance (required by OpenAIServingChat)
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+
+        serving_render = OpenAIServingRender(
+            model_config=engine.model_config,
+            renderer=engine.renderer,
+            io_processor=engine.io_processor,
+            model_registry=models.registry,
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+
+        # Create serving chat instance
+        serving_chat = OpenAIServingChat(
+            engine_client=engine,
+            models=models,
+            response_role="assistant",
+            openai_serving_render=serving_render,
+            chat_template=None,
+            chat_template_content_format="auto",
+            request_logger=None,
+        )
+        # Create a chat completion request
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": TEXT_PROMPT}],
+            max_tokens=100,
+            temperature=1.0,
+            seed=33,
+        )
+        # Test 1: Valid DP rank (0)
+        mock_raw_request = MagicMock()
+        mock_raw_request.headers = {"X-data-parallel-rank": "0"}
+        mock_raw_request.state = MagicMock()
+
+        # Should succeed with valid rank
+        response = await serving_chat.create_chat_completion(req, mock_raw_request)
+        assert isinstance(response, ChatCompletionResponse), (
+            "Expected a ChatCompletionResponse for valid DP rank"
+        )
+
+        # Test 2: Out-of-range DP rank (1)
+        mock_raw_request.headers = {"X-data-parallel-rank": "1"}
+
+        # should raise ValueError for out-of-range rank
+        with pytest.raises(ValueError):
+            await serving_chat.create_chat_completion(req, mock_raw_request)
+
+
 @pytest.mark.asyncio
-async def test_check_health(monkeypatch: pytest.MonkeyPatch):
+async def test_check_health():
     """Test that check_health returns normally for healthy engine
     and raises EngineDeadError when the engine is dead.
     """
@@ -474,9 +567,7 @@ async def test_check_health(monkeypatch: pytest.MonkeyPatch):
 
     from vllm.v1.engine.exceptions import EngineDeadError
 
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
         after.callback(engine.shutdown)
@@ -503,15 +594,10 @@ async def test_check_health(monkeypatch: pytest.MonkeyPatch):
     "output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
 )
 @pytest.mark.asyncio
-async def test_abort_final_output(
-    monkeypatch: pytest.MonkeyPatch,
-    output_kind: RequestOutputKind,
-):
+async def test_abort_final_output(output_kind: RequestOutputKind):
     """Test that abort() returns a final output with correct information."""
 
-    with monkeypatch.context() as m, ExitStack() as after:
-        m.setenv("VLLM_USE_V1", "1")
-
+    with ExitStack() as after:
         with set_default_torch_num_threads(1):
             engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
         after.callback(engine.shutdown)
@@ -536,7 +622,7 @@ async def test_abort_final_output(
         await asyncio.sleep(0.5)
 
         # Abort the request
-        await engine.abort(request_id)
+        await engine.abort(request_id, internal=False)
 
         # Wait for generation to complete and return final output
         final_output = await generated
@@ -575,9 +661,9 @@ async def collect_outputs(
     prompt: PromptType,
     sampling_params: SamplingParams,
     outputs_list: list[RequestOutput],
-) -> Optional[RequestOutput]:
+) -> RequestOutput | None:
     """Helper to collect outputs and return the final one."""
-    final_output: Optional[RequestOutput] = None
+    final_output: RequestOutput | None = None
     async for output in engine.generate(
         request_id=request_id, prompt=prompt, sampling_params=sampling_params
     ):
@@ -585,3 +671,346 @@ async def collect_outputs(
             outputs_list.append(output)
         final_output = output
     return final_output
+
+
+# =============================================================================
+# Pause/Resume Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_basic():
+    """Test basic pause/resume flag behavior and idempotency.
+
+    Tests:
+    - pause_generation sets the paused flag
+    - resume_generation clears the paused flag
+    - calling pause when already paused is a no-op
+    - calling resume when not paused is safe
+    - all pause modes work with no requests in flight
+    - rapid pause/resume cycles don't break the engine
+    """
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        # Initially not paused
+        assert not await engine.is_paused()
+
+        # Resume when not paused should be safe
+        await engine.resume_generation()
+        assert not await engine.is_paused()
+
+        # Pause sets flag
+        await engine.pause_generation(mode="abort")
+        assert await engine.is_paused()
+
+        # Pause when already paused is a no-op
+        await engine.pause_generation(mode="abort")
+        assert await engine.is_paused()
+
+        # Resume clears flag
+        await engine.resume_generation()
+        assert not await engine.is_paused()
+
+        # Test all modes with no requests in flight
+        for mode in ("abort", "wait", "keep"):
+            await engine.pause_generation(mode=mode)
+            assert await engine.is_paused()
+            await engine.resume_generation()
+            assert not await engine.is_paused()
+
+        # Concurrent pause/resume race conditions - should not deadlock or raise
+        await asyncio.gather(
+            engine.pause_generation(mode="abort"),
+            engine.resume_generation(),
+            engine.pause_generation(mode="abort"),
+            engine.resume_generation(),
+        )
+
+        # Ensure we end in a known state
+        await engine.resume_generation()
+        assert not await engine.is_paused()
+
+        # Engine should still work after all cycles
+        sampling_params = SamplingParams(max_tokens=5)
+        async for out in engine.generate(
+            request_id="post-cycles",
+            prompt=TEXT_PROMPT,
+            sampling_params=sampling_params,
+        ):
+            pass
+        assert out.finished
+
+
+@pytest.mark.asyncio
+async def test_pause_abort():
+    """Test that mode='abort' aborts in-flight requests immediately."""
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        # Start a long-running request
+        sampling_params = SamplingParams(max_tokens=1000, ignore_eos=True)
+        outputs: list[RequestOutput] = []
+
+        async def gen():
+            async for out in engine.generate(
+                request_id="test-abort-pause",
+                prompt=TEXT_PROMPT,
+                sampling_params=sampling_params,
+            ):
+                outputs.append(out)
+            return outputs[-1] if outputs else None
+
+        # Start generation task
+        gen_task = asyncio.create_task(gen())
+
+        # Wait for some tokens to be generated
+        while len(outputs) < 3:
+            await asyncio.sleep(0.01)
+
+        # Pause with abort mode
+        await engine.pause_generation(mode="abort")
+
+        # Wait for task to complete (should be aborted)
+        final_output = await gen_task
+
+        # Request should be finished (aborted)
+        assert final_output is not None
+        assert final_output.finished
+        assert final_output.outputs[0].finish_reason == "abort"
+
+        # Also test that new requests are blocked while paused, then resume
+        assert await engine.is_paused()
+
+        request_completed = False
+
+        async def gen_blocked():
+            nonlocal request_completed
+            async for out in engine.generate(
+                request_id="test-blocked",
+                prompt=TEXT_PROMPT,
+                sampling_params=SamplingParams(max_tokens=5),
+            ):
+                pass
+            request_completed = True
+            return out
+
+        # Start a request (should block)
+        gen_task2 = asyncio.create_task(gen_blocked())
+
+        # Wait a bit - request should not have completed
+        await asyncio.sleep(0.3)
+        assert not request_completed, "Request should be blocked while paused"
+
+        # Resume
+        await engine.resume_generation()
+
+        # Now request should complete
+        final_output2 = await asyncio.wait_for(gen_task2, timeout=10.0)
+        assert request_completed
+        assert final_output2.finished
+
+
+@pytest.mark.asyncio
+async def test_pause_then_abort_queued_request():
+    """Test that aborting a request that was submitted while paused (in
+    _paused_adds_queue) aborts it and notifies the client; the request does
+    not run after resume.
+    """
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        request_id = "abort-queued-request"
+        sampling_params = SamplingParams(max_tokens=20, ignore_eos=True)
+        outputs: list[RequestOutput] = []
+
+        # Pause first so the next add goes to _paused_adds_queue
+        await engine.pause_generation(mode="keep")
+        assert await engine.is_paused()
+
+        async def gen():
+            async for out in engine.generate(
+                request_id=request_id,
+                prompt=TEXT_PROMPT,
+                sampling_params=sampling_params,
+            ):
+                outputs.append(out)
+            return outputs[-1] if outputs else None
+
+        gen_task = asyncio.create_task(gen())
+
+        # Give the request time to reach the engine and sit in _paused_adds_queue
+        await asyncio.sleep(0.2)
+
+        # Abort the queued request
+        await engine.abort(request_id, internal=False)
+
+        # Resume so the engine can process and deliver the abort output
+        await engine.resume_generation()
+
+        final_output = await asyncio.wait_for(gen_task, timeout=10.0)
+        assert final_output is not None
+        assert final_output.finished
+        assert final_output.outputs[0].finish_reason == "abort"
+        # Request was never run, so no tokens
+        assert len(final_output.outputs[0].token_ids) == 0
+
+
+@pytest.mark.asyncio
+async def test_pause_wait():
+    """Test that mode='wait' waits for in-flight requests to complete."""
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        # Start a request - use fewer tokens since wait mode waits for completion
+        sampling_params = SamplingParams(max_tokens=10, ignore_eos=True)
+        got_first_token = asyncio.Event()
+        request_completed = False
+
+        async def gen():
+            nonlocal request_completed
+            async for out in engine.generate(
+                request_id="test-wait",
+                prompt=TEXT_PROMPT,
+                sampling_params=sampling_params,
+            ):
+                got_first_token.set()
+            request_completed = True
+            return out
+
+        # Start generation
+        gen_task = asyncio.create_task(gen())
+
+        # Wait for generation to start (event-driven)
+        await asyncio.wait_for(got_first_token.wait(), timeout=30.0)
+
+        # Pause with wait mode - should wait for request to finish
+        await engine.pause_generation(mode="wait")
+
+        # By now the request should be done (wait mode waits for completion)
+        assert request_completed, "Request should have completed during wait"
+
+        final_output = gen_task.result()
+        assert final_output.finished
+        # Should complete normally, not aborted
+        assert final_output.outputs[0].finish_reason != "eos"
+
+
+@pytest.mark.asyncio
+async def test_pause_keep_single_request():
+    """Test that mode='keep' freezes a single request and resumes with timing gap."""
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        sampling_params = SamplingParams(max_tokens=30, ignore_eos=True)
+        token_times: list[tuple[int, float]] = []
+        pause_duration = 5.0
+        pause_token_idx = 0
+
+        async def generator_task():
+            """Generate tokens and record timestamps."""
+            async for output in engine.generate(
+                request_id="test-keep-single",
+                prompt=TEXT_PROMPT,
+                sampling_params=sampling_params,
+            ):
+                token_count = len(output.outputs[0].token_ids)
+                token_times.append((token_count, time.monotonic()))
+            return output
+
+        async def controller_task():
+            """Pause and resume the engine."""
+            nonlocal pause_token_idx
+            # Wait for some tokens (event-driven, handles slow token generation)
+            while len(token_times) < 5:
+                await asyncio.sleep(0.01)
+
+            # Pause with keep mode
+            await engine.pause_generation(mode="keep")
+            pause_token_idx = len(token_times)
+
+            # Sleep while paused
+            await asyncio.sleep(pause_duration)
+
+            # Resume
+            await engine.resume_generation()
+
+        # Run both tasks with timeout for slow generation
+        gen_task = asyncio.create_task(generator_task())
+        ctrl_task = asyncio.create_task(controller_task())
+
+        final_output, _ = await asyncio.wait_for(
+            asyncio.gather(gen_task, ctrl_task), timeout=60.0
+        )
+
+        # Request should complete with all tokens
+        assert final_output.finished
+        assert len(final_output.outputs[0].token_ids) == 30
+
+        # Check the gap at the recorded pause index matches the pause duration
+        pause_gap = (
+            token_times[pause_token_idx][1] - token_times[pause_token_idx - 1][1]
+        )
+        assert pause_gap >= pause_duration * 0.8, (
+            f"Expected gap of ~{pause_duration}s after pause, got {pause_gap:.3f}s"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pause_keep_multi_request():
+    """Test that mode='keep' freezes multiple concurrent requests and all resume."""
+    with ExitStack() as after:
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        num_requests = 3
+        sampling_params = SamplingParams(max_tokens=10, ignore_eos=True)
+        completed_requests: list[str] = []
+        any_token_generated = asyncio.Event()
+
+        async def gen_multi(request_id: str):
+            async for out in engine.generate(
+                request_id=request_id,
+                prompt=TEXT_PROMPT,
+                sampling_params=sampling_params,
+            ):
+                any_token_generated.set()
+            completed_requests.append(request_id)
+            return out
+
+        # Start multiple requests
+        tasks = [
+            asyncio.create_task(gen_multi(f"req-multi-{i}"))
+            for i in range(num_requests)
+        ]
+
+        # Wait for at least one token across any request (event-driven)
+        await asyncio.wait_for(any_token_generated.wait(), timeout=30.0)
+
+        # Pause with keep mode
+        await engine.pause_generation(mode="keep")
+
+        # Wait while paused
+        await asyncio.sleep(0.5)
+
+        # Resume
+        await engine.resume_generation()
+
+        # All requests should complete
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+
+        assert len(completed_requests) == num_requests
+        for result in results:
+            assert result.finished
+            assert len(result.outputs[0].token_ids) == 10

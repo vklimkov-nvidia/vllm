@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from https://github.com/fixie-ai/ultravox/blob/ecd58c4041030bae2ad15aa6bcf04ab43199ea02/ultravox/model/ultravox_config.py
-from typing import Any, Optional
+from typing import Any
 
 import transformers
 
@@ -43,17 +43,16 @@ class UltravoxConfig(transformers.PretrainedConfig):
             use `False`, but v0.5 and above use `True`.
     """
 
-    wrapped_model_config: transformers.PretrainedConfig
     model_type = "ultravox"
     audio_token = "<|audio|>"
     is_composition = False
 
     def __init__(
         self,
-        audio_config: Optional[dict[str, Any]] = None,
-        text_config: Optional[dict[str, Any]] = None,
-        audio_model_id: Optional[str] = None,
-        text_model_id: Optional[str] = None,
+        audio_config: dict[str, Any] | None = None,
+        text_config: dict[str, Any] | None = None,
+        audio_model_id: str | None = None,
+        text_model_id: str | None = None,
         ignore_index: int = -100,
         audio_token_index: int = 32000,
         hidden_size: int = 4096,
@@ -61,6 +60,7 @@ class UltravoxConfig(transformers.PretrainedConfig):
         norm_init: float = 0.4,
         projector_act: str = "swiglu",
         projector_ln_mid: bool = False,
+        num_projector_layers: int = 0,
         **kwargs,
     ):
         self.ignore_index = ignore_index
@@ -71,8 +71,10 @@ class UltravoxConfig(transformers.PretrainedConfig):
         self.norm_init = norm_init
         self.projector_act = projector_act
         self.projector_ln_mid = projector_ln_mid
+        self.num_projector_layers = num_projector_layers
 
         # N.B. May set the wrapped_model_config below.
+        self.wrapped_model_config: transformers.PretrainedConfig
         self.text_model_id = text_model_id
         if text_model_id is None:
             text_config = text_config or {}
