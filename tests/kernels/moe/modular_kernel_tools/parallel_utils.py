@@ -3,15 +3,16 @@
 import dataclasses
 import os
 import traceback
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Concatenate
 
 import torch
 from torch.multiprocessing import spawn  # pyright: ignore[reportPrivateImportUsage]
-from typing_extensions import Concatenate, ParamSpec
+from typing_extensions import ParamSpec
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import init_distributed_environment, initialize_model_parallel
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 ## Parallel Processes Utils
 
@@ -58,14 +59,14 @@ def _worker_parallel_launch(
     world_local_size: int,
     node_rank: int,
     init_method: str,
-    worker: Callable[Concatenate[ProcessGroupInfo, Optional[VllmConfig], Any, P], None],
-    vllm_config: Optional[VllmConfig],
-    env_dict: Optional[dict],
+    worker: Callable[Concatenate[ProcessGroupInfo, VllmConfig | None, Any, P], None],
+    vllm_config: VllmConfig | None,
+    env_dict: dict | None,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> None:
     rank = node_rank * world_local_size + local_rank
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     device = torch.device("cuda", local_rank)
     torch.distributed.init_process_group(
         backend="cpu:gloo,cuda:nccl",

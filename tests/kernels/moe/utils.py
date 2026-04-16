@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional, Union
 
 import torch
 
@@ -8,17 +7,69 @@ import vllm._custom_ops as ops
 from tests.kernels.quant_utils import per_block_cast_to_int8
 from tests.kernels.quantization.nvfp4_utils import FLOAT4_E2M1_MAX, FLOAT8_E4M3_MAX
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+    RoutingMethodType,
+)
 from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
     BatchedPrepareAndFinalize,
     BatchedTritonExperts,
     NaiveBatchedExperts,
 )
-from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    TritonExperts,
+    fused_experts,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.utils import round_up
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
+from vllm.utils.math_utils import round_up
+
+
+def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
+    """Fold weights to adjacent locations for Triton MoE / SwiGLU kernel layout."""
+    shape = w.shape
+    n = shape[-1]
+    first = w[..., : n // 2]
+    second = w[..., n // 2 :]
+    stacked = torch.stack((first, second), dim=-1)
+    return stacked.reshape(shape)
+
+
+def make_dummy_moe_config(
+    num_experts: int = 1,
+    experts_per_token: int = 1,
+    hidden_dim: int = 1,
+    intermediate_size_per_partition: int = 1,
+    in_dtype: torch.dtype = torch.bfloat16,
+) -> FusedMoEConfig:
+    """
+    This is a dummy config for the mk constructor interface
+    as most kernels like DeepGEMM, CUTLASSFp4, Triton, MARLIN
+    do not actually use this config.
+
+    CUTLASSFp8 needs to set some params for workshapes.
+    """
+    return FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
+        hidden_dim=hidden_dim,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU,
+        in_dtype=in_dtype,
+        device="cuda",
+        routing_method=RoutingMethodType.TopK,
+    )
 
 
 def triton_moe(
@@ -27,13 +78,13 @@ def triton_moe(
     w2: torch.Tensor,
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    quant_dtype: Optional[torch.dtype] = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    quant_dtype: torch.dtype | None = None,
     per_act_token_quant=False,
-    block_shape: Optional[list[int]] = None,
+    block_shape: list[int] | None = None,
 ) -> torch.Tensor:
     quant_config = FusedMoEQuantConfig.make(
         quant_dtype,
@@ -54,13 +105,13 @@ def batched_moe(
     w2: torch.Tensor,
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    quant_dtype: Optional[torch.dtype] = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    quant_dtype: torch.dtype | None = None,
     per_act_token_quant: bool = False,
-    block_shape: Optional[list[int]] = None,
+    block_shape: list[int] | None = None,
 ) -> torch.Tensor:
     max_num_tokens = round_up(a.shape[0], 64)
 
@@ -74,7 +125,9 @@ def batched_moe(
         a2_scale=a2_scale,
     )
 
-    fused_experts = FusedMoEModularKernel(
+    moe_config = make_dummy_moe_config()
+
+    fused_experts = FusedMoEKernel(
         BatchedPrepareAndFinalize(
             max_num_tokens, num_dispatchers=1, num_local_experts=w1.shape[0], rank=0
         ),
@@ -82,10 +135,22 @@ def batched_moe(
             max_num_tokens=max_num_tokens,
             num_dispatchers=1,
             quant_config=quant_config,
+            moe_config=moe_config,
         ),
+        inplace=False,
     )
 
-    return fused_experts(a, w1, w2, topk_weight, topk_ids)
+    return fused_experts.apply(
+        a,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        global_num_experts=w1.shape[0],
+        activation=moe_config.activation,
+        apply_router_weight_on_input=False,
+        expert_map=None,
+    )
 
 
 def naive_batched_moe(
@@ -94,13 +159,13 @@ def naive_batched_moe(
     w2: torch.Tensor,
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    quant_dtype: Optional[torch.dtype] = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    quant_dtype: torch.dtype | None = None,
     per_act_token_quant: bool = False,
-    block_shape: Optional[list[int]] = None,
+    block_shape: list[int] | None = None,
 ) -> torch.Tensor:
     max_num_tokens = round_up(a.shape[0], 64)
 
@@ -113,8 +178,9 @@ def naive_batched_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
     )
+    moe_config = make_dummy_moe_config()
 
-    fused_experts = FusedMoEModularKernel(
+    fused_experts = FusedMoEKernel(
         BatchedPrepareAndFinalize(
             max_num_tokens, num_dispatchers=1, num_local_experts=w1.shape[0], rank=0
         ),
@@ -122,15 +188,27 @@ def naive_batched_moe(
             max_num_tokens=max_num_tokens,
             num_dispatchers=1,
             quant_config=quant_config,
+            moe_config=moe_config,
         ),
+        inplace=False,
     )
 
-    return fused_experts(a, w1, w2, topk_weight, topk_ids)
+    return fused_experts.apply(
+        a,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        global_num_experts=w1.shape[0],
+        activation=moe_config.activation,
+        apply_router_weight_on_input=False,
+        expert_map=None,
+    )
 
 
 def chunk_scales(
-    scales: Optional[torch.Tensor], start: int, end: int
-) -> Optional[torch.Tensor]:
+    scales: torch.Tensor | None, start: int, end: int
+) -> torch.Tensor | None:
     if scales is not None:
         if scales.numel() == 1:
             return scales
@@ -144,10 +222,10 @@ def make_quantized_test_activations(
     m: int,
     k: int,
     in_dtype: torch.dtype,
-    quant_dtype: Optional[torch.dtype] = None,
-    block_shape: Optional[list[int]] = None,
+    quant_dtype: torch.dtype | None = None,
+    block_shape: list[int] | None = None,
     per_act_token_quant: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     a = torch.randn((E, m, k), device="cuda", dtype=in_dtype) / 10
     a_q = a
     a_scale = None
@@ -172,11 +250,11 @@ def make_quantized_test_activations(
 
 def moe_quantize_weights(
     w: torch.Tensor,
-    w_s: Optional[torch.Tensor],
-    quant_dtype: Union[torch.dtype, str, None],
+    w_s: torch.Tensor | None,
+    quant_dtype: torch.dtype | str | None,
     per_token_quant: bool,
-    block_shape: Optional[list[int]],
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    block_shape: list[int] | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     assert (
         quant_dtype == torch.float8_e4m3fn
         or quant_dtype == torch.int8
@@ -220,10 +298,10 @@ def make_test_weight(
     rows: int,
     cols: int,
     in_dtype: torch.dtype = torch.bfloat16,
-    quant_dtype: Union[torch.dtype, str, None] = None,
-    block_shape: Optional[list[int]] = None,
+    quant_dtype: torch.dtype | str | None = None,
+    block_shape: list[int] | None = None,
     per_out_ch_quant: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     w_16 = torch.randn((e, rows, cols), device="cuda", dtype=in_dtype) / 15
     w_gs = None
 
@@ -262,16 +340,23 @@ def make_test_weights(
     n: int,
     k: int,
     in_dtype: torch.dtype = torch.bfloat16,
-    quant_dtype: Union[torch.dtype, str, None] = None,
-    block_shape: Optional[list[int]] = None,
+    quant_dtype: torch.dtype | str | None = None,
+    block_shape: list[int] | None = None,
     per_out_ch_quant: bool = False,
+    make_gate: bool = True,
 ) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
-    tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None],
 ]:
     return (
         make_test_weight(
-            e, 2 * n, k, in_dtype, quant_dtype, block_shape, per_out_ch_quant
+            e,
+            (2 if make_gate else 1) * n,
+            k,
+            in_dtype,
+            quant_dtype,
+            block_shape,
+            per_out_ch_quant,
         ),
         make_test_weight(e, k, n, in_dtype, quant_dtype, block_shape, per_out_ch_quant),
     )
@@ -295,9 +380,10 @@ def make_test_quant_config(
     n: int,
     k: int,
     in_dtype: torch.dtype,
-    quant_dtype: Union[torch.dtype, str, None] = None,
+    quant_dtype: torch.dtype | str | None = None,
     per_act_token_quant: bool = False,
-    block_shape: Optional[list[int]] = None,
+    block_shape: list[int] | None = None,
+    make_gate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, FusedMoEQuantConfig]:
     (_, w1, w1_s, w1_gs), (_, w2, w2_s, w2_gs) = make_test_weights(
         e,
@@ -307,11 +393,12 @@ def make_test_quant_config(
         quant_dtype,
         per_out_ch_quant=per_act_token_quant,
         block_shape=block_shape,
+        make_gate=make_gate,
     )
 
     # Hacky/trivial scales for nvfp4.
-    a1_gscale: Optional[torch.Tensor] = None
-    a2_gscale: Optional[torch.Tensor] = None
+    a1_gscale: torch.Tensor | None = None
+    a2_gscale: torch.Tensor | None = None
     if quant_dtype == "nvfp4":
         a1_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
         a2_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
@@ -348,9 +435,9 @@ def fused_moe(
     score: torch.Tensor,
     topk: int,
     renormalize: bool = False,
-    quant_config: Optional[FusedMoEQuantConfig] = None,
+    quant_config: FusedMoEQuantConfig | None = None,
     global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
+    expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     topk_weights, topk_ids, _ = fused_topk(
         hidden_states, score.float(), topk, renormalize
@@ -378,7 +465,7 @@ class BaselineMM(torch.nn.Module):
         self.b = b.to(dtype=torch.float32)
         self.out_dtype = out_dtype
 
-    def forward(self, a: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         return torch.mm(a.to(dtype=torch.float32), self.b).to(self.out_dtype), None
 
 
@@ -422,8 +509,8 @@ class RealMLP(torch.nn.Module):
         quant_config=None,
         reduce_results: bool = True,
         prefix: str = "",
-        w1_s: Optional[torch.Tensor] = None,
-        w2_s: Optional[torch.Tensor] = None,
+        w1_s: torch.Tensor | None = None,
+        w2_s: torch.Tensor | None = None,
     ) -> None:
         from vllm.model_executor.layers.linear import (
             MergedColumnParallelLinear,
@@ -481,7 +568,7 @@ def make_shared_experts(
     N: int,
     K: int,
     in_dtype: torch.dtype = torch.bfloat16,
-    quant_dtype: Union[torch.dtype, str, None] = None,
+    quant_dtype: torch.dtype | str | None = None,
 ) -> torch.nn.Module:
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
@@ -511,3 +598,21 @@ def make_shared_experts(
         return RealMLP(K, N, w1, w2, "silu", quant_config, w1_s=w1_s, w2_s=w2_s)
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+def modular_triton_fused_moe(
+    moe_config: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig,
+    shared_experts: torch.nn.Module | None = None,
+) -> FusedMoEKernel:
+    return FusedMoEKernel(
+        maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=quant_config,
+            allow_new_interface=True,
+            use_monolithic=False,
+        ),
+        TritonExperts(moe_config, quant_config),
+        shared_experts,
+        inplace=False,
+    )

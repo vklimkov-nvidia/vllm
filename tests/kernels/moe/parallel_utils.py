@@ -7,20 +7,22 @@ DeepEP test utilities
 import dataclasses
 import os
 import traceback
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Concatenate
 
 import torch
 from torch.distributed import ProcessGroup
 from torch.multiprocessing import spawn  # pyright: ignore[reportPrivateImportUsage]
-from typing_extensions import Concatenate, ParamSpec
+from typing_extensions import ParamSpec
 
-from vllm.utils import get_open_port, has_deep_ep
+from vllm.utils.import_utils import has_deep_ep
+from vllm.utils.network_utils import get_open_port
 
 if has_deep_ep():
-    from vllm.model_executor.layers.fused_moe.deepep_ht_prepare_finalize import (
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
         DeepEPHTPrepareAndFinalize,
     )
-    from vllm.model_executor.layers.fused_moe.deepep_ll_prepare_finalize import (
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
         DeepEPLLPrepareAndFinalize,
     )
 
@@ -50,7 +52,7 @@ def _worker_parallel_launch(
     **kwargs: P.kwargs,
 ) -> None:
     rank = node_rank * world_local_size + local_rank
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     device = torch.device("cuda", local_rank)
     torch.distributed.init_process_group(
         backend="cpu:gloo,cuda:nccl",
@@ -126,8 +128,8 @@ def make_deepep_ht_a2a(
     pgi: ProcessGroupInfo,
     dp_size: int,
     ht_args: DeepEPHTArgs,
-    q_dtype: Optional[torch.dtype] = None,
-    block_shape: Optional[list[int]] = None,
+    q_dtype: torch.dtype | None = None,
+    block_shape: list[int] | None = None,
 ):
     import deep_ep
 
@@ -153,8 +155,8 @@ def make_deepep_ll_a2a(
     pg: ProcessGroup,
     pgi: ProcessGroupInfo,
     deepep_ll_args: DeepEPLLArgs,
-    q_dtype: Optional[torch.dtype] = None,
-    block_shape: Optional[list[int]] = None,
+    q_dtype: torch.dtype | None = None,
+    block_shape: list[int] | None = None,
 ):
     import deep_ep
 
@@ -185,10 +187,10 @@ def make_deepep_a2a(
     pg: ProcessGroup,
     pgi: ProcessGroupInfo,
     dp_size: int,
-    deepep_ht_args: Optional[DeepEPHTArgs],
-    deepep_ll_args: Optional[DeepEPLLArgs],
-    q_dtype: Optional[torch.dtype] = None,
-    block_shape: Optional[list[int]] = None,
+    deepep_ht_args: DeepEPHTArgs | None,
+    deepep_ll_args: DeepEPLLArgs | None,
+    q_dtype: torch.dtype | None = None,
+    block_shape: list[int] | None = None,
 ):
     if deepep_ht_args is not None:
         assert deepep_ll_args is None

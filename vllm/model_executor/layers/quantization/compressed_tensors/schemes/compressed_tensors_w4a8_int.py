@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
-from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
 )
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
@@ -36,7 +36,7 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
         self,
         strategy: str,
         num_bits: int,
-        group_size: Optional[int] = None,
+        group_size: int | None = None,
         is_static_input_scheme: bool = False,
         input_symmetric: bool = True,
     ):
@@ -148,6 +148,6 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)

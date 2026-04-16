@@ -4,19 +4,12 @@ import pytest
 import torch
 
 
-def _cuda_sm90_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 9
-
-
 def test_sparse_flashmla_metadata_smoke():
-    import vllm.attention.ops.flashmla as fm
+    import vllm.v1.attention.ops.flashmla as fm
 
-    ok, reason = fm.is_flashmla_supported()
-    if not ok or not _cuda_sm90_available():
-        pytest.skip(reason or "SM90 not available")
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
 
     device = torch.device("cuda")
     batch_size = 1
@@ -41,16 +34,16 @@ def test_sparse_flashmla_metadata_smoke():
 
 
 def test_sparse_flashmla_decode_smoke():
-    import vllm.attention.ops.flashmla as fm
+    import vllm.v1.attention.ops.flashmla as fm
 
-    ok, reason = fm.is_flashmla_supported()
-    if not ok or not _cuda_sm90_available():
-        pytest.skip(reason or "SM90 not available")
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
 
     device = torch.device("cuda")
     batch_size = 1
     seqlen_q = 1
-    num_heads_q = 1
+    num_heads_q = 64
     head_dim_k = 576
     head_dim_v = 512
     num_heads_k = 1
@@ -104,11 +97,11 @@ def test_sparse_flashmla_decode_smoke():
 
 
 def test_sparse_flashmla_prefill_smoke():
-    import vllm.attention.ops.flashmla as fm
+    import vllm.v1.attention.ops.flashmla as fm
 
-    ok, reason = fm.is_flashmla_supported()
-    if not ok or not _cuda_sm90_available():
-        pytest.skip(reason or "SM90 not available")
+    ok, reason = fm.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
 
     device = torch.device("cuda")
     s_q = 1

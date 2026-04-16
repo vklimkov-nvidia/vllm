@@ -7,7 +7,7 @@
 #!/usr/bin/env python3
 import abc
 import math
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -32,8 +32,6 @@ from vllm.model_executor.models.phi4mm_utils import (
     get_offset,
     unfold_tensor,
 )
-
-_AUDIO_PLACEHOLDER_TOKEN_ID = 200011  # <|endoftext11|>
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -221,7 +219,7 @@ class ConformerEncoderLayer(nn.Module):
         pos_k: torch.Tensor,
         pos_v: torch.Tensor,
         mask: torch.Tensor,
-        relative_attention_bias: Optional[Tensor] = None,
+        relative_attention_bias: Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """ConformerEncoder forward.
 
@@ -329,8 +327,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
     def __init__(
         self,
         input_size: int,
-        chunk_size: Union[int, list[int]],
-        left_chunk: Union[int, list[int]],
+        chunk_size: int | list[int],
+        left_chunk: int | list[int],
         attention_dim: int = 256,
         attention_heads: int = 4,
         input_layer: str = "nemo_conv",
@@ -339,12 +337,12 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         time_reduction: int = 4,
         dropout_rate: float = 0.0,
         padding_idx: int = -1,
-        relative_attention_bias_args: Optional[dict[str, Any]] = None,
+        relative_attention_bias_args: dict[str, Any] | None = None,
         positional_dropout_rate: float = 0.0,
-        nemo_conv_settings: Optional[dict[str, Any]] = None,
+        nemo_conv_settings: dict[str, Any] | None = None,
         conv2d_extra_padding: Literal["feat", "feat_time", "none", True] = "none",
         attention_group_size: int = 1,
-        encoder_embedding_config: Optional[dict[str, Any]] = None,
+        encoder_embedding_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.input_size = input_size
@@ -411,8 +409,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         )
 
     def compute_lens_change(
-        self, feature_lens: Union[int, torch.Tensor]
-    ) -> Union[int, torch.Tensor]:
+        self, feature_lens: int | torch.Tensor
+    ) -> int | torch.Tensor:
         """feature_lens: int
         return updated feature lens.
 
@@ -452,8 +450,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
 
     def _chunk_size_selection(
         self,
-        chunk_size: Optional[Union[int, list[int]]] = None,
-        left_chunk: Optional[Union[int, list[int]]] = None,
+        chunk_size: int | list[int] | None = None,
+        left_chunk: int | list[int] | None = None,
     ) -> tuple[int, int]:
         """If chunk size is a list, we will randomly select a chunk size."""
 
@@ -503,7 +501,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
 
     def _position_embedding(
         self, input_tensor: torch.Tensor
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         pos_k = None
         pos_v = None
         if self.relative_attention_bias_layer is None:
@@ -516,8 +514,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         self,
         seq_len: int,
         batch_size: int,
-        chunk_size: Union[int, list[int]],
-        left_chunk: Union[int, list[int]],
+        chunk_size: int | list[int],
+        left_chunk: int | list[int],
     ) -> torch.Tensor:
         chunk_size_train_eff, left_chunk_train_eff = self._chunk_size_selection(
             chunk_size, left_chunk
@@ -540,25 +538,25 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         self,
         xs_pad: torch.Tensor,
         masks: torch.Tensor,
-        chunk_size_nc: Optional[Union[int, list[int]]] = None,
-        left_chunk_nc: Optional[Union[int, list[int]]] = None,
-    ) -> Union[
+        chunk_size_nc: int | list[int] | None = None,
+        left_chunk_nc: int | list[int] | None = None,
+    ) -> (
         tuple[
             torch.Tensor,
-            Optional[torch.Tensor],
-            Optional[torch.Tensor],
+            torch.Tensor | None,
+            torch.Tensor | None,
             torch.Tensor,
             torch.Tensor,
-        ],
-        tuple[
+        ]
+        | tuple[
             torch.Tensor,
-            Optional[torch.Tensor],
-            Optional[torch.Tensor],
+            torch.Tensor | None,
+            torch.Tensor | None,
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
-        ],
-    ]:
+        ]
+    ):
         """Forwarding the inputs through the top embedding layers
 
         Args:
@@ -587,10 +585,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         enc_streaming_mask = self._streaming_mask(
             seq_len, batch_size, self.chunk_size, self.left_chunk
         )
-
-        if xs_pad.is_cuda:
-            enc_streaming_mask = enc_streaming_mask.cuda()
-            xs_pad = xs_pad.cuda()
+        device = xs_pad.device
+        enc_streaming_mask = enc_streaming_mask.to(device)
+        xs_pad = xs_pad.to(device)
 
         input_tensor = xs_pad
         input_tensor, masks = self._forward_embeddings_core(input_tensor, masks)
@@ -607,8 +604,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             enc_streaming_mask_nc = self._streaming_mask(
                 seq_len, batch_size, chunk_size_nc, left_chunk_nc
             )
-            if xs_pad.is_cuda:
-                enc_streaming_mask_nc = enc_streaming_mask_nc.cuda()
+            if device.type != "cpu":
+                enc_streaming_mask_nc = enc_streaming_mask_nc.to(device)
             if masks is not None:
                 hs_mask_nc = masks & enc_streaming_mask_nc
             else:
@@ -692,19 +689,19 @@ class ConformerEncoder(TransformerEncoderBase):
             default False.
         ext_pw_out_channel: int, optional
             the number of channel for CNN
-            before depthwise_seperable_CNN.
+            before depthwise_separable_CNN.
             If 0 then use linear. default 0.
         ext_pw_kernel_size: int, optional
-            kernel size of N before depthwise_seperable_CNN.
+            kernel size of N before depthwise_separable_CNN.
             only work for ext_pw_out_channel > 0.
             default 1
         depthwise_seperable_out_channel: int, optional
             the number of channel for
-            depthwise_seperable_CNN.
+            depthwise_separable_CNN.
             default 256.
         depthwise_multiplier: int, optional
             the number of multiplier for
-            depthwise_seperable_CNN.
+            depthwise_separable_CNN.
             default 1.
         chunk_se: int, optional
             0 for offline SE.
@@ -714,7 +711,7 @@ class ConformerEncoder(TransformerEncoderBase):
              by only the current chunk.
             default 0.
         kernel_size: int, optional
-            the number of kernels for depthwise_seperable_CNN.
+            the number of kernels for depthwise_separable_CNN.
             default 3.
         activation: str, optional
             FeedForward block activation.
@@ -724,7 +721,7 @@ class ConformerEncoder(TransformerEncoderBase):
             activation function used in ConvModule part
             of the conformer, default "relu".
         conv_glu_type: str, optional
-            activation used use glu in depthwise_seperable_CNN,
+            activation used use glu in depthwise_separable_CNN,
             default "sigmoid"
         bias_in_glu: bool, optional
             if set to True, use additive bias in the weight module
@@ -803,9 +800,9 @@ class ConformerEncoder(TransformerEncoderBase):
     def __init__(  # pylint: disable-all
         self,
         input_size: int,
-        chunk_size: Union[int, list[int]],
-        left_chunk: Union[int, list[int]],
-        num_lang: Optional[int] = None,
+        chunk_size: int | list[int],
+        left_chunk: int | list[int],
+        num_lang: int | None = None,
         attention_dim: int = 256,
         attention_heads: int = 4,
         linear_units: int = 2048,
@@ -832,14 +829,14 @@ class ConformerEncoder(TransformerEncoderBase):
         extra_layer_output_idx: int = -1,
         extra_multi_layer_output_idxs: list[int] = [],  # noqa
         activation_checkpointing: str = "",
-        relative_attention_bias_args: Optional[dict[str, Any]] = None,
+        relative_attention_bias_args: dict[str, Any] | None = None,
         time_reduction: int = 4,
         use_pt_scaled_dot_product_attention: bool = False,
-        nemo_conv_settings: Optional[dict[str, Any]] = None,
+        nemo_conv_settings: dict[str, Any] | None = None,
         conv2d_extra_padding: Literal["feat", "feat_time", "none", True] = "none",
         replication_pad_for_subsample_embedding: bool = False,
         attention_group_size: int = 1,
-        encoder_embedding_config: Optional[dict[str, Any]] = None,
+        encoder_embedding_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             input_size,
@@ -908,12 +905,12 @@ class ConformerEncoder(TransformerEncoderBase):
 
     def init_relative_attention_bias(
         self, input_tensor: torch.Tensor
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if self.relative_attention_bias_layer:
             return self.relative_attention_bias_layer(input_tensor)
 
     def calculate_hs_mask(
-        self, xs_pad: torch.Tensor, device: torch.device, mask: Optional[torch.Tensor]
+        self, xs_pad: torch.Tensor, device: torch.device, mask: torch.Tensor | None
     ) -> torch.Tensor:
         max_audio_length = xs_pad.shape[1]
         batch_size = xs_pad.shape[0]
@@ -1066,9 +1063,9 @@ class WindowQformer(nn.Module):
     def forward(
         self,
         audio_embed: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        embed_len: Optional[int] = None,
-    ) -> tuple[torch.Tensor, Optional[int]]:
+        mask: torch.Tensor | None,
+        embed_len: int | None = None,
+    ) -> tuple[torch.Tensor, int | None]:
         """forward decoder"""
         # audio_embed: N x T x D => N x D x T
 
@@ -1224,7 +1221,7 @@ class AudioEmbedding(nn.Module):
     def get_audio_features(
         self,
         input_embeds: torch.Tensor,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_attention_mask: torch.Tensor | None = None,
         audio_projection_mode: str = "speech",
     ) -> torch.Tensor:
         """
@@ -1278,7 +1275,7 @@ class AudioEmbedding(nn.Module):
     def forward(
         self,
         audio_features: torch.Tensor,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_attention_mask: torch.Tensor | None = None,
         audio_projection_mode: str = "speech",
     ) -> torch.Tensor:
         """

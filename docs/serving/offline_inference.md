@@ -16,10 +16,10 @@ After initializing the `LLM` instance, use the available APIs to perform model i
 The available APIs depend on the model type:
 
 - [Generative models](../models/generative_models.md) output logprobs which are sampled from to obtain the final output text.
-- [Pooling models](../models/pooling_models.md) output their hidden states directly.
+- [Pooling models](../models/pooling_models/README.md) output their hidden states directly.
 
 !!! info
-    [API Reference][offline-inference-api]
+    [API Reference](../api/README.md#offline-inference)
 
 ## Ray Data LLM API
 

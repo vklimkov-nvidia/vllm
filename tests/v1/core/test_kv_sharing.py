@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.worker.utils import add_kv_sharing_layers_to_kv_cache_groups
 
+pytestmark = pytest.mark.cpu_test
+
 
 def new_kv_cache_spec():
-    return FullAttentionSpec(16, 1, 1, torch.float32, False)
+    return FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
 
 
 def test_initialize_kv_cache_for_kv_sharing_different_attn_groups():

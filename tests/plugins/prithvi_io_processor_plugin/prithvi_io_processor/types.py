@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Literal, Optional, TypedDict, Union
+from typing import Any, Literal, TypedDict
 
 import albumentations
 from pydantic import BaseModel
@@ -38,9 +38,6 @@ class ImagePrompt(BaseModel):
     """
 
 
-MultiModalPromptType = Union[ImagePrompt]
-
-
 class ImageRequestOutput(BaseModel):
     """
     The output data of an image request to vLLM.
@@ -54,4 +51,3 @@ class ImageRequestOutput(BaseModel):
     type: Literal["path", "b64_json"]
     format: str
     data: str
-    request_id: Optional[str] = None

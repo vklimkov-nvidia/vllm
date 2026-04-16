@@ -3,34 +3,69 @@
 
 import asyncio
 import os
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from concurrent.futures import Future
+from typing import Any
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.uniproc_executor import (
+    ExecutorWithExternalLauncher,
+    UniProcExecutor,
+)
 
 
 class Mock: ...
 
 
+def test_supports_async_scheduling_base_executor():
+    assert Executor.supports_async_scheduling() is False
+
+
+def test_supports_async_scheduling_uniproc_executor():
+    assert UniProcExecutor.supports_async_scheduling() is True
+
+
+def test_supports_async_scheduling_executor_with_external_launcher():
+    # ExecutorWithExternalLauncher inherits from UniProcExecutor and does not
+    # override supports_async_scheduling, so it should return True.
+    assert ExecutorWithExternalLauncher.supports_async_scheduling() is True
+
+
+def test_supports_async_scheduling_multiproc_executor():
+    assert MultiprocExecutor.supports_async_scheduling() is True
+
+
 class CustomMultiprocExecutor(MultiprocExecutor):
     def collective_rpc(
         self,
-        method: Union[str, Callable],
-        timeout: Optional[float] = None,
+        method: str | Callable,
+        timeout: float | None = None,
         args: tuple = (),
-        kwargs: Optional[dict] = None,
+        kwargs: dict | None = None,
         non_block: bool = False,
-        unique_reply_rank: Optional[int] = None,
-    ) -> list[Any]:
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: KVOutputAggregator = None,
+    ) -> Any | list[Any] | Future[Any | list[Any]]:
         # Drop marker to show that this was run
         with open(".marker", "w"):
             ...
-        return super().collective_rpc(method, timeout, args, kwargs)
+        return super().collective_rpc(
+            method,
+            timeout,
+            args,
+            kwargs,
+            non_block,
+            unique_reply_rank,
+            kv_output_aggregator,
+        )
 
 
 CustomMultiprocExecutorAsync = CustomMultiprocExecutor

@@ -3,7 +3,6 @@
 
 import inspect
 from collections.abc import Sequence
-from typing import Optional
 
 import numpy as np
 import pytest
@@ -11,7 +10,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.utils import is_pin_memory_available, make_tensor_with_pad
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -170,6 +170,7 @@ def _construct_expected_sampling_metadata(
             repetition_penalties, dtype=torch.float, device=device
         ),
         output_token_ids=output_token_ids,
+        spec_token_ids=[[] for _ in range(len(output_token_ids))],
         no_penalties=(
             all(x == 0 for x in presence_penalties)
             and all(x == 0 for x in frequency_penalties)
@@ -240,6 +241,7 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
         pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
+        kernel_block_sizes=[1],
     )
     reqs: list[CachedRequestState] = []
     req_id_reqs = {}
@@ -269,7 +271,7 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
         reqs, req_ids_retained, input_batch.req_id_to_index, device=torch.device(device)
     )
 
-    def same(t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]) -> bool:
+    def same(t1: torch.Tensor | None, t2: torch.Tensor | None) -> bool:
         return (t1 is None and t2 is None) or (
             t1 is not None and t2 is not None and torch.allclose(t1, t2)
         )
@@ -334,6 +336,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
+        kernel_block_sizes=[1],
     )
     ref_input_batch: InputBatch = InputBatch(
         max_num_reqs=batch_size,
@@ -343,6 +346,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
         pin_memory=is_pin_memory_available(),
         vocab_size=1024,
         block_sizes=[1],
+        kernel_block_sizes=[1],
     )
 
     reqs: list[CachedRequestState] = []
@@ -374,3 +378,110 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
     ref_input_batch.refresh_metadata()
 
     _compare_objs(input_batch, ref_input_batch)
+
+
+def _construct_pooling_request(req_id_suffix: int, pooling_params=None):
+    from vllm.pooling_params import PoolingParams
+
+    prompt_token_ids = [
+        np.random.randint(0, VOCAB_SIZE)
+        for _ in range(np.random.randint(10, MAX_PROMPT_SIZE))
+    ]
+    return CachedRequestState(
+        req_id=f"pool_req_{req_id_suffix}",
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=None,
+        pooling_params=pooling_params or PoolingParams(task="classify"),
+        mm_features=[],
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_pooling_prompt_lens_not_aliased(device: str):
+    """Verify that prompt_lens in PoolingMetadata does not share memory
+    with the internal num_prompt_tokens pinned buffer. Guards against possible
+    non-determinism in pooling metadata due to mutations to the internal buffer.
+    """
+    batch_size = 4
+    input_batch = InputBatch(
+        max_num_reqs=batch_size * 2,
+        max_model_len=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
+        max_num_batched_tokens=batch_size * (MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS),
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        is_pooling_model=True,
+    )
+
+    reqs = []
+    # Add requests
+    for i in range(batch_size):
+        req = _construct_pooling_request(i)
+        input_batch.add_request(req)
+        reqs.append(req)
+    input_batch.refresh_metadata()
+
+    # prompt_lens must be a snapshot
+    metadata = input_batch.get_pooling_metadata()
+    prompt_lens_snapshot = metadata.prompt_lens.clone()
+
+    # Mutate the internal buffer (simulates next batch adding new requests)
+    input_batch.num_prompt_tokens_cpu_tensor.fill_(999)
+
+    # prompt_lens must be unaffected by the mutation
+    assert torch.equal(metadata.prompt_lens, prompt_lens_snapshot), (
+        "prompt_lens shares memory with internal pinned buffer; "
+        "mutations to num_prompt_tokens_cpu_tensor corrupted prompt_lens. "
+        f"Expected {prompt_lens_snapshot}, got {metadata.prompt_lens}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pooling_params", "expect_device_prompt_token_ids", "expect_cpu_prompt_token_ids"),
+    [
+        ({"task": "classify"}, False, False),
+        ({"task": "classify", "requires_token_ids": True}, True, True),
+    ],
+)
+def test_pooling_metadata_token_id_buffers(
+    pooling_params: dict[str, object],
+    expect_device_prompt_token_ids: bool,
+    expect_cpu_prompt_token_ids: bool,
+):
+    from vllm.pooling_params import PoolingParams
+
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
+        max_num_batched_tokens=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        is_pooling_model=True,
+    )
+    req = _construct_pooling_request(0, PoolingParams(**pooling_params))
+    input_batch.add_request(req)
+    input_batch.refresh_metadata()
+
+    metadata = input_batch.get_pooling_metadata()
+    if expect_device_prompt_token_ids:
+        assert input_batch.sampling_metadata.prompt_token_ids is not None
+        assert metadata.prompt_token_ids is not None
+        assert metadata.get_prompt_token_ids()[0].tolist() == req.prompt_token_ids
+    else:
+        assert input_batch.sampling_metadata.prompt_token_ids is None
+        assert metadata.prompt_token_ids is None
+
+    if expect_cpu_prompt_token_ids:
+        assert metadata.prompt_token_ids_cpu is not None
+        assert metadata.get_prompt_token_ids_cpu()[0].tolist() == req.prompt_token_ids
+    else:
+        assert metadata.prompt_token_ids_cpu is None

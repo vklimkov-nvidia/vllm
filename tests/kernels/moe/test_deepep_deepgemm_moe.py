@@ -7,7 +7,7 @@ fp8 block-quantized case.
 """
 
 import dataclasses
-from typing import Optional
+from contextlib import contextmanager
 
 import pytest
 import torch.distributed
@@ -15,25 +15,32 @@ from torch.distributed import ProcessGroup
 from typing_extensions import ParamSpec
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEModularKernel
-from vllm.platforms import current_platform
-from vllm.utils import has_deep_ep, has_deep_gemm
-from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used, is_deep_gemm_supported
+from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.utils.deep_gemm import (
+    get_mk_alignment_for_contiguous_layout,
+    is_deep_gemm_e8m0_used,
+    is_deep_gemm_supported,
+)
+from vllm.utils.import_utils import has_deep_ep, has_deep_gemm
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...utils import multi_gpu_test
 from .parallel_utils import ProcessGroupInfo, parallel_launch
-from .utils import make_test_weights
+from .utils import make_dummy_moe_config, make_test_weights
 
 if has_deep_ep():
-    from vllm.model_executor.layers.fused_moe.deepep_ht_prepare_finalize import (
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
         DeepEPHTPrepareAndFinalize,
     )
-    from vllm.model_executor.layers.fused_moe.deepep_ll_prepare_finalize import (
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
         DeepEPLLPrepareAndFinalize,
     )
 
@@ -56,6 +63,23 @@ requires_deep_gemm = pytest.mark.skipif(
 )
 
 P = ParamSpec("P")
+
+
+@contextmanager
+def with_dp_metadata(M: int, world_size: int):
+    num_tokens_across_dp = torch.tensor([M] * world_size, device="cpu", dtype=torch.int)
+
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.data_parallel_size = world_size
+    vllm_config.parallel_config.enable_expert_parallel = True
+
+    with set_forward_context(
+        None,
+        vllm_config,
+        num_tokens=M,
+        num_tokens_across_dp=num_tokens_across_dp,
+    ):
+        yield
 
 
 def next_power_of_2(x):
@@ -92,13 +116,13 @@ class TestConfig:
     block_size: list[int]
     # configs for testing low-latency kernels
     low_latency: bool
-    use_fp8_dispatch: Optional[bool] = False
+    use_fp8_dispatch: bool | None = False
 
 
 @dataclasses.dataclass
 class TestTensors:
     rank_tokens: torch.Tensor  # all ranks make this many tokens
-    rank_token_scales: Optional[torch.Tensor]
+    rank_token_scales: torch.Tensor | None
     topk: torch.Tensor
     topk_weights: torch.Tensor
     config: TestConfig
@@ -110,10 +134,8 @@ class TestTensors:
 
         fp8_info = torch.finfo(torch.float8_e4m3fn)
         fp8_max, fp8_min = fp8_info.max, fp8_info.min
-
-        rank_tokens = (
-            torch.randn((m, k), device=torch.cuda.current_device(), dtype=dtype) / 10.0
-        )
+        device = torch.accelerator.current_device_index()
+        rank_tokens = torch.randn((m, k), device=device, dtype=dtype) / 10.0
         rank_tokens = rank_tokens.clamp(min=fp8_min, max=fp8_max)
         rank_token_scales = None
 
@@ -121,11 +143,13 @@ class TestTensors:
             low=0,
             high=config.num_experts,
             size=(m, topk),
-            device=torch.cuda.current_device(),
+            device=device,
         ).to(dtype=torch.int64)
 
         topk_weights = torch.randn(
-            topk_ids.shape, dtype=torch.float32, device=torch.cuda.current_device()
+            topk_ids.shape,
+            dtype=torch.float32,
+            device=device,
         )
 
         return TestTensors(
@@ -143,10 +167,10 @@ def make_ll_modular_kernel(
     max_tokens_per_rank: int,
     dp_size: int,
     hidden_size: int,
-    q_dtype: Optional[torch.dtype],
+    q_dtype: torch.dtype | None,
     test_config: TestConfig,
     quant_config: FusedMoEQuantConfig,
-) -> FusedMoEModularKernel:
+) -> FusedMoEKernel:
     assert test_config.low_latency
     assert test_config.use_fp8_dispatch is not None
 
@@ -169,9 +193,13 @@ def make_ll_modular_kernel(
         max_num_tokens=max_tokens_per_rank,
         num_dispatchers=pgi.world_size // dp_size,
         quant_config=quant_config,
+        moe_config=make_dummy_moe_config(),
     )
-    mk = FusedMoEModularKernel(prepare_finalize=a2a, fused_experts=fused_experts)
-    return mk
+    return FusedMoEKernel(
+        prepare_finalize=a2a,
+        fused_experts=fused_experts,
+        inplace=False,
+    )
 
 
 def make_ht_modular_kernel(
@@ -179,10 +207,10 @@ def make_ht_modular_kernel(
     pgi: ProcessGroupInfo,
     dp_size: int,
     num_local_experts: int,
-    q_dtype: Optional[torch.dtype],
+    q_dtype: torch.dtype | None,
     test_config: TestConfig,
     quant_config: FusedMoEQuantConfig,
-) -> FusedMoEModularKernel:
+) -> FusedMoEKernel:
     assert not test_config.low_latency
     assert test_config.use_fp8_dispatch is None
 
@@ -196,9 +224,15 @@ def make_ht_modular_kernel(
         block_shape=test_config.block_size,
     )
 
-    fused_experts = DeepGemmExperts(quant_config)
-    mk = FusedMoEModularKernel(prepare_finalize=a2a, fused_experts=fused_experts)
-    return mk
+    fused_experts = DeepGemmExperts(
+        moe_config=make_dummy_moe_config(),
+        quant_config=quant_config,
+    )
+    return FusedMoEKernel(
+        prepare_finalize=a2a,
+        fused_experts=fused_experts,
+        inplace=False,
+    )
 
 
 def make_modular_kernel(
@@ -208,11 +242,11 @@ def make_modular_kernel(
     num_local_experts: int,
     test_tensors: TestTensors,
     quant_config: FusedMoEQuantConfig,
-) -> FusedMoEModularKernel:
+) -> FusedMoEKernel:
     q_dtype = torch.float8_e4m3fn
     test_config = test_tensors.config
 
-    mk: FusedMoEModularKernel
+    mk: FusedMoEKernel
     # Make modular kernel
     if test_config.low_latency:
         max_tokens_per_rank = max(64, next_power_of_2(test_tensors.rank_tokens.size(0)))
@@ -249,8 +283,8 @@ def deepep_deepgemm_moe_impl(
     test_tensors: TestTensors,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
 ) -> torch.Tensor:
     test_config = test_tensors.config
     num_experts = test_config.num_experts
@@ -262,7 +296,8 @@ def deepep_deepgemm_moe_impl(
         s = pgi.rank * num_local_experts
         e = s + num_local_experts
         expert_map[s:e] = torch.tensor(list(range(num_local_experts)))
-        return expert_map.to(device=torch.cuda.current_device(), dtype=torch.int32)
+        device = torch.accelerator.current_device_index()
+        return expert_map.to(device=device, dtype=torch.int32)
 
     quant_config = fp8_w8a8_moe_quant_config(
         w1_scale=w1_scale,
@@ -273,7 +308,7 @@ def deepep_deepgemm_moe_impl(
     )
 
     # Make modular kernel
-    mk: FusedMoEModularKernel = make_modular_kernel(
+    mk: FusedMoEKernel = make_modular_kernel(
         pg=pg,
         pgi=pgi,
         dp_size=dp_size,
@@ -282,18 +317,20 @@ def deepep_deepgemm_moe_impl(
         quant_config=quant_config,
     )
 
-    out = mk.forward(
-        hidden_states=test_tensors.rank_tokens,
-        w1=w1,
-        w2=w2,
-        topk_weights=test_tensors.topk_weights,
-        topk_ids=test_tensors.topk,
-        inplace=False,
-        activation="silu",
-        global_num_experts=num_experts,
-        expert_map=build_expert_map(),
-        apply_router_weight_on_input=False,
-    )
+    with with_dp_metadata(
+        M=test_tensors.rank_tokens.size(0), world_size=pgi.world_size
+    ):
+        out = mk.apply(
+            hidden_states=test_tensors.rank_tokens,
+            w1=w1,
+            w2=w2,
+            topk_weights=test_tensors.topk_weights,
+            topk_ids=test_tensors.topk,
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+            expert_map=build_expert_map(),
+            apply_router_weight_on_input=False,
+        )
     return out
 
 
@@ -323,9 +360,6 @@ def triton_impl(
         topk_ids=topk_ids,
         inplace=False,
         quant_config=quant_config,
-        # Make sure this is set to False so we
-        # don't end up comparing the same implementation.
-        allow_deep_gemm=False,
     )
 
 
@@ -338,12 +372,16 @@ def _test_deepep_deepgemm_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
 ):
-    current_platform.seed_everything(pgi.rank)
+    device = torch.device(f"cuda:{pgi.local_rank}")
+    init_workspace_manager(device)
 
-    w1 = w1.to(device=torch.cuda.current_device())
-    w2 = w2.to(device=torch.cuda.current_device())
-    w1_scale = w1_scale.to(device=torch.cuda.current_device())
-    w2_scale = w2_scale.to(device=torch.cuda.current_device())
+    set_random_seed(pgi.rank)
+
+    device = torch.accelerator.current_device_index()
+    w1 = w1.to(device=device)
+    w2 = w2.to(device=device)
+    w1_scale = w1_scale.to(device=device)
+    w2_scale = w2_scale.to(device=device)
 
     pg = torch.distributed.new_group(list(range(pgi.world_size)))
     test_tensors = TestTensors.make(config, pgi.rank)
@@ -394,7 +432,6 @@ def _test_deepep_deepgemm_moe(
 MNKs = [
     (8, 128, 128),
     (8, 128, 512),
-    (8, 512, 512),
     (3, 1024, 2048),
     (32, 128, 1024),
     (45, 512, 2048),
@@ -415,27 +452,25 @@ NUM_EXPERTS = [32]
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 @requires_deep_gemm
-@pytest.mark.skipif(
-    is_deep_gemm_e8m0_used(), reason="Skipping test for Blackwell DeepGEMM"
-)
 def test_ht_deepep_deepgemm_moe(
     mnk: tuple[int, int, int],
     num_experts: int,
     topk: int,
     world_dp_size: tuple[int, int],
+    disable_deepgemm_ue8m0,
+    workspace_init,
 ):
     """
     Tests for High-Throughput DeepEP + DeepGemm integration.
     """
-    import deep_gemm
 
     m, n, k = mnk
-    current_platform.seed_everything(7)
+    set_random_seed(7)
 
     if topk > num_experts:
         pytest.skip(f"Skipping test: topk={topk} > E={num_experts}")
 
-    block_m = deep_gemm.get_m_alignment_for_contiguous_layout()
+    block_m = get_mk_alignment_for_contiguous_layout()[0]
     block_size = [block_m, block_m]
 
     world_size, dp_size = world_dp_size
@@ -489,9 +524,6 @@ USE_FP8_DISPATCH = [False]
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 @requires_deep_gemm
-@pytest.mark.skipif(
-    is_deep_gemm_e8m0_used(), reason="Skipping test for Blackwell DeepGEMM"
-)
 def test_ll_deepep_deepgemm_moe(
     mnk: tuple[int, int, int],
     num_experts: int,
@@ -499,13 +531,16 @@ def test_ll_deepep_deepgemm_moe(
     use_fp8_dispatch: bool,
     block_size: list[int],
     world_dp_size: tuple[int, int],
+    disable_deepgemm_ue8m0,
+    workspace_init,
 ):
     """
     Tests for Low-Latency DeepEP + DeepGemm integration.
     """
+    assert not is_deep_gemm_e8m0_used()
 
     m, n, k = mnk
-    current_platform.seed_everything(7)
+    set_random_seed(7)
 
     if topk > num_experts:
         pytest.skip(f"Skipping test: topk={topk} > E={num_experts}")

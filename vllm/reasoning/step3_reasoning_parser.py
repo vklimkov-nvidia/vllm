@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Sequence
-from typing import Optional, Union
+from collections.abc import Iterable, Sequence
+from itertools import islice
+from typing import TYPE_CHECKING
 
 import regex as re
 from transformers import PreTrainedTokenizerBase
 
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, DeltaMessage
+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.logger import init_logger
-from vllm.reasoning import ReasoningParser, ReasoningParserManager
+from vllm.reasoning import ReasoningParser
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 logger = init_logger(__name__)
 
 
-@ReasoningParserManager.register_module("step3")
 class Step3ReasoningParser(ReasoningParser):
     """
     Reasoning parser for Step3 model.
@@ -35,14 +39,15 @@ class Step3ReasoningParser(ReasoningParser):
                 "constructor during construction."
             )
 
-        self.think_end_token_id = self.vocab.get(self.think_end_token)
-        if self.think_end_token_id is None:
+        think_end_token_id = self.vocab.get(self.think_end_token)
+        if think_end_token_id is None:
             raise RuntimeError(
                 "Step3 reasoning parser could not locate think end "
                 "token in the tokenizer!"
             )
+        self.think_end_token_id: int = think_end_token_id
 
-    def extract_reasoning_content_streaming(
+    def extract_reasoning_streaming(
         self,
         previous_text: str,
         current_text: str,
@@ -50,13 +55,13 @@ class Step3ReasoningParser(ReasoningParser):
         previous_token_ids: Sequence[int],
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
-    ) -> Union[DeltaMessage, None]:
+    ) -> DeltaMessage | None:
         """
         Extract reasoning content from a delta message.
         Handles streaming output where previous + delta = current.
         Uses token IDs for faster processing.
         For text "abc</think>xyz":
-        - 'abc' goes to reasoning_content
+        - 'abc' goes to reasoning
         - 'xyz' goes to content
         """
         # Skip single special token
@@ -66,10 +71,10 @@ class Step3ReasoningParser(ReasoningParser):
         if self.think_end_token_id in delta_token_ids:
             # </think> in delta, extract reasoning content and remaining content
             end_index = delta_text.find(self.think_end_token)
-            reasoning_content = delta_text[:end_index]
+            reasoning = delta_text[:end_index]
             content = delta_text[end_index + len(self.think_end_token) :]
             return DeltaMessage(
-                reasoning_content=reasoning_content,
+                reasoning=reasoning,
                 content=content if content else None,
             )
         elif self.think_end_token_id in previous_token_ids:
@@ -77,11 +82,11 @@ class Step3ReasoningParser(ReasoningParser):
             return DeltaMessage(content=delta_text)
         else:
             # No </think> seen yet, everything is reasoning
-            return DeltaMessage(reasoning_content=delta_text)
+            return DeltaMessage(reasoning=delta_text)
 
-    def extract_reasoning_content(
-        self, model_output: str, request: ChatCompletionRequest
-    ) -> tuple[Optional[str], Optional[str]]:
+    def extract_reasoning(
+        self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> tuple[str | None, str | None]:
         # Check if the model output contains the </think> token
         if self.think_end_token not in model_output:
             # If no </think> token, everything is reasoning content
@@ -89,21 +94,26 @@ class Step3ReasoningParser(ReasoningParser):
         else:
             # Find the first occurrence of </think>
             end_index = model_output.find(self.think_end_token)
-            reasoning_content = model_output[:end_index]
+            reasoning = model_output[:end_index]
 
             # Content after </think> token
-            content = model_output[end_index + len(self.think_end_token) :]
+            content = model_output[end_index + len(self.think_end_token) :] or None
 
-            if len(content) == 0:
-                content = None
+            return reasoning, content
 
-            return reasoning_content, content
-
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self.think_end_token_id in input_ids
 
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        end_token_id = self.think_end_token_id
+        return end_token_id in delta_ids
+
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if self.think_end_token_id not in input_ids[:-1]:
+        if self.think_end_token_id not in islice(
+            input_ids, 0, max(0, len(input_ids) - 1)
+        ):
             return []
         else:
             return input_ids[input_ids.index(self.think_end_token_id) + 1 :]

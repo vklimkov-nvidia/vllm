@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional
 
 import pytest
 import torch
 
 from vllm._custom_ops import merge_attn_states as merge_attn_states_cuda
-from vllm.attention.ops.triton_merge_attn_states import (
+from vllm.platforms import current_platform
+from vllm.v1.attention.ops.triton_merge_attn_states import (
     merge_attn_states as merge_attn_states_triton,
 )
-from vllm.platforms import current_platform
 
 
 # Naive PyTorch Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
@@ -20,7 +19,7 @@ def merge_attn_states_torch(
     prefix_lse: torch.Tensor,  # [NUM_HEADS, NUM_TOKENS]
     suffix_output: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
     suffix_lse: torch.Tensor,  # [NUM_HEADS, NUM_TOKENS]
-    output_lse: Optional[torch.Tensor] = None,  # [NUM_HEADS, NUM_TOKENS]
+    output_lse: torch.Tensor | None = None,  # [NUM_HEADS, NUM_TOKENS]
 ):
     p_lse = prefix_lse
     s_lse = suffix_lse
@@ -151,8 +150,8 @@ def test_merge_attn_states(
     output_torch = output.clone()
     output_lse_torch = output_lse.clone()
     total_time_torch_kernel = 0
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = torch.Event(enable_timing=True)
+    end = torch.Event(enable_timing=True)
 
     # 0. Run the Torch kernel
     prefix_lse_torch = prefix_lse.clone()
@@ -166,7 +165,7 @@ def test_merge_attn_states(
             suffix_lse_torch,
             output_lse_torch,
         )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for _ in range(repeat_times):
         start.record()
@@ -179,7 +178,7 @@ def test_merge_attn_states(
             output_lse_torch,
         )
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         total_time_torch_kernel += start.elapsed_time(end)
 
     avg_time_torch_kernel = total_time_torch_kernel / repeat_times
@@ -189,8 +188,8 @@ def test_merge_attn_states(
     output_lse_ref_triton = output_lse.clone()
 
     total_time_triton_kernel = 0
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = torch.Event(enable_timing=True)
+    end = torch.Event(enable_timing=True)
 
     for _ in range(warmup_times):
         merge_attn_states_triton(
@@ -201,7 +200,7 @@ def test_merge_attn_states(
             suffix_lse,
             output_lse_ref_triton,
         )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for _ in range(repeat_times):
         start.record()
@@ -214,7 +213,7 @@ def test_merge_attn_states(
             output_lse_ref_triton,
         )
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         total_time_triton_kernel += start.elapsed_time(end)
 
     avg_time_triton_kernel = total_time_triton_kernel / repeat_times
@@ -233,7 +232,7 @@ def test_merge_attn_states(
             suffix_lse,
             output_lse_cuda,
         )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for _ in range(repeat_times):
         start.record()
@@ -246,7 +245,7 @@ def test_merge_attn_states(
             output_lse_cuda,
         )
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         total_time_cuda_kernel += start.elapsed_time(end)
 
     avg_time_cuda_kernel = total_time_cuda_kernel / repeat_times

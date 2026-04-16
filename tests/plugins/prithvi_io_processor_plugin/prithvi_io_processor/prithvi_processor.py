@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
-
-import base64
 import datetime
 import os
 import tempfile
 import urllib.request
 from collections.abc import Sequence
-from typing import Any, Union
+from typing import Any
 
 import albumentations
 import numpy as np
+import pybase64 as base64
 import rasterio
 import regex as re
 import torch
@@ -20,15 +18,11 @@ from einops import rearrange
 from terratorch.datamodules import Sen1Floods11NonGeoDataModule
 
 from vllm.config import VllmConfig
-from vllm.entrypoints.openai.protocol import IOProcessorRequest, IOProcessorResponse
-from vllm.inputs.data import PromptType
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
-from vllm.plugins.io_processors.interface import (
-    IOProcessor,
-    IOProcessorInput,
-    IOProcessorOutput,
-)
+from vllm.plugins.io_processors.interface import IOProcessor
+from vllm.renderers import BaseRenderer
 
 from .types import DataModuleConfig, ImagePrompt, ImageRequestOutput
 
@@ -51,12 +45,8 @@ datamodule_config: DataModuleConfig = {
     "no_label_replace": -1,
     "num_workers": 8,
     "test_transform": [
-        albumentations.Resize(
-            always_apply=False, height=448, interpolation=1, p=1, width=448
-        ),
-        albumentations.pytorch.ToTensorV2(
-            transpose_mask=False, always_apply=True, p=1.0
-        ),
+        albumentations.Resize(height=448, interpolation=1, p=1, width=448),
+        albumentations.pytorch.ToTensorV2(transpose_mask=False, p=1.0),
     ],
 }
 
@@ -160,11 +150,11 @@ def read_geotiff(
 
 
 def load_image(
-    data: Union[list[str]],
+    data: list[str],
     path_type: str,
     mean: list[float] | None = None,
     std: list[float] | None = None,
-    indices: Union[list[int], None] | None = None,
+    indices: list[int] | None | None = None,
 ):
     """Build an input example by loading images in *file_paths*.
 
@@ -226,11 +216,11 @@ def load_image(
     return imgs, temporal_coords, location_coords, metas
 
 
-class PrithviMultimodalDataProcessor(IOProcessor):
+class PrithviMultimodalDataProcessor(IOProcessor[ImagePrompt, ImageRequestOutput]):
     indices = [0, 1, 2, 3, 4, 5]
 
-    def __init__(self, vllm_config: VllmConfig):
-        super().__init__(vllm_config)
+    def __init__(self, vllm_config: VllmConfig, renderer: BaseRenderer):
+        super().__init__(vllm_config, renderer)
 
         self.datamodule = Sen1Floods11NonGeoDataModule(
             data_root=datamodule_config["data_root"],
@@ -250,37 +240,18 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         self.requests_cache: dict[str, dict[str, Any]] = {}
         self.indices = DEFAULT_INPUT_INDICES
 
-    def parse_request(self, request: Any) -> IOProcessorInput:
-        if type(request) is dict:
-            image_prompt = ImagePrompt(**request)
-            return image_prompt
-        if isinstance(request, IOProcessorRequest):
-            if not hasattr(request, "data"):
-                raise ValueError("missing 'data' field in OpenAIBaseModel Request")
+    def parse_data(self, data: object) -> ImagePrompt:
+        if isinstance(data, dict):
+            return ImagePrompt(**data)
 
-            request_data = request.data
-
-            if type(request_data) is dict:
-                return ImagePrompt(**request_data)
-            else:
-                raise ValueError("Unable to parse the request data")
-
-        raise ValueError("Unable to parse request")
-
-    def output_to_response(
-        self, plugin_output: IOProcessorOutput
-    ) -> IOProcessorResponse:
-        return IOProcessorResponse(
-            request_id=plugin_output.request_id,
-            data=plugin_output,
-        )
+        raise ValueError("Prompt data should be an `ImagePrompt`")
 
     def pre_process(
         self,
-        prompt: IOProcessorInput,
+        prompt: ImagePrompt,
         request_id: str | None = None,
         **kwargs,
-    ) -> Union[PromptType, Sequence[PromptType]]:
+    ) -> PromptType | Sequence[PromptType]:
         image_data = dict(prompt)
 
         if request_id:
@@ -348,8 +319,10 @@ class PrithviMultimodalDataProcessor(IOProcessor):
                 {
                     "prompt_token_ids": [1],
                     "multi_modal_data": {
-                        "pixel_values": window.to(torch.float16)[0],
-                        "location_coords": location_coords.to(torch.float16),
+                        "image": {
+                            "pixel_values": window.to(torch.float16)[0],
+                            "location_coords": location_coords.to(torch.float16),
+                        }
                     },
                 }
             )
@@ -361,7 +334,7 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         model_output: Sequence[PoolingRequestOutput],
         request_id: str | None = None,
         **kwargs,
-    ) -> IOProcessorOutput:
+    ) -> ImageRequestOutput:
         pred_imgs_list = []
 
         if request_id and (request_id in self.requests_cache):
@@ -370,9 +343,9 @@ class PrithviMultimodalDataProcessor(IOProcessor):
             out_format = "b64_json"
 
         for output in model_output:
-            y_hat = output.outputs.data.argmax(dim=1)
+            y_hat = output.outputs.data.argmax(dim=0)
             pred = torch.nn.functional.interpolate(
-                y_hat.unsqueeze(1).float(),
+                y_hat[None, None, ...].float(),
                 size=self.img_size,
                 mode="nearest",
             )
@@ -406,5 +379,7 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         )
 
         return ImageRequestOutput(
-            type=out_format, format="tiff", data=out_data, request_id=request_id
+            type=out_format,
+            format="tiff",
+            data=out_data,
         )

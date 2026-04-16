@@ -2,36 +2,53 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import ClassVar, Optional, Union
+from typing import ClassVar
 
 import torch
 
 import vllm._custom_ops as ops
-from vllm.attention.backends.abstract import (
-    AttentionLayer,
-    AttentionType,
-    is_quantized_kv_cache,
-)
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.common import (
+from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionLayer,
+    AttentionType,
+    MultipleOf,
+    is_quantized_kv_cache,
+)
 
 logger = init_logger(__name__)
 
 
 class CutlassMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     # enable full CUDA Graph support for decode-only capture
-    cudagraph_support: ClassVar[AttentionCGSupport] = (
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
 
 
 class CutlassMLABackend(MLACommonBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [128]
+
     @staticmethod
     def get_name() -> str:
         return "CUTLASS_MLA"
@@ -44,6 +61,10 @@ class CutlassMLABackend(MLACommonBackend):
     def get_builder_cls() -> type["CutlassMLAMetadataBuilder"]:
         return CutlassMLAMetadataBuilder
 
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major == 10
+
 
 class SM100Workspace:
     def __init__(self, initial_workspace_size):
@@ -55,8 +76,7 @@ class SM100Workspace:
 
         # Pre-compute sm_count to avoid recomputing it. Use device 0 as a proxy
         # (assumes all devices are similar)
-        properties = torch.cuda.get_device_properties(torch.device("cuda:0"))
-        self._sm_count = properties.multi_processor_count
+        self._sm_count = num_compute_units(0)
 
     def get_buf(self):
         return self._workspace_buf
@@ -90,12 +110,12 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]],
-        sliding_window: Optional[int],
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
         kv_cache_dtype: str,
-        logits_soft_cap: Optional[float],
+        logits_soft_cap: float | None,
         attn_type: str,
-        kv_sharing_target_layer_name: Optional[str],
+        kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
         **mla_args,
     ) -> None:
@@ -134,13 +154,18 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         #       FORCE_NUM_KV_SPLITS=1
         force_num_kv_splits = os.environ.get("FORCE_NUM_KV_SPLITS", None)
         if force_num_kv_splits:
-            logger.warning_once("Forcing num_kv_splits to %d", int(force_num_kv_splits))
+            logger.debug_once("Forcing num_kv_splits to %d", int(force_num_kv_splits))
             self._num_kv_splits = int(force_num_kv_splits)
         else:
             self._num_kv_splits = -1  # => Auto-detect
 
         # Share workspace buffer across all executions
         self._workspace = g_sm100_workspace
+
+        # Pre-allocated output buffer, lazily sized on first call.
+        # Zero-init once to prevent NaN in padding slots (seq_lens=0)
+        # from contaminating downstream per-tensor reductions.
+        self._decode_out: torch.Tensor | None = None
 
     def _sm100_cutlass_mla_decode(
         self,
@@ -198,7 +223,15 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else q_nope.dtype
         )
-        out = q_nope.new_empty((B_q, MAX_HEADS, D_latent), dtype=dtype)
+        # Reuse pre-allocated zero-init output buffer to avoid a memset
+        # kernel on every CUDA graph replay.
+        if (
+            self._decode_out is None
+            or self._decode_out.shape[0] < B_q
+            or self._decode_out.dtype != dtype
+        ):
+            self._decode_out = q_nope.new_zeros((B_q, MAX_HEADS, D_latent), dtype=dtype)
+        out = self._decode_out[:B_q]
         lse = (
             torch.empty((B_q, MAX_HEADS), dtype=torch.float32, device=q_nope.device)
             if self.need_to_return_lse_for_decode
@@ -225,15 +258,20 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         return out, lse
 
-    def _forward_decode(
+    def forward_mqa(
         self,
-        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         layer: AttentionLayer,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+
+        if layer._q_scale_float != 1.0 or layer._k_scale_float != 1.0:
+            raise NotImplementedError(
+                "CutlassMLAImpl does not support scaling for q and kv_latent yet"
+            )
 
         if type(q) is tuple:
             q_nope, q_pe = q
