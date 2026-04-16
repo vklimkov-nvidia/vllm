@@ -9,6 +9,14 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.turns.user_turn_processor import UserTurnProcessor
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+
+from audio_only_turn_stop import AudioOnlyTurnStopStrategy
+
 from llm import GemmaAudioLLMProcessor, get_engine
 from tts import Qwen3TTSService
 
@@ -26,20 +34,40 @@ async def run_bot(webrtc_connection):
         ),
     )
 
+    # 1. Lower Silero's stop_secs drastically. 
+    # It now only acts as a fast trigger for the Smart Turn model.
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(
-                stop_secs=0.5,
+                stop_secs=0.2, # Changed from 0.5 to 0.2
                 min_volume=0.4,
             ),
         ),
     )
+
+    # 2. Initialize the pure-audio Smart Turn Analyzer
+    turn_analyzer = LocalSmartTurnAnalyzerV3(
+        params=SmartTurnParams(
+            stop_secs=2.0 # Safety fallback: Max silence before forcing a turn
+        )
+    )
+
+    # 3. Create the Turn Processor to coordinate Start/Stop states
+    turn_processor = UserTurnProcessor(
+        user_turn_strategies=UserTurnStrategies(
+            start=[VADUserTurnStartStrategy()],
+            stop=[AudioOnlyTurnStopStrategy(turn_analyzer=turn_analyzer)]
+        )
+    )
+
+
     gemma = GemmaAudioLLMProcessor(engine)
     tts = Qwen3TTSService()
 
     pipeline = Pipeline([
         transport.input(),
         vad,
+        turn_processor,
         gemma,
         tts,
         transport.output(),

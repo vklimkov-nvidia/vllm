@@ -13,6 +13,8 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
+    UserStartedSpeakingFrame, 
+    UserStoppedSpeakingFrame
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -80,7 +82,7 @@ class GemmaAudioLLMProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
+        if isinstance(frame, UserStartedSpeakingFrame):
             self._audio_buffer.clear()
             self._is_speaking = True
 
@@ -89,7 +91,7 @@ class GemmaAudioLLMProcessor(FrameProcessor):
                 self._sample_rate = frame.sample_rate
                 self._audio_buffer.extend(frame.audio)
 
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+        elif isinstance(frame, UserStoppedSpeakingFrame):
             self._is_speaking = False
             if self._audio_buffer:
                 await self._run_inference()
