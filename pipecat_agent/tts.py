@@ -43,9 +43,23 @@ class Qwen3TTSService(TTSService):
             settings=TTSSettings(model="qwen3-tts", voice="default", language=None),
             **kwargs,
         )
+        self._active_client: grpcclient.InferenceServerClient | None = None
+        self._interrupted = False
+
+    async def on_audio_context_interrupted(self, context_id: str):
+        """Stop the Triton stream when the user interrupts."""
+        logger.info(f"Qwen3TTS: interrupted (context={context_id})")
+        self._interrupted = True
+        if self._active_client:
+            try:
+                self._active_client.stop_stream()
+            except Exception:
+                pass
+            self._active_client = None
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         logger.info(f"Qwen3TTS: synthesizing [{text}]")
+        self._interrupted = False
 
         yield TTSStartedFrame(context_id=context_id)
 
@@ -67,6 +81,7 @@ class Qwen3TTSService(TTSService):
                 loop.call_soon_threadsafe(q.put_nowait, _SENTINEL)
 
         client = grpcclient.InferenceServerClient(url=TRITON_URL)
+        self._active_client = client
         client.start_stream(callback=_on_response)
 
         inputs, req_outputs = _make_inputs(text)
@@ -77,7 +92,7 @@ class Qwen3TTSService(TTSService):
         )
 
         try:
-            while True:
+            while not self._interrupted:
                 item = await asyncio.wait_for(q.get(), timeout=60)
 
                 if item is _SENTINEL:
@@ -97,6 +112,11 @@ class Qwen3TTSService(TTSService):
         except asyncio.TimeoutError:
             logger.warning("Qwen3TTS: timed out waiting for audio chunk")
         finally:
-            client.stop_stream()
+            if self._active_client is client:
+                self._active_client = None
+            try:
+                client.stop_stream()
+            except Exception:
+                pass
 
         yield TTSStoppedFrame(context_id=context_id)

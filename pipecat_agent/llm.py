@@ -5,14 +5,11 @@ import numpy as np
 from loguru import logger
 
 from pipecat.frames.frames import (
-    AudioRawFrame,
     Frame,
     InputAudioRawFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
-    VADUserStartedSpeakingFrame,
-    VADUserStoppedSpeakingFrame,
     UserStartedSpeakingFrame, 
     UserStoppedSpeakingFrame
 )
@@ -35,8 +32,7 @@ MODEL_PATH = "/home/vklimkov/workspace/vllm/models/gemma-4-E2B-it"
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant. "
     "Respond concisely and naturally in plain text. "
-    "Do not use markdown, bullet points, or special formatting. "
-    "Keep answers short — one or two sentences."
+    "Do not use markdown, bullet points, or special formatting."
 )
 
 # Matches the output of apply_chat_template(enable_thinking=False)
@@ -78,6 +74,7 @@ class GemmaAudioLLMProcessor(FrameProcessor):
         self._audio_buffer = bytearray()
         self._sample_rate = 16000
         self._is_speaking = False
+        self._current_request_id: str | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -85,6 +82,7 @@ class GemmaAudioLLMProcessor(FrameProcessor):
         if isinstance(frame, UserStartedSpeakingFrame):
             self._audio_buffer.clear()
             self._is_speaking = True
+            await self._abort_current_request()
 
         elif isinstance(frame, InputAudioRawFrame):
             if self._is_speaking:
@@ -99,6 +97,13 @@ class GemmaAudioLLMProcessor(FrameProcessor):
         else:
             await self.push_frame(frame, direction)
 
+    async def _abort_current_request(self):
+        if self._current_request_id:
+            rid = self._current_request_id
+            self._current_request_id = None
+            logger.info(f"Gemma: aborting request {rid}")
+            await self._engine.abort(rid)
+
     async def _run_inference(self):
         audio_np = (
             np.frombuffer(self._audio_buffer, dtype=np.int16).astype(np.float32)
@@ -107,6 +112,7 @@ class GemmaAudioLLMProcessor(FrameProcessor):
         self._audio_buffer.clear()
 
         request_id = str(uuid.uuid4())
+        self._current_request_id = request_id
         logger.info(
             f"Gemma: {len(audio_np)} samples @ {self._sample_rate} Hz, rid={request_id}"
         )
@@ -114,18 +120,25 @@ class GemmaAudioLLMProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseStartFrame())
 
         prev_text = ""
-        async for output in self._engine.generate(
-            {
-                "prompt": GEMMA_PROMPT,
-                "multi_modal_data": {"audio": [(audio_np, self._sample_rate)]},
-            },
-            sampling_params=self._sampling_params,
-            request_id=request_id,
-        ):
-            new_text = output.outputs[0].text
-            delta = new_text[len(prev_text) :]
-            prev_text = new_text
-            if delta:
-                await self.push_frame(LLMTextFrame(text=delta))
+        try:
+            async for output in self._engine.generate(
+                {
+                    "prompt": GEMMA_PROMPT,
+                    "multi_modal_data": {"audio": [(audio_np, self._sample_rate)]},
+                },
+                sampling_params=self._sampling_params,
+                request_id=request_id,
+            ):
+                if self._current_request_id != request_id:
+                    logger.info(f"Gemma: request {request_id} was interrupted")
+                    break
+                new_text = output.outputs[0].text
+                delta = new_text[len(prev_text) :]
+                prev_text = new_text
+                if delta:
+                    await self.push_frame(LLMTextFrame(text=delta))
+        finally:
+            if self._current_request_id == request_id:
+                self._current_request_id = None
 
         await self.push_frame(LLMFullResponseEndFrame())

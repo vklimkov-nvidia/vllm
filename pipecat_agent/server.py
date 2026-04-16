@@ -73,11 +73,21 @@ async def start(request: Request):
     session_id = str(uuid.uuid4())
     active_sessions[session_id] = body
 
-    result: dict = {"sessionId": session_id}
+    # Include the UI configuration payload here
+    result: dict = {
+        "sessionId": session_id,
+        "messages": {
+            "show_text_container": False,   # Keep the text chat enabled
+            "show_video_container": False, # Disables and hides the video element
+            "show_debug_container": False  # Hides raw debug logs (optional)
+        }
+    }
+    
     if body.get("enableDefaultIceServers"):
         result["iceConfig"] = {
             "iceServers": [{"urls": "stun:stun.l.google.com:19302"}]
         }
+        
     return result
 
 

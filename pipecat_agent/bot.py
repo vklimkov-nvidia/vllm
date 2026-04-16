@@ -48,7 +48,7 @@ async def run_bot(webrtc_connection):
     # 2. Initialize the pure-audio Smart Turn Analyzer
     turn_analyzer = LocalSmartTurnAnalyzerV3(
         params=SmartTurnParams(
-            stop_secs=2.0 # Safety fallback: Max silence before forcing a turn
+            stop_secs=0.7 # Safety fallback: Max silence before forcing a turn
         )
     )
 
@@ -76,8 +76,8 @@ async def run_bot(webrtc_connection):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
+            enable_metrics=False,
+            enable_usage_metrics=False,
         ),
     )
 
