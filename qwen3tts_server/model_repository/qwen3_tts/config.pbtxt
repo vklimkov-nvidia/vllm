@@ -13,6 +13,30 @@ input [
     data_type: TYPE_STRING
     dims: [ 1 ]
     optional: true
+  },
+  {
+    name: "speaker"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "streaming"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "end_of_text"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "stream_id"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
   }
 ]
 
@@ -45,15 +69,15 @@ parameters {
 }
 parameters {
   key: "max_tokens"
-  value: { string_value: "1024" }
+  value: { string_value: "512" }
 }
 parameters {
   key: "codec_chunk_size"
-  value: { string_value: "35" }
+  value: { string_value: "30" }
 }
 parameters {
   key: "first_chunk_frames"
-  value: { string_value: "2" }
+  value: { string_value: "3" }
 }
 parameters {
   key: "codec_left_context"
@@ -65,9 +89,13 @@ parameters {
 }
 parameters {
   key: "gpu_memory_utilization"
-  value: { string_value: "0.6" }
+  value: { string_value: "0.3" }
 }
 parameters {
   key: "max_concurrency"
   value: { string_value: "32" }
+}
+parameters {
+  key: "text_stream_timeout_s"
+  value: { string_value: "300" }
 }

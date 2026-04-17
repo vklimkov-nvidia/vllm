@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir \
 
 # 2b. Python packages for checkpoint conversion (from PyPI)
 RUN pip install --no-cache-dir \
-    transformers==4.57.3 \
+    transformers==5.5.0 \
     onnxruntime-gpu \
     librosa \
     sox \
@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir \
     compressed-tensors==0.11.0 \
     depyf==0.19.0 \
     diskcache==5.6.3 \
-    gguf==0.13.0 \
+    gguf==0.18.0 \
     gpt-oss==0.0.7 \
     lm-format-enforcer==0.11.3 \
     msgspec \
@@ -60,7 +60,11 @@ RUN pip install --no-cache-dir \
     blake3 \
     Pillow \
     pyzmq \
-    tensorrt==10.15.1.29
+    tensorrt==10.15.1.29 \
+    uvloop==0.22.1 \
+    llguidance==1.7.2 \
+    xgrammar==0.1.33
+
 
 # 6. Verify the shm_channel extension compiled and loads
 RUN python3 -c 'import vllm._shm_channel_cpp as m; print("OK:", m.__file__)'

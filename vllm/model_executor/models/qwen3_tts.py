@@ -598,11 +598,17 @@ class Qwen3TTSTalkerDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         
-        rope_scaling = getattr(config, "rope_scaling", None)
         rope_theta = getattr(config, "rope_theta", 1000000.0)
+        # Newer HF transformers (v4.50+) may convert rope_scaling →
+        # rope_parameters and drop the rope_scaling attribute.  Try both.
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_params_attr = getattr(config, "rope_parameters", None)
         if rope_scaling is not None:
             rope_parameters = dict(rope_scaling)
             rope_parameters["rope_theta"] = rope_theta
+        elif rope_params_attr is not None:
+            rope_parameters = dict(rope_params_attr)
+            rope_parameters.setdefault("rope_theta", rope_theta)
         else:
             rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
         
@@ -1332,24 +1338,32 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
     ]
 
     @staticmethod
-    def build_prefill_tokens(
+    def _synth_content_token_ids(tokenizer, text: str) -> list[int]:
+        """Token IDs for the synthesis span (inside the IM chat template).
+
+        Matches ``input_id[:, 3:-5]`` in HuggingFace ``Qwen3TTSForConditionalGeneration.generate``.
+        """
+        synth_full = (
+            f"<|im_start|>assistant\n{text}"
+            f"<|im_end|>\n<|im_start|>assistant\n"
+        )
+        full_ids = tokenizer.encode(synth_full)
+        return full_ids[3:-5]
+
+    @staticmethod
+    def _build_tts_prefill_prefix_lists(
         tokenizer,
-        text: str,
+        config: dict,
         speaker: Union[str, int],
         language: Union[str, int, None],
-        config: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build ``text_ids`` and ``group0_ids`` for the prefill stage.
+    ) -> tuple[list[int], list[int]]:
+        """Shared prefix for TTS prefill: role row + codec / speaker control header.
 
-        Returns:
-            text_ids:    ``[L]`` int64 – text token IDs.
-            group0_ids:  ``[L]`` int64 – group-0 codec control / token IDs
-                (used as ``prompt_token_ids`` for vLLM).
+        Matches HuggingFace ``Qwen3TTSForConditionalGeneration.generate`` up to (but not
+        including) the synthesis-text body.
         """
         tc = config["talker_config"]
-
         tts_bos = config["tts_bos_token_id"]
-        tts_eos = config["tts_eos_token_id"]
         tts_pad = config["tts_pad_token_id"]
         codec_pad = tc["codec_pad_id"]
         codec_bos = tc["codec_bos_id"]
@@ -1386,13 +1400,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         text_list: list[int] = []
         g0_list: list[int] = []
 
-        # A. Role prefix
         role_tokens = tokenizer.encode("<|im_start|>assistant\n")[:3]
         for rid in role_tokens:
             text_list.append(rid)
             g0_list.append(zero_token)
 
-        # B+C. Control header + speaker
         if language_id is None or language_id < 0:
             codec_ctrl = [
                 codec_nothink, codec_think_bos, codec_think_eos,
@@ -1408,13 +1420,48 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
             text_list.append(tts_pad if i < n_ctrl - 2 else tts_bos)
             g0_list.append(codec_ctrl[i])
 
-        # D. Synth text + EOS
-        synth_full = (
-            f"<|im_start|>assistant\n{text}"
-            f"<|im_end|>\n<|im_start|>assistant\n"
+        return text_list, g0_list
+
+    @staticmethod
+    def build_prefill_tokens(
+        tokenizer,
+        text: str,
+        speaker: Union[str, int],
+        language: Union[str, int, None],
+        config: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build ``text_ids`` and ``group0_ids`` for **batch** (full-text) prefill.
+
+        This layout matches HuggingFace ``Qwen3TTSForConditionalGeneration.generate`` with
+        ``non_streaming_mode=True``: every synthesis text token occupies its own timestep
+        with group-0 ``codec_pad``, then ``tts_eos`` + ``codec_pad``, then ``tts_pad`` +
+        ``codec_bos`` on a dedicated position.
+
+        For streaming-style conditioning (first token fused with ``codec_bos``, remaining
+        text fed one token per codec step), use :meth:`build_streaming_prefill_tokens` and
+        :meth:`build_streaming_decode_text_ids`.
+
+        Returns:
+            text_ids:    ``[L]`` int64 – text token IDs.
+            group0_ids:  ``[L]`` int64 – group-0 codec control / token IDs
+                (used as ``prompt_token_ids`` for vLLM).
+        """
+        tc = config["talker_config"]
+        tts_eos = config["tts_eos_token_id"]
+        tts_pad = config["tts_pad_token_id"]
+        codec_pad = tc["codec_pad_id"]
+        codec_bos = tc["codec_bos_id"]
+
+        text_list, g0_list = (
+            Qwen3TTSTalkerForConditionalGeneration._build_tts_prefill_prefix_lists(
+                tokenizer, config, speaker, language
+            )
         )
-        full_ids = tokenizer.encode(synth_full)
-        content_ids = full_ids[3:-5]
+
+        # D. Synth text + EOS
+        content_ids = Qwen3TTSTalkerForConditionalGeneration._synth_content_token_ids(
+            tokenizer, text
+        )
 
         for tid in content_ids:
             text_list.append(tid)
@@ -1430,6 +1477,113 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module, SupportsPP):
         group0_ids = torch.tensor(g0_list, dtype=torch.long)
 
         return text_ids, group0_ids
+
+    @staticmethod
+    def build_streaming_prefill_tokens(
+        tokenizer,
+        text: str,
+        speaker: Union[str, int],
+        language: Union[str, int, None],
+        config: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefill tokens for **streaming / incremental** TTS (HF ``non_streaming_mode=False``).
+
+        In HuggingFace, the talker prefill ends with a single fused position
+        ``text_projection(first_synthesis_token) + codec_embedding(codec_bos)`` instead of
+        placing the whole transcript in the prefill and a separate ``(tts_pad, codec_bos)``
+        tail. Remaining characters are added at **each codec decode step** via
+        ``trailing_text_hidden[:, generation_step]`` (see ``Qwen3TTSTalkerForConditionalGeneration.forward``).
+
+        vLLM does not implement ``trailing_text_hidden``; you reproduce the same math by
+        passing ``text_ids`` from :meth:`build_streaming_decode_text_ids` on successive
+        decode calls (and ``tts_pad_token_id`` after that schedule is exhausted), while
+        ``prompt_token_ids`` / group-0 samples follow the usual codec path.
+
+        Returns:
+            Shorter ``text_ids`` / ``group0_ids`` than :meth:`build_prefill_tokens`: same
+            role + codec header as batch mode, then **one** tail position
+            ``(content_ids[0], codec_bos)``.
+
+        Raises:
+            ValueError: If tokenized synthesis text is empty.
+        """
+        content_ids = Qwen3TTSTalkerForConditionalGeneration._synth_content_token_ids(
+            tokenizer, text
+        )
+        if not content_ids:
+            raise ValueError(
+                "build_streaming_prefill_tokens requires non-empty synthesis text "
+                "after chat-template tokenization."
+            )
+
+        text_list, g0_list = (
+            Qwen3TTSTalkerForConditionalGeneration._build_tts_prefill_prefix_lists(
+                tokenizer, config, speaker, language
+            )
+        )
+
+        # HF streaming: only the first synthesis token, summed with codec_bos embedding.
+        codec_bos = config["talker_config"]["codec_bos_id"]
+        text_list.append(content_ids[0])
+        g0_list.append(codec_bos)
+
+        text_ids = torch.tensor(text_list, dtype=torch.long)
+        group0_ids = torch.tensor(g0_list, dtype=torch.long)
+        return text_ids, group0_ids
+
+    @staticmethod
+    def build_streaming_decode_text_ids(
+        tokenizer,
+        text: str,
+        config: dict,
+    ) -> torch.Tensor:
+        """Per-decode-step ``text_ids`` after :meth:`build_streaming_prefill_tokens`.
+
+        HuggingFace stacks ``text_projection(input_id[:, 4:-5])`` followed by the
+        ``tts_eos`` embedding into ``trailing_text_hidden``; the talker adds
+        ``trailing_text_hidden[:, generation_step]`` on each codec step once generation
+        starts.
+
+        This returns those text-side IDs in order: all synthesis tokens **after** the
+        first, then ``tts_eos_token_id``. After the returned sequence is exhausted, pass
+        ``tts_pad_token_id`` on further decode steps (HF uses ``tts_pad_embed`` there).
+
+        Args:
+            tokenizer: Same tokenizer used for prefill.
+            text: Same raw synthesis string as prefill.
+            config: Model ``config`` dict (needs ``tts_eos_token_id``).
+
+        Returns:
+            ``[S]`` int64 with ``S = max(0, len(content_ids) - 1) + 1`` (at least the
+            EOS slot when the transcript is a single subword).
+        """
+        tts_eos = config["tts_eos_token_id"]
+        content_ids = Qwen3TTSTalkerForConditionalGeneration._synth_content_token_ids(
+            tokenizer, text
+        )
+        tail: list[int] = list(content_ids[1:]) + [tts_eos]
+        return torch.tensor(tail, dtype=torch.long)
+
+    @staticmethod
+    def streaming_decode_text_id_at_step(
+        decode_schedule: torch.Tensor,
+        step: int,
+        tts_pad_token_id: int,
+    ) -> torch.Tensor:
+        """Single-step ``text_ids`` tensor ``[1]`` for vLLM ``custom_inputs``.
+
+        Args:
+            decode_schedule: Output of :meth:`build_streaming_decode_text_ids`.
+            step: Zero-based decode step index (0 = first step **after** prefill output).
+            tts_pad_token_id: ``config['tts_pad_token_id']`` for steps past the schedule.
+        """
+        if step < 0:
+            raise ValueError("step must be non-negative")
+        if step < decode_schedule.numel():
+            tid = int(decode_schedule[step].item())
+        else:
+            tid = int(tts_pad_token_id)
+        return torch.tensor([tid], dtype=torch.long)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

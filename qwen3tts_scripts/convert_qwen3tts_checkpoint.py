@@ -55,10 +55,16 @@ def _adjust_config(config: dict) -> None:
     if "talker_config" in config:
         tc = config["talker_config"]
         rs = tc.get("rope_scaling")
-        if rs is not None and rs.get("interleaved", False):
-            if "mrope_interleaved" not in rs:
-                print("  Adding mrope_interleaved=True to rope_scaling...")
+        if rs is not None:
+            if rs.get("interleaved", False) and "mrope_interleaved" not in rs:
                 rs["mrope_interleaved"] = True
+            # Remove keys that HF's rope validation doesn't recognize.
+            # "interleaved" is the old Qwen format; vLLM uses "mrope_interleaved".
+            # "type" is legacy; vLLM uses "rope_type".
+            for stale_key in ("interleaved", "type"):
+                if stale_key in rs:
+                    print(f"  Removing stale '{stale_key}' from rope_scaling...")
+                    del rs[stale_key]
 
     # 4. Add top-level sampling parameters (for group-0 via vLLM sampler)
     defaults = {
